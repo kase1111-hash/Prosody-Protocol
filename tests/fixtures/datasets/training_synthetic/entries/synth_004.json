@@ -1,0 +1,16 @@
+{
+  "id": "synth_004",
+  "timestamp": "2025-06-01T12:00:00Z",
+  "source": "synthetic",
+  "language": "en-US",
+  "audio_file": "audio/synth_004.wav",
+  "transcript": "I miss the old days so much.",
+  "iml": "<utterance emotion=\"sad\" confidence=\"0.9\">I miss the old days so much.</utterance>",
+  "speaker_id": "synth_speaker",
+  "emotion_label": "sad",
+  "annotator": "model",
+  "consent": true,
+  "metadata": {
+    "synthetic": true
+  }
+}

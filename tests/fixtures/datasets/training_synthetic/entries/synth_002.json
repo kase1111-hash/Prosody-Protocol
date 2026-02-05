@@ -1,0 +1,16 @@
+{
+  "id": "synth_002",
+  "timestamp": "2025-06-01T12:00:00Z",
+  "source": "synthetic",
+  "language": "en-US",
+  "audio_file": "audio/synth_002.wav",
+  "transcript": "I CANNOT believe you did that!",
+  "iml": "<utterance emotion=\"angry\" confidence=\"0.9\">I CANNOT believe you did that!</utterance>",
+  "speaker_id": "synth_speaker",
+  "emotion_label": "angry",
+  "annotator": "model",
+  "consent": true,
+  "metadata": {
+    "synthetic": true
+  }
+}

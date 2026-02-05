@@ -1,0 +1,16 @@
+{
+  "id": "synth_006",
+  "timestamp": "2025-06-01T12:00:00Z",
+  "source": "synthetic",
+  "language": "en-US",
+  "audio_file": "audio/synth_006.wav",
+  "transcript": "Oh great, another meeting.",
+  "iml": "<utterance emotion=\"sarcastic\" confidence=\"0.9\">Oh great, another meeting.</utterance>",
+  "speaker_id": "synth_speaker",
+  "emotion_label": "sarcastic",
+  "annotator": "model",
+  "consent": true,
+  "metadata": {
+    "synthetic": true
+  }
+}

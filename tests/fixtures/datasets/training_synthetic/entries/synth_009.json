@@ -1,0 +1,16 @@
+{
+  "id": "synth_009",
+  "timestamp": "2025-06-01T12:00:00Z",
+  "source": "synthetic",
+  "language": "en-US",
+  "audio_file": "audio/synth_009.wav",
+  "transcript": "Please pass me the salt.",
+  "iml": "<utterance emotion=\"neutral\" confidence=\"0.9\">Please pass me the salt.</utterance>",
+  "speaker_id": "synth_speaker",
+  "emotion_label": "neutral",
+  "annotator": "model",
+  "consent": true,
+  "metadata": {
+    "synthetic": true
+  }
+}

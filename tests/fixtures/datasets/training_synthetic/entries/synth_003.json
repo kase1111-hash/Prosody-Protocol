@@ -1,0 +1,16 @@
+{
+  "id": "synth_003",
+  "timestamp": "2025-06-01T12:00:00Z",
+  "source": "synthetic",
+  "language": "en-US",
+  "audio_file": "audio/synth_003.wav",
+  "transcript": "This is the best day ever!",
+  "iml": "<utterance emotion=\"joyful\" confidence=\"0.9\">This is the best day ever!</utterance>",
+  "speaker_id": "synth_speaker",
+  "emotion_label": "joyful",
+  "annotator": "model",
+  "consent": true,
+  "metadata": {
+    "synthetic": true
+  }
+}

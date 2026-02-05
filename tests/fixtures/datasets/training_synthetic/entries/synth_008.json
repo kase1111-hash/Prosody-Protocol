@@ -1,0 +1,16 @@
+{
+  "id": "synth_008",
+  "timestamp": "2025-06-01T12:00:00Z",
+  "source": "synthetic",
+  "language": "en-US",
+  "audio_file": "audio/synth_008.wav",
+  "transcript": "This thing never works properly.",
+  "iml": "<utterance emotion=\"frustrated\" confidence=\"0.9\">This thing never works properly.</utterance>",
+  "speaker_id": "synth_speaker",
+  "emotion_label": "frustrated",
+  "annotator": "model",
+  "consent": true,
+  "metadata": {
+    "synthetic": true
+  }
+}

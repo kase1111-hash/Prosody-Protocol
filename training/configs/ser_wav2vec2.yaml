@@ -1,0 +1,45 @@
+task: ser
+description: "Speech Emotion Recognition using prosodic features"
+
+model:
+  type: logistic_regression    # baseline; swap for wav2vec2 when ml extras installed
+  num_classes: 8
+  labels:
+    - neutral
+    - angry
+    - frustrated
+    - joyful
+    - sad
+    - fearful
+    - sarcastic
+    - calm
+
+data:
+  features:
+    - f0_mean
+    - f0_range
+    - intensity_mean
+    - speech_rate
+    - jitter
+    - shimmer
+    - hnr
+  label_field: emotion_label
+
+training:
+  epochs: 100
+  learning_rate: 0.01
+  batch_size: 32
+  optimizer: lbfgs
+  regularization: 1.0
+  max_iter: 200
+
+evaluation:
+  metrics:
+    - precision
+    - recall
+    - f1
+  average: macro
+
+output:
+  format: pickle
+  export_format: json

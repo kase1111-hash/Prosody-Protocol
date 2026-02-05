@@ -18,6 +18,7 @@ from .exceptions import (
     IMLValidationError,
     ProfileError,
     ProsodyProtocolError,
+    TrainingError,
 )
 from .iml_to_audio import IMLToAudio
 from .iml_to_ssml import IMLToSSML
@@ -80,4 +81,5 @@ __all__ = [
     "AudioProcessingError",
     "ConversionError",
     "DatasetError",
+    "TrainingError",
 ]
