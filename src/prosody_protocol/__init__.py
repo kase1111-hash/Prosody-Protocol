@@ -9,9 +9,11 @@ from ._version import __version__
 from .assembler import IMLAssembler
 from .audio_to_iml import AudioToIML
 from .emotion_classifier import EmotionClassifier, RuleBasedEmotionClassifier
+from .datasets import Dataset, DatasetEntry, DatasetLoader
 from .exceptions import (
     AudioProcessingError,
     ConversionError,
+    DatasetError,
     IMLParseError,
     IMLValidationError,
     ProfileError,
@@ -66,6 +68,10 @@ __all__ = [
     "ProfileApplier",
     "ProsodyProfile",
     "ProsodyMapping",
+    # Datasets
+    "DatasetLoader",
+    "DatasetEntry",
+    "Dataset",
     # Exceptions
     "ProsodyProtocolError",
     "IMLParseError",
@@ -73,4 +79,5 @@ __all__ = [
     "ProfileError",
     "AudioProcessingError",
     "ConversionError",
+    "DatasetError",
 ]

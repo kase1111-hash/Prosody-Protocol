@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://prosody-protocol.org/schemas/dataset-entry.schema.json",
+  "title": "IML Dataset Entry",
+  "description": "Schema for a single annotated entry in a Prosody Protocol training dataset. See EXECUTION_GUIDE.md Phase 10.",
+  "type": "object",
+  "required": [
+    "id",
+    "timestamp",
+    "source",
+    "language",
+    "audio_file",
+    "transcript",
+    "iml",
+    "emotion_label",
+    "annotator",
+    "consent"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Unique identifier for this entry.",
+      "minLength": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "description": "ISO-8601 timestamp when the entry was created.",
+      "format": "date-time"
+    },
+    "source": {
+      "type": "string",
+      "description": "Origin of the data.",
+      "enum": ["mavis", "recorded", "synthetic"]
+    },
+    "language": {
+      "type": "string",
+      "description": "BCP-47 language tag.",
+      "pattern": "^[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)*$"
+    },
+    "audio_file": {
+      "type": "string",
+      "description": "Relative path to the audio file (WAV) within the dataset directory.",
+      "minLength": 1
+    },
+    "transcript": {
+      "type": "string",
+      "description": "Plain text transcript of the audio."
+    },
+    "iml": {
+      "type": "string",
+      "description": "IML-annotated version of the transcript.",
+      "minLength": 1
+    },
+    "speaker_id": {
+      "type": ["string", "null"],
+      "description": "Identifier for the speaker, or null if unknown."
+    },
+    "emotion_label": {
+      "type": "string",
+      "description": "Primary emotion label for the entry.",
+      "minLength": 1
+    },
+    "annotator": {
+      "type": "string",
+      "description": "Who/what created the annotation.",
+      "enum": ["human", "model", "hybrid"]
+    },
+    "consent": {
+      "type": "boolean",
+      "description": "Whether explicit consent was given for this data.",
+      "const": true
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Optional additional metadata.",
+      "additionalProperties": true
+    }
+  }
+}

@@ -34,3 +34,7 @@ class AudioProcessingError(ProsodyProtocolError):
 
 class ConversionError(ProsodyProtocolError):
     """Raised when format conversion fails (e.g., IML to SSML)."""
+
+
+class DatasetError(ProsodyProtocolError):
+    """Raised when dataset loading or validation fails."""
