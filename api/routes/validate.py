@@ -5,6 +5,8 @@ from __future__ import annotations
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from prosody_protocol import IMLValidator
+
 router = APIRouter()
 
 
@@ -27,4 +29,18 @@ class ValidateResponse(BaseModel):
 
 @router.post("/validate", response_model=ValidateResponse)
 async def validate_iml(request: ValidateRequest) -> ValidateResponse:
-    raise NotImplementedError
+    validator = IMLValidator()
+    result = validator.validate(request.iml)
+
+    issues = [
+        ValidationIssueResponse(
+            severity=issue.severity,
+            rule=issue.rule,
+            message=issue.message,
+            line=getattr(issue, "line", None),
+            column=getattr(issue, "column", None),
+        )
+        for issue in result.issues
+    ]
+
+    return ValidateResponse(valid=result.valid, issues=issues)
