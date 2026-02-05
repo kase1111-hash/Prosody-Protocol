@@ -1,0 +1,318 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Intent Markup Language (IML) XML Schema Definition
+  Version: 1.0.0
+  License: CC-BY-4.0
+
+  This schema enforces the structural and type constraints defined in spec.md.
+  Note: Certain semantic rules (e.g., "confidence REQUIRED when emotion present")
+  cannot be fully expressed in XSD 1.0 and are enforced via xs:assert (XSD 1.1)
+  or application-level validation.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           elementFormDefault="qualified">
+
+  <!-- ================================================================== -->
+  <!-- Simple Types                                                        -->
+  <!-- ================================================================== -->
+
+  <!-- Confidence: float between 0.0 and 1.0 -->
+  <xs:simpleType name="confidenceType">
+    <xs:restriction base="xs:decimal">
+      <xs:minInclusive value="0.0"/>
+      <xs:maxInclusive value="1.0"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Semantic version string (e.g., "1.0.0", "0.1.0-alpha") -->
+  <xs:simpleType name="semverType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- BCP-47 language tag (e.g., "en-US", "ja", "fr-FR") -->
+  <xs:simpleType name="bcp47Type">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})*"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Pitch: relative percentage (+15%, -10%), semitones (+3st, -2st), or absolute Hz (185Hz) -->
+  <xs:simpleType name="pitchType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[+\-]\d+(\.\d+)?%"/>        <!-- relative percentage -->
+      <xs:pattern value="[+\-]\d+(\.\d+)?st"/>       <!-- semitones -->
+      <xs:pattern value="\d+(\.\d+)?Hz"/>             <!-- absolute Hz -->
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Pitch contour enumeration -->
+  <xs:simpleType name="pitchContourType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="rise"/>
+      <xs:enumeration value="fall"/>
+      <xs:enumeration value="rise-fall"/>
+      <xs:enumeration value="fall-rise"/>
+      <xs:enumeration value="fall-sharp"/>
+      <xs:enumeration value="rise-sharp"/>
+      <xs:enumeration value="flat"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Volume: relative dB (+6dB, -3dB) -->
+  <xs:simpleType name="volumeType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[+\-]\d+(\.\d+)?dB"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Rate: named values or percentage -->
+  <xs:simpleType name="rateNamedType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="fast"/>
+      <xs:enumeration value="slow"/>
+      <xs:enumeration value="medium"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="ratePercentType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="\d+(\.\d+)?%"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="rateType">
+    <xs:union memberTypes="rateNamedType ratePercentType"/>
+  </xs:simpleType>
+
+  <!-- Voice quality enumeration -->
+  <xs:simpleType name="qualityType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="modal"/>
+      <xs:enumeration value="breathy"/>
+      <xs:enumeration value="tense"/>
+      <xs:enumeration value="creaky"/>
+      <xs:enumeration value="whispery"/>
+      <xs:enumeration value="harsh"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Core emotion vocabulary -->
+  <xs:simpleType name="coreEmotionType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="neutral"/>
+      <xs:enumeration value="sincere"/>
+      <xs:enumeration value="sarcastic"/>
+      <xs:enumeration value="frustrated"/>
+      <xs:enumeration value="joyful"/>
+      <xs:enumeration value="uncertain"/>
+      <xs:enumeration value="angry"/>
+      <xs:enumeration value="sad"/>
+      <xs:enumeration value="fearful"/>
+      <xs:enumeration value="surprised"/>
+      <xs:enumeration value="disgusted"/>
+      <xs:enumeration value="calm"/>
+      <xs:enumeration value="empathetic"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Emotion: core vocabulary OR custom string (producers MAY use values outside the core set) -->
+  <xs:simpleType name="emotionType">
+    <xs:union memberTypes="coreEmotionType xs:string"/>
+  </xs:simpleType>
+
+  <!-- Emphasis level enumeration -->
+  <xs:simpleType name="emphasisLevelType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="strong"/>
+      <xs:enumeration value="moderate"/>
+      <xs:enumeration value="reduced"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Segment tempo enumeration -->
+  <xs:simpleType name="tempoType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="rushed"/>
+      <xs:enumeration value="steady"/>
+      <xs:enumeration value="drawn-out"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Segment rhythm enumeration -->
+  <xs:simpleType name="rhythmType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="staccato"/>
+      <xs:enumeration value="legato"/>
+      <xs:enumeration value="syncopated"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- F0 range: "low-high" (e.g., "120-240") -->
+  <xs:simpleType name="f0RangeType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="\d+(\.\d+)?-\d+(\.\d+)?"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- F0 contour: comma-separated Hz values (e.g., "150,165,180,170,140") -->
+  <xs:simpleType name="f0ContourType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="\d+(\.\d+)?(,\d+(\.\d+)?)*"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Consent model enumeration -->
+  <xs:simpleType name="consentType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="explicit"/>
+      <xs:enumeration value="implicit"/>
+      <xs:enumeration value="none"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Processing location enumeration -->
+  <xs:simpleType name="processingType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="local"/>
+      <xs:enumeration value="remote"/>
+      <xs:enumeration value="hybrid"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- ================================================================== -->
+  <!-- Complex Types                                                       -->
+  <!-- ================================================================== -->
+
+  <!--
+    pauseType: <pause> element.
+    MUST be self-closing (empty). duration is required, in whole milliseconds.
+    Spec reference: Section 3.3, 5.2 constraint 3.
+  -->
+  <xs:complexType name="pauseType">
+    <xs:attribute name="duration" type="xs:positiveInteger" use="required"/>
+  </xs:complexType>
+
+  <!--
+    emphasisType: <emphasis> element.
+    Mixed content: text + <prosody> children.
+    Nesting depth of prosody inside emphasis should not exceed 2 levels (advisory).
+    Spec reference: Section 3.4, 5.2 constraint 2.
+  -->
+  <xs:complexType name="emphasisType" mixed="true">
+    <xs:choice minOccurs="0" maxOccurs="unbounded">
+      <xs:element name="prosody" type="prosodyType"/>
+      <xs:element name="pause" type="pauseType"/>
+    </xs:choice>
+    <xs:attribute name="level" type="emphasisLevelType" use="required"/>
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:complexType>
+
+  <!--
+    prosodyType: <prosody> element.
+    Mixed content: text + <emphasis>, <pause> children.
+    All attributes optional (but at least one should be present by convention).
+    Includes both core and extended attributes.
+    Spec reference: Sections 3.2, 4.
+  -->
+  <xs:complexType name="prosodyType" mixed="true">
+    <xs:choice minOccurs="0" maxOccurs="unbounded">
+      <xs:element name="emphasis" type="emphasisType"/>
+      <xs:element name="pause" type="pauseType"/>
+      <xs:element name="prosody" type="prosodyType"/>
+    </xs:choice>
+    <!-- Core attributes (Section 3.2) -->
+    <xs:attribute name="pitch" type="pitchType"/>
+    <xs:attribute name="pitch_contour" type="pitchContourType"/>
+    <xs:attribute name="volume" type="volumeType"/>
+    <xs:attribute name="rate" type="rateType"/>
+    <xs:attribute name="quality" type="qualityType"/>
+    <!-- Extended attributes: Fundamental Frequency (Section 4.1) -->
+    <xs:attribute name="f0_mean" type="xs:decimal"/>
+    <xs:attribute name="f0_range" type="f0RangeType"/>
+    <xs:attribute name="f0_contour" type="f0ContourType"/>
+    <!-- Extended attributes: Intensity (Section 4.2) -->
+    <xs:attribute name="intensity_mean" type="xs:decimal"/>
+    <xs:attribute name="intensity_range" type="xs:decimal"/>
+    <!-- Extended attributes: Temporal (Section 4.3) -->
+    <xs:attribute name="speech_rate" type="xs:decimal"/>
+    <xs:attribute name="duration_ms" type="xs:positiveInteger"/>
+    <!-- Extended attributes: Voice Quality Measures (Section 4.4) -->
+    <xs:attribute name="jitter" type="xs:decimal"/>
+    <xs:attribute name="shimmer" type="xs:decimal"/>
+    <xs:attribute name="hnr" type="xs:decimal"/>
+    <!-- Extension mechanism: x-* attributes (Section 9.2) -->
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:complexType>
+
+  <!--
+    segmentType: <segment> element.
+    Mixed content: text + <prosody>, <emphasis>, <pause> children.
+    MUST be direct child of <utterance> only (enforced by parent content model).
+    MUST NOT nest within other <segment> elements (no self-reference).
+    Spec reference: Section 3.5, 5.2 constraints 4-5.
+    Status: Stable (promoted from experimental in v1.0).
+  -->
+  <xs:complexType name="segmentType" mixed="true">
+    <xs:choice minOccurs="0" maxOccurs="unbounded">
+      <xs:element name="prosody" type="prosodyType"/>
+      <xs:element name="emphasis" type="emphasisType"/>
+      <xs:element name="pause" type="pauseType"/>
+    </xs:choice>
+    <xs:attribute name="tempo" type="tempoType"/>
+    <xs:attribute name="rhythm" type="rhythmType"/>
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:complexType>
+
+  <!--
+    utteranceType: <utterance> element.
+    Mixed content: text + all inline elements.
+    Semantic constraint: confidence MUST be present when emotion is present.
+    (This co-occurrence constraint cannot be fully enforced in XSD 1.0;
+     use xs:assert in XSD 1.1 or application-level validation.)
+    Spec reference: Section 3.1, 6.1 requirement 2.
+  -->
+  <xs:complexType name="utteranceType" mixed="true">
+    <xs:choice minOccurs="0" maxOccurs="unbounded">
+      <xs:element name="prosody" type="prosodyType"/>
+      <xs:element name="emphasis" type="emphasisType"/>
+      <xs:element name="pause" type="pauseType"/>
+      <xs:element name="segment" type="segmentType"/>
+    </xs:choice>
+    <xs:attribute name="emotion" type="emotionType"/>
+    <xs:attribute name="confidence" type="confidenceType"/>
+    <xs:attribute name="speaker_id" type="xs:string"/>
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:complexType>
+
+  <!--
+    imlType: <iml> root wrapper element.
+    Contains one or more <utterance> elements.
+    Spec reference: Section 2.4, 8.3.
+  -->
+  <xs:complexType name="imlType">
+    <xs:sequence>
+      <xs:element name="utterance" type="utteranceType" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="version" type="semverType"/>
+    <xs:attribute name="language" type="bcp47Type"/>
+    <xs:attribute name="consent" type="consentType"/>
+    <xs:attribute name="processing" type="processingType"/>
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:complexType>
+
+  <!-- ================================================================== -->
+  <!-- Root Elements                                                       -->
+  <!-- ================================================================== -->
+
+  <!--
+    Two valid root elements:
+    1. <iml> wrapper containing multiple utterances
+    2. <utterance> standalone (single utterance without wrapper)
+    Spec reference: Section 2.1, 5.2 constraint 1.
+  -->
+  <xs:element name="iml" type="imlType"/>
+  <xs:element name="utterance" type="utteranceType"/>
+
+</xs:schema>

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<utterance emotion="frustrated" confidence="0.92">
+  <prosody f0_mean="220" f0_range="180-310" intensity_mean="72"
+           intensity_range="15" speech_rate="5.1" jitter="2.1" shimmer="4.5">
+    I <emphasis level="strong">can't believe</emphasis>
+    <pause duration="350"/>
+    this happened
+    <prosody pitch="+18%" volume="+8dB" pitch_contour="rise-fall">again</prosody>!
+  </prosody>
+</utterance>

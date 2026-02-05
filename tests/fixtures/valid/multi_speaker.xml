@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<iml version="0.1.0" language="en-US">
+  <utterance emotion="neutral" confidence="0.95" speaker_id="agent">
+    How can I help you today?
+  </utterance>
+  <utterance emotion="frustrated" confidence="0.89" speaker_id="caller">
+    I've been on hold for
+    <prosody pitch="+8%" volume="+5dB">thirty minutes</prosody>
+    and my
+    <emphasis level="strong">account is still locked</emphasis>.
+  </utterance>
+  <utterance emotion="empathetic" confidence="0.82" speaker_id="agent">
+    I'm
+    <prosody quality="breathy" pitch="-5%">so sorry</prosody>
+    about that. Let me fix this right away.
+  </utterance>
+</iml>
