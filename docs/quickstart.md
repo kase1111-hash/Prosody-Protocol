@@ -12,6 +12,12 @@ For audio processing capabilities:
 pip install prosody-protocol[audio]
 ```
 
+For the REST API server:
+
+```bash
+pip install prosody-protocol[api]
+```
+
 ## Parse IML
 
 ```python
@@ -54,6 +60,16 @@ iml_string = converter.convert("recording.wav")
 print(iml_string)
 ```
 
+## Predict Prosody from Text
+
+```python
+from prosody_protocol import TextToIML
+
+predictor = TextToIML()
+iml = predictor.predict("I can't believe this happened!", context="frustrated")
+print(iml)
+```
+
 ## Convert IML to SSML
 
 ```python
@@ -64,6 +80,79 @@ ssml = converter.convert(iml_string)
 print(ssml)
 ```
 
-> **Note:** The SDK is in pre-alpha. Many classes currently raise
-> `NotImplementedError` and will be implemented in upcoming phases.
-> See the [Execution Guide](../EXECUTION_GUIDE.md) for the roadmap.
+## Synthesize Audio from IML
+
+```python
+from prosody_protocol import IMLToAudio
+
+synthesizer = IMLToAudio()
+wav_bytes = synthesizer.synthesize('''
+<utterance emotion="calm" confidence="0.9">
+  Please <prosody rate="slow">listen carefully</prosody>.
+</utterance>
+''')
+
+with open("output.wav", "wb") as f:
+    f.write(wav_bytes)
+```
+
+## Load Prosody Profiles
+
+```python
+from prosody_protocol import ProfileLoader, ProfileApplier
+
+loader = ProfileLoader()
+profile = loader.load("profiles/autism_spectrum.json")
+
+applier = ProfileApplier()
+emotion, confidence = applier.apply(profile, features, "neutral", 0.5)
+```
+
+## Work with Datasets
+
+```python
+from prosody_protocol import DatasetLoader
+
+loader = DatasetLoader()
+dataset = loader.load("datasets/emotional-speech")
+
+print(f"Dataset: {dataset.name}, {dataset.size} entries")
+
+train, val, test = loader.split(dataset)
+for entry in train:
+    print(f"{entry.id}: {entry.emotion_label}")
+```
+
+## Run Benchmarks
+
+```python
+from prosody_protocol import Benchmark, BenchmarkReport, AudioToIML, DatasetLoader
+
+loader = DatasetLoader()
+dataset = loader.load("datasets/emotional-speech")
+converter = AudioToIML()
+
+benchmark = Benchmark(dataset, converter, dataset_dir="datasets/emotional-speech")
+report = benchmark.run()
+
+print(f"Emotion accuracy: {report.emotion_accuracy:.2%}")
+print(f"Validity rate: {report.validity_rate:.2%}")
+
+# Save for tracking
+report.save("benchmarks/latest.json")
+```
+
+## Run the REST API
+
+```bash
+pip install prosody-protocol[api]
+uvicorn api.app:app --host 0.0.0.0 --port 8000
+```
+
+Then visit `http://localhost:8000/docs` for interactive API documentation.
+
+## Next Steps
+
+- [API Reference](API.md) -- full class and method documentation
+- [Integration Guides](integrations/) -- Whisper, Claude, ElevenLabs, Coqui TTS
+- [Specification](../spec.md) -- formal IML spec
