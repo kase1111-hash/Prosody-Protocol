@@ -1,0 +1,14 @@
+{
+  "id": "entry_001",
+  "timestamp": "2025-01-15T10:30:00Z",
+  "source": "recorded",
+  "language": "en-US",
+  "audio_file": "audio/sample_001.wav",
+  "transcript": "Hello world.",
+  "iml": "<utterance>Hello world.</utterance>",
+  "speaker_id": "speaker_01",
+  "emotion_label": "neutral",
+  "annotator": "human",
+  "consent": true,
+  "metadata": {"session": "test_session_1"}
+}

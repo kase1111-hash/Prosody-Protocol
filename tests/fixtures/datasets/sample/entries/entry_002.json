@@ -1,0 +1,13 @@
+{
+  "id": "entry_002",
+  "timestamp": "2025-01-15T10:31:00Z",
+  "source": "synthetic",
+  "language": "en-US",
+  "audio_file": "audio/sample_002.wav",
+  "transcript": "That is amazing!",
+  "iml": "<utterance emotion=\"joyful\" confidence=\"0.85\">That is amazing!</utterance>",
+  "speaker_id": null,
+  "emotion_label": "joyful",
+  "annotator": "model",
+  "consent": true
+}

@@ -1,0 +1,13 @@
+{
+  "id": "entry_003",
+  "timestamp": "2025-01-15T10:32:00Z",
+  "source": "mavis",
+  "language": "en-GB",
+  "audio_file": "audio/sample_003.wav",
+  "transcript": "I suppose so.",
+  "iml": "<utterance emotion=\"uncertain\" confidence=\"0.6\">I suppose so.</utterance>",
+  "speaker_id": "speaker_02",
+  "emotion_label": "uncertain",
+  "annotator": "hybrid",
+  "consent": true
+}
