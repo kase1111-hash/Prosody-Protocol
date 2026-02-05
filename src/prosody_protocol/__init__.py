@@ -6,7 +6,9 @@ Public API re-exports for convenient access::
 """
 
 from ._version import __version__
+from .assembler import IMLAssembler
 from .audio_to_iml import AudioToIML
+from .emotion_classifier import EmotionClassifier, RuleBasedEmotionClassifier
 from .exceptions import (
     AudioProcessingError,
     ConversionError,
@@ -27,7 +29,7 @@ from .models import (
 )
 from .parser import IMLParser
 from .profiles import ProfileApplier, ProfileLoader, ProsodyProfile
-from .prosody_analyzer import ProsodyAnalyzer, SpanFeatures, WordAlignment
+from .prosody_analyzer import PauseInterval, ProsodyAnalyzer, SpanFeatures, WordAlignment
 from .text_to_iml import TextToIML
 from .validator import IMLValidator, ValidationIssue, ValidationResult
 
@@ -50,10 +52,15 @@ __all__ = [
     "IMLToAudio",
     "IMLToSSML",
     "TextToIML",
+    "IMLAssembler",
     # Analysis
     "ProsodyAnalyzer",
     "SpanFeatures",
     "WordAlignment",
+    "PauseInterval",
+    # Emotion
+    "EmotionClassifier",
+    "RuleBasedEmotionClassifier",
     # Profiles
     "ProfileLoader",
     "ProfileApplier",
