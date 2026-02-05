@@ -1,0 +1,15 @@
+{
+  "profile_version": "1.0.0",
+  "user_id": "user_001",
+  "prosody_mappings": [
+    {
+      "pattern": {
+        "pitch": "high"
+      },
+      "interpretation": {
+        "emotion": "excited",
+        "confidence_boost": 0.1
+      }
+    }
+  ]
+}

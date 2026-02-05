@@ -1,0 +1,36 @@
+{
+  "profile_version": "0.1.0",
+  "user_id": "user_789",
+  "description": "Autism spectrum - monotone speech with rate-based expression",
+  "prosody_mappings": [
+    {
+      "pattern": {
+        "pitch_contour": "flat",
+        "rate": "fast"
+      },
+      "interpretation": {
+        "emotion": "excitement",
+        "confidence_boost": 0.15
+      }
+    },
+    {
+      "pattern": {
+        "pitch_contour": "flat",
+        "pause_frequency": "high"
+      },
+      "interpretation": {
+        "emotion": "thinking_carefully",
+        "confidence_boost": 0.10
+      }
+    },
+    {
+      "pattern": {
+        "volume": "spike"
+      },
+      "interpretation": {
+        "emotion": "emphasis_not_anger",
+        "confidence_boost": 0.20
+      }
+    }
+  ]
+}

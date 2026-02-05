@@ -1,0 +1,13 @@
+{
+  "profile_version": "0.1.0",
+  "prosody_mappings": [
+    {
+      "pattern": {
+        "pitch": "high"
+      },
+      "interpretation": {
+        "emotion": "excited"
+      }
+    }
+  ]
+}
