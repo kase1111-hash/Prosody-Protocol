@@ -1,0 +1,16 @@
+{
+  "id": "synth_007",
+  "timestamp": "2025-06-01T12:00:00Z",
+  "source": "synthetic",
+  "language": "en-US",
+  "audio_file": "audio/synth_007.wav",
+  "transcript": "Let us take a moment to breathe.",
+  "iml": "<utterance emotion=\"calm\" confidence=\"0.9\">Let us take a moment to breathe.</utterance>",
+  "speaker_id": "synth_speaker",
+  "emotion_label": "calm",
+  "annotator": "model",
+  "consent": true,
+  "metadata": {
+    "synthetic": true
+  }
+}

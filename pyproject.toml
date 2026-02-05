@@ -39,6 +39,8 @@ audio = [
 ml = [
     "torch>=2.0",
     "transformers>=4.30",
+    "scikit-learn>=1.3",
+    "pyyaml>=6.0",
 ]
 api = [
     "fastapi>=0.100",

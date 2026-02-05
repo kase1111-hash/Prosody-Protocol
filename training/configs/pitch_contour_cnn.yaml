@@ -1,0 +1,31 @@
+task: pitch_contour
+description: "Pitch contour shape classification from F0 sequences"
+
+model:
+  type: random_forest    # baseline; swap for 1D CNN or LSTM when ml extras installed
+  n_estimators: 50
+  max_depth: 8
+
+data:
+  sequence_length: 20          # resample F0 to this many points
+  contour_classes:
+    - rise
+    - fall
+    - rise-fall
+    - fall-rise
+    - flat
+
+training:
+  min_samples_split: 2
+  min_samples_leaf: 1
+
+evaluation:
+  metrics:
+    - precision
+    - recall
+    - f1
+  average: macro
+
+output:
+  format: pickle
+  export_format: json

@@ -1,0 +1,6 @@
+{
+  "name": "training_synthetic",
+  "version": "0.1.0",
+  "description": "Synthetic dataset for training pipeline validation (10 samples)",
+  "size": 10
+}

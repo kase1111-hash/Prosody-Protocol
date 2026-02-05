@@ -38,3 +38,7 @@ class ConversionError(ProsodyProtocolError):
 
 class DatasetError(ProsodyProtocolError):
     """Raised when dataset loading or validation fails."""
+
+
+class TrainingError(ProsodyProtocolError):
+    """Raised when model training or evaluation fails."""

@@ -1,0 +1,16 @@
+{
+  "id": "synth_010",
+  "timestamp": "2025-06-01T12:00:00Z",
+  "source": "synthetic",
+  "language": "en-US",
+  "audio_file": "audio/synth_010.wav",
+  "transcript": "Stop doing that right now!",
+  "iml": "<utterance emotion=\"angry\" confidence=\"0.9\">Stop doing that right now!</utterance>",
+  "speaker_id": "synth_speaker",
+  "emotion_label": "angry",
+  "annotator": "model",
+  "consent": true,
+  "metadata": {
+    "synthetic": true
+  }
+}

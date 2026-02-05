@@ -1,0 +1,44 @@
+task: text_to_prosody
+description: "Per-token prosodic label prediction from plain text"
+
+model:
+  type: decision_tree    # baseline; swap for BERT + sequence labeling when ml extras installed
+  max_depth: 10
+
+data:
+  text_features:
+    - word_length
+    - position_ratio
+    - is_capitalized
+    - has_punctuation
+    - sentence_position
+    - prev_word_length
+    - next_word_length
+  labels:
+    pitch_level:
+      - high
+      - mid
+      - low
+    volume_level:
+      - loud
+      - normal
+      - quiet
+    rate_level:
+      - fast
+      - normal
+      - slow
+
+training:
+  min_samples_split: 2
+  min_samples_leaf: 1
+
+evaluation:
+  metrics:
+    - precision
+    - recall
+    - f1
+  average: macro
+
+output:
+  format: pickle
+  export_format: json
