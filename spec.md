@@ -265,7 +265,7 @@ I <emphasis level="strong">said</emphasis> I'm fine.
 
 Groups a stretch of speech sharing overall prosodic characteristics. Useful for characterizing entire phrases or clauses rather than individual words.
 
-**Status:** Experimental
+**Status:** Stable (promoted from experimental in v1.0)
 
 **Content model:** Mixed content (text, `<prosody>`, `<pause>`, `<emphasis>`)
 
@@ -519,8 +519,8 @@ Consumers MUST ignore `x-` prefixed attributes they do not understand.
 
 | Level | Tags | Commitment |
 |-------|------|------------|
-| **Stable** | `<utterance>`, `<prosody>`, `<pause>`, `<emphasis>` | Will not change in backwards-incompatible ways within a major version |
-| **Experimental** | `<segment>`, extended attributes | May change or be removed in minor versions |
+| **Stable** | `<utterance>`, `<prosody>`, `<pause>`, `<emphasis>`, `<segment>` | Will not change in backwards-incompatible ways within a major version |
+| **Experimental** | Extended attributes | May change or be removed in minor versions |
 | **Proposed** | Backchannel markers, laughter notation | Under discussion, not yet part of the spec |
 
 ---
@@ -547,7 +547,7 @@ The following features are under discussion for future versions:
 | `<prosody>` | Stable | Mixed (text + inline elements) | No | `<utterance>`, `<emphasis>`, `<segment>` |
 | `<pause>` | Stable | Empty | Yes | `<utterance>`, `<prosody>`, `<segment>` |
 | `<emphasis>` | Stable | Mixed (text + `<prosody>`) | No | `<utterance>`, `<prosody>`, `<segment>` |
-| `<segment>` | Experimental | Mixed (text + inline elements) | No | `<utterance>` |
+| `<segment>` | Stable | Mixed (text + inline elements) | No | `<utterance>` |
 
 ## Appendix B: Attribute Quick Reference
 
@@ -626,3 +626,61 @@ The following features are under discussion for future versions:
   </prosody>
 </utterance>
 ```
+
+## Appendix D: RFC-2119 Conformance Summary
+
+This specification uses the key words MUST, MUST NOT, SHOULD, SHOULD NOT, MAY, REQUIRED, and OPTIONAL as defined in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119). The following table catalogues every normative requirement.
+
+### D.1 MUST / REQUIRED / MUST NOT
+
+| ID | Requirement | Section |
+|----|-------------|---------|
+| M1 | IML documents MUST be encoded in UTF-8. | 2.2 |
+| M2 | `<utterance>` MUST be the top-level content element (or wrapped in `<iml>`). | 5.2 |
+| M3 | `<pause>` MUST be a self-closing empty element. | 5.2 |
+| M4 | `<segment>` MUST be a direct child of `<utterance>`. | 5.2 |
+| M5 | `<segment>` elements MUST NOT nest within other `<segment>` elements. | 5.2 |
+| M6 | Producers MUST generate well-formed XML. | 6.1 |
+| M7 | Producers MUST include `confidence` when `emotion` is specified on `<utterance>`. | 6.1 |
+| M8 | Producers MUST express `<pause>` durations in whole milliseconds. | 6.1 |
+| M9 | Consumers MUST be able to extract plain text by stripping all tags. | 6.2 |
+| M10 | Consumers MUST ignore unknown tags and attributes without error. | 6.2 |
+| M11 | Consumers MUST NOT assume the presence of extended attributes. | 6.2 |
+| M12 | Systems handling IML data MUST obtain explicit user consent before collecting emotional annotations. | 8.1 |
+| M13 | Systems handling IML data MUST treat emotion data with the same protections as other PII. | 8.1 |
+| M14 | Systems handling IML data MUST provide mechanisms for users to review and delete their emotional data. | 8.1 |
+| M15 | IML MUST NOT be used for deception detection. | 8.2 |
+| M16 | IML MUST NOT be used for covert emotional surveillance. | 8.2 |
+| M17 | IML MUST NOT be used for discriminatory profiling. | 8.2 |
+| M18 | Consumers MUST ignore `x-` prefixed attributes they do not understand. | 9.2 |
+
+### D.2 SHOULD / SHOULD NOT
+
+| ID | Requirement | Section |
+|----|-------------|---------|
+| S1 | The IML namespace `http://prosody-protocol.org/iml/0.1` SHOULD be used when embedding IML in other XML formats. | 2.3 |
+| S2 | Nesting depth of `<prosody>` inside `<emphasis>` (or vice versa) SHOULD NOT exceed 2 levels. | 5.2 |
+| S3 | Producers SHOULD omit attributes when values are at speaker baseline. | 6.1 |
+| S4 | Producers SHOULD use the core emotion vocabulary where applicable. | 6.1 |
+| S5 | Consumers SHOULD treat `confidence` values below 0.5 as low-confidence annotations. | 6.2 |
+| S6 | Consumers SHOULD use speaker-specific baselines when `speaker_id` is present. | 6.2 |
+| S7 | Consumers SHOULD handle unknown emotion values gracefully by treating them as `neutral`. | 3.1 |
+| S8 | When a prosody profile is active, consumers SHOULD apply profile mappings before default emotion classification. | 7.2 |
+| S9 | When a prosody profile is active, consumers SHOULD add the `confidence_boost` to the baseline confidence score (capped at 1.0). | 7.2 |
+| S10 | When a prosody profile is active, consumers SHOULD indicate profile usage in any downstream reporting. | 7.2 |
+| S11 | Systems handling IML data SHOULD support local/on-device processing where feasible. | 8.1 |
+
+### D.3 MAY / OPTIONAL
+
+| ID | Requirement | Section |
+|----|-------------|---------|
+| O1 | The XML declaration is OPTIONAL but recommended. | 2.2 |
+| O2 | The `version` attribute on `<iml>` is RECOMMENDED. | 2.4 |
+| O3 | The `language` attribute on `<iml>` is OPTIONAL. | 2.4 |
+| O4 | `emotion` on `<utterance>` is OPTIONAL. | 3.1 |
+| O5 | `speaker_id` on `<utterance>` is OPTIONAL. | 3.1 |
+| O6 | Producers MAY use emotion values outside the core set. | 3.1 |
+| O7 | All `<prosody>` attributes are OPTIONAL. | 3.2 |
+| O8 | `<segment>` attributes (`tempo`, `rhythm`) are OPTIONAL. | 3.5 |
+| O9 | Extended attributes (Section 4) are OPTIONAL; producers are NOT required to include them. | 4 |
+| O10 | Custom attributes MAY be added using the `x-` prefix. | 9.2 |

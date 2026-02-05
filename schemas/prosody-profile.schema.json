@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://prosody-protocol.org/schemas/prosody-profile.schema.json",
+  "title": "IML Prosody Profile",
+  "description": "Schema for user prosody profiles that map atypical prosodic patterns to intended emotional meanings. See spec.md Section 7.",
+  "type": "object",
+  "required": ["profile_version", "user_id", "prosody_mappings"],
+  "additionalProperties": false,
+  "properties": {
+    "profile_version": {
+      "type": "string",
+      "description": "Semantic version of the profile format.",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(-[a-zA-Z0-9.]+)?$",
+      "examples": ["0.1.0", "1.0.0"]
+    },
+    "user_id": {
+      "type": "string",
+      "description": "Unique identifier for the user this profile belongs to.",
+      "minLength": 1,
+      "examples": ["user_789"]
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of the user's prosodic characteristics and why this profile exists.",
+      "examples": ["Autism spectrum - monotone speech with rate-based expression"]
+    },
+    "prosody_mappings": {
+      "type": "array",
+      "description": "Ordered list of pattern-to-interpretation mappings. More specific patterns (more keys) take precedence when multiple patterns match.",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/prosodyMapping"
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Optional metadata about the profile (creation date, author, clinical context, etc.).",
+      "properties": {
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO-8601 timestamp when the profile was created."
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO-8601 timestamp when the profile was last updated."
+        },
+        "author": {
+          "type": "string",
+          "description": "Who created or last edited this profile."
+        },
+        "clinical_context": {
+          "type": "string",
+          "description": "Optional clinical or accessibility context."
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "prosodyMapping": {
+      "type": "object",
+      "description": "A single mapping from an observed prosodic pattern to an intended emotional interpretation.",
+      "required": ["pattern", "interpretation"],
+      "additionalProperties": false,
+      "properties": {
+        "pattern": {
+          "$ref": "#/$defs/prosodyPattern"
+        },
+        "interpretation": {
+          "$ref": "#/$defs/prosodyInterpretation"
+        }
+      }
+    },
+    "prosodyPattern": {
+      "type": "object",
+      "description": "Describes an observed prosodic pattern to match against. Keys correspond to prosodic features; values describe the observed state. At least one key must be present.",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "pitch": {
+          "type": "string",
+          "description": "Pitch observation (e.g., 'high', 'low', 'normal').",
+          "enum": ["high", "low", "normal"]
+        },
+        "pitch_contour": {
+          "type": "string",
+          "description": "Observed pitch contour pattern.",
+          "enum": ["rise", "fall", "rise-fall", "fall-rise", "fall-sharp", "rise-sharp", "flat"]
+        },
+        "volume": {
+          "type": "string",
+          "description": "Volume observation.",
+          "enum": ["loud", "quiet", "normal", "spike"]
+        },
+        "rate": {
+          "type": "string",
+          "description": "Speech rate observation.",
+          "enum": ["fast", "slow", "normal"]
+        },
+        "quality": {
+          "type": "string",
+          "description": "Voice quality observation.",
+          "enum": ["modal", "breathy", "tense", "creaky", "whispery", "harsh"]
+        },
+        "pause_frequency": {
+          "type": "string",
+          "description": "Frequency of pauses in speech.",
+          "enum": ["high", "low", "normal"]
+        },
+        "emphasis_frequency": {
+          "type": "string",
+          "description": "Frequency of emphasis markers.",
+          "enum": ["high", "low", "normal"]
+        }
+      }
+    },
+    "prosodyInterpretation": {
+      "type": "object",
+      "description": "The intended emotional meaning when the pattern is matched.",
+      "required": ["emotion"],
+      "additionalProperties": false,
+      "properties": {
+        "emotion": {
+          "type": "string",
+          "description": "The emotion label to apply. May be from the core vocabulary or a custom label.",
+          "minLength": 1,
+          "examples": ["excitement", "thinking_carefully", "emphasis_not_anger"]
+        },
+        "confidence_boost": {
+          "type": "number",
+          "description": "Amount to add to the baseline confidence score (result capped at 1.0).",
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "default": 0.0
+        }
+      }
+    }
+  }
+}
