@@ -28,7 +28,7 @@ from .models import (
     Utterance,
 )
 from .parser import IMLParser
-from .profiles import ProfileApplier, ProfileLoader, ProsodyProfile
+from .profiles import ProfileApplier, ProfileLoader, ProsodyMapping, ProsodyProfile
 from .prosody_analyzer import PauseInterval, ProsodyAnalyzer, SpanFeatures, WordAlignment
 from .text_to_iml import TextToIML
 from .validator import IMLValidator, ValidationIssue, ValidationResult
@@ -65,6 +65,7 @@ __all__ = [
     "ProfileLoader",
     "ProfileApplier",
     "ProsodyProfile",
+    "ProsodyMapping",
     # Exceptions
     "ProsodyProtocolError",
     "IMLParseError",
