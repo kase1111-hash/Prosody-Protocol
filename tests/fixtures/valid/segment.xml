@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<iml version="0.1.0" language="en-US">
+  <utterance emotion="excitement" confidence="0.78" speaker_id="user_789">
+    <segment tempo="rushed" rhythm="legato">
+      I just got the new keyboard and it works perfectly with the setup.
+    </segment>
+  </utterance>
+</iml>

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INVALID: pause missing required duration attribute (violates V5 / spec 3.3) -->
+<utterance emotion="neutral" confidence="0.9">
+  Wait <pause/> there.
+</utterance>

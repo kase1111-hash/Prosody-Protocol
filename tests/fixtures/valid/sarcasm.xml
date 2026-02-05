@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<utterance emotion="sarcastic" confidence="0.87">
+  Oh, that's
+  <prosody pitch="+15%" volume="+6dB" pitch_contour="fall-sharp">
+    GREAT
+  </prosody>.
+</utterance>

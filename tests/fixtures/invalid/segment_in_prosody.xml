@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INVALID: segment nested inside prosody (violates V10 / spec 5.2) -->
+<utterance emotion="calm" confidence="0.9">
+  <prosody pitch="+5%">
+    <segment tempo="rushed">Wrongly nested segment</segment>
+  </prosody>
+</utterance>

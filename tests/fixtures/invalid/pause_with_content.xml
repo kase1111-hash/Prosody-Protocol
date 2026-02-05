@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INVALID: pause has child content (violates V7 / spec 5.2) -->
+<utterance emotion="neutral" confidence="0.9">
+  Wait <pause duration="500">oops</pause> there.
+</utterance>
