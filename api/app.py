@@ -11,13 +11,18 @@ Endpoints defined in spec:
 
 from __future__ import annotations
 
-from prosody_protocol import __version__
-
-# FastAPI import deferred -- requires the [api] extra.
-# This module will fail at import time without it, which is intentional:
-# you should only run the API server with the api extra installed.
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from prosody_protocol import __version__
+from prosody_protocol.exceptions import (
+    ConversionError,
+    IMLParseError,
+    IMLValidationError,
+    ProfileError,
+    ProsodyProtocolError,
+)
 
 from .config import Settings
 from .routes import convert, synthesize, validate
@@ -40,6 +45,60 @@ app.add_middleware(
 app.include_router(convert.router, prefix="/v1/convert", tags=["convert"])
 app.include_router(synthesize.router, prefix="/v1", tags=["synthesize"])
 app.include_router(validate.router, prefix="/v1", tags=["validate"])
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(IMLParseError)
+async def iml_parse_error_handler(request: Request, exc: IMLParseError) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"error": "iml_parse_error", "detail": str(exc)},
+    )
+
+
+@app.exception_handler(ConversionError)
+async def conversion_error_handler(request: Request, exc: ConversionError) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"error": "conversion_error", "detail": str(exc)},
+    )
+
+
+@app.exception_handler(IMLValidationError)
+async def iml_validation_error_handler(
+    request: Request, exc: IMLValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"error": "validation_error", "detail": str(exc)},
+    )
+
+
+@app.exception_handler(ProfileError)
+async def profile_error_handler(request: Request, exc: ProfileError) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"error": "profile_error", "detail": str(exc)},
+    )
+
+
+@app.exception_handler(ProsodyProtocolError)
+async def prosody_protocol_error_handler(
+    request: Request, exc: ProsodyProtocolError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"error": "prosody_protocol_error", "detail": str(exc)},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
 
 
 @app.get("/v1/health")
