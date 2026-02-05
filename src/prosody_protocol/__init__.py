@@ -8,6 +8,7 @@ Public API re-exports for convenient access::
 from ._version import __version__
 from .assembler import IMLAssembler
 from .audio_to_iml import AudioToIML
+from .benchmarks import Benchmark, BenchmarkReport
 from .emotion_classifier import EmotionClassifier, RuleBasedEmotionClassifier
 from .datasets import Dataset, DatasetEntry, DatasetLoader
 from .exceptions import (
@@ -69,6 +70,9 @@ __all__ = [
     "ProfileApplier",
     "ProsodyProfile",
     "ProsodyMapping",
+    # Benchmarks
+    "Benchmark",
+    "BenchmarkReport",
     # Datasets
     "DatasetLoader",
     "DatasetEntry",
