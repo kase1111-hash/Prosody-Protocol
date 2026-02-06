@@ -4,6 +4,45 @@ All notable changes to the Prosody Protocol SDK are documented here.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.1.0a2] - 2026-02-06
+
+### Added
+
+#### Mavis Data Bridge (Phase 16)
+- `MavisBridge` for converting Mavis PhonemeEvent streams to prosody_protocol datasets
+- `PhonemeEvent` dataclass mirroring Mavis data types
+- Feature extraction (7-dimensional) for sklearn training pipelines
+- Batch feature extraction and dataset export
+- Mavis integration guide (`docs/integrations/mavis.md`)
+
+### Changed
+
+#### Security Hardening (Phase 14)
+- XML parser: explicit XXE prevention with `resolve_entities=False, no_network=True`
+- Training model serialization: replaced `pickle` with `joblib` (safer deserialization)
+- API upload size enforcement via `UploadSizeLimitMiddleware` (configurable, default 50MB)
+- Validator V17/V18: consent and processing attribute validation
+- Validator handles non-element nodes (entities, PIs) gracefully
+
+#### Dependency & Spec Cleanup (Phase 15)
+- Moved `torch` and `transformers` to new `ml-neural` extra (not required for sklearn baselines)
+- `ml` extra now only requires `scikit-learn` and `pyyaml`
+- Promoted `<segment>` tag to stable status in spec.md and CLAUDE.md
+
+#### API Production Readiness (Phase 17)
+- Rate limiting middleware (configurable via `PP_RATE_LIMIT` env var, default 60 req/min)
+- CORS restricted to configured origins only (no wildcard default)
+- Dockerfile runs as non-root user, includes `api/` directory, env var configuration
+- `api/config.py` reads all settings from environment variables
+
+#### Testing & CI (Phase 18)
+- Added `test-ml-extras` CI job for sklearn training pipeline
+- Added `test-api-extras` CI job for FastAPI endpoints
+- Total test count: 526 (from 491)
+
+### Infrastructure
+- `pyproject.toml`: new `ml-neural` and `all-neural` extras groups
+
 ## [0.1.0a1] - 2026-02-05
 
 ### Added
@@ -63,7 +102,8 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ### Infrastructure
 - `pyproject.toml` with optional dependency groups: `audio`, `ml`, `api`, `dev`
-- Comprehensive test suite (465+ tests)
+- Comprehensive test suite (491+ tests)
 - IML test fixtures in `tests/fixtures/`
 
+[0.1.0a2]: https://github.com/kase1111-hash/Prosody-Protocol/releases/tag/v0.1.0a2
 [0.1.0a1]: https://github.com/kase1111-hash/Prosody-Protocol/releases/tag/v0.1.0a1

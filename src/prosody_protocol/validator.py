@@ -18,8 +18,10 @@ Implements validation rules V1-V16 as defined in the execution guide:
   V14 volume value matches valid format                        WARNING
   V15 emotion is from core vocabulary                          INFO
   V16 No unknown elements present                              INFO
+  V17 consent value is "explicit" or "implicit"                WARNING
+  V18 processing value is "local" or "remote"                  WARNING
 
-Spec reference: Sections 5-6.
+Spec reference: Sections 5-6, 8.
 """
 
 from __future__ import annotations
@@ -30,6 +32,9 @@ from pathlib import Path
 from typing import Literal
 
 from lxml import etree
+
+# Secure XML parser: disable external entities and network access (defense-in-depth).
+_SECURE_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -54,6 +59,9 @@ _CORE_EMOTIONS = frozenset({
 _VALID_EMPHASIS_LEVELS = frozenset({"strong", "moderate", "reduced"})
 
 _KNOWN_ELEMENTS = frozenset({"iml", "utterance", "prosody", "pause", "emphasis", "segment"})
+
+_VALID_CONSENT_VALUES = frozenset({"explicit", "implicit"})
+_VALID_PROCESSING_VALUES = frozenset({"local", "remote"})
 
 # Patterns per spec Section 3.2
 _PITCH_RE = re.compile(r"^[+\-]\d+(\.\d+)?(%|st)$|^\d+(\.\d+)?Hz$")
@@ -219,7 +227,10 @@ class _Walker:
         for child in el:
             if isinstance(child, etree._Comment):
                 continue
-            tag = _strip_ns(child.tag)  # type: ignore[arg-type]
+            # Skip non-element nodes (entities, processing instructions, etc.)
+            if not isinstance(child.tag, str):
+                continue
+            tag = _strip_ns(child.tag)
 
             # V16: unknown elements
             if tag not in _KNOWN_ELEMENTS:
@@ -256,7 +267,7 @@ class IMLValidator:
 
         # V1: well-formed XML
         try:
-            root = etree.fromstring(iml_string.encode("utf-8"))  # noqa: S320
+            root = etree.fromstring(iml_string.encode("utf-8"), parser=_SECURE_PARSER)  # noqa: S320
         except etree.XMLSyntaxError as exc:
             result.valid = False
             result.issues.append(
@@ -273,6 +284,24 @@ class IMLValidator:
         root_tag = _strip_ns(root.tag)
 
         if root_tag == "iml":
+            # V17: consent attribute value
+            consent = root.get("consent")
+            if consent is not None and consent not in _VALID_CONSENT_VALUES:
+                walker._add(
+                    "warning", "V17",
+                    f'consent="{consent}" is not a recognized value (expected: explicit, implicit)',
+                    root,
+                )
+
+            # V18: processing attribute value
+            processing = root.get("processing")
+            if processing is not None and processing not in _VALID_PROCESSING_VALUES:
+                walker._add(
+                    "warning", "V18",
+                    f'processing="{processing}" is not a recognized value (expected: local, remote)',
+                    root,
+                )
+
             # Check for at least one utterance
             utterance_children = [
                 c for c in root

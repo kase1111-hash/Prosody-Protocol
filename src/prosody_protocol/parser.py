@@ -14,6 +14,9 @@ from pathlib import Path
 from lxml import etree
 
 from .exceptions import IMLParseError
+
+# Secure XML parser: disable external entities and network access (defense-in-depth).
+_SECURE_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
 from .models import (
     ChildNode,
     Emphasis,
@@ -259,7 +262,7 @@ class IMLParser:
         malformed XML.
         """
         try:
-            root = etree.fromstring(iml_string.encode("utf-8"))  # noqa: S320
+            root = etree.fromstring(iml_string.encode("utf-8"), parser=_SECURE_PARSER)  # noqa: S320
         except etree.XMLSyntaxError as exc:
             raise IMLParseError(
                 str(exc),
