@@ -56,7 +56,7 @@ class TestAcceptanceCriteria:
         assert results["task"] == "ser"
         assert results["train_samples"] > 0
         assert "accuracy" in results["train_metrics"]
-        assert (tmp_path / "checkpoint" / "model.pkl").exists()
+        assert (tmp_path / "checkpoint" / "model.joblib").exists()
         assert (tmp_path / "checkpoint" / "metadata.json").exists()
 
     def test_evaluation_produces_precision_recall_f1(self, tmp_path):
@@ -112,7 +112,7 @@ class TestAcceptanceCriteria:
         )
 
         assert (tmp_path / "export" / "config.json").exists()
-        assert (tmp_path / "export" / "model.pkl").exists()
+        assert (tmp_path / "export" / "model.joblib").exists()
         assert (tmp_path / "export" / "export_metadata.json").exists()
 
         # Load exported model and run inference
@@ -614,7 +614,7 @@ class TestEdgeCases:
 
         deep_path = tmp_path / "a" / "b" / "c"
         model.save(deep_path)
-        assert (deep_path / "model.pkl").exists()
+        assert (deep_path / "model.joblib").exists()
 
     def test_evaluation_report_dict_serializable(self):
         report = compute_metrics(["a", "b"], ["a", "b"])

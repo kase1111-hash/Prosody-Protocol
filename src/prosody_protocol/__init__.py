@@ -22,6 +22,7 @@ from .exceptions import (
     TrainingError,
 )
 from .iml_to_audio import IMLToAudio
+from .mavis_bridge import MavisBridge, PhonemeEvent
 from .iml_to_ssml import IMLToSSML
 from .models import (
     Emphasis,
@@ -77,6 +78,9 @@ __all__ = [
     "DatasetLoader",
     "DatasetEntry",
     "Dataset",
+    # Mavis Bridge
+    "MavisBridge",
+    "PhonemeEvent",
     # Exceptions
     "ProsodyProtocolError",
     "IMLParseError",

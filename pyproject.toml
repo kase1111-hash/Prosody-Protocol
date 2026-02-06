@@ -37,10 +37,13 @@ audio = [
     "praat-parselmouth>=0.4",
 ]
 ml = [
-    "torch>=2.0",
-    "transformers>=4.30",
     "scikit-learn>=1.3",
     "pyyaml>=6.0",
+]
+ml-neural = [
+    "prosody-protocol[ml]",
+    "torch>=2.0",
+    "transformers>=4.30",
 ]
 api = [
     "fastapi>=0.100",
@@ -55,6 +58,7 @@ dev = [
     "lxml-stubs",
 ]
 all = ["prosody-protocol[audio,ml,api,dev]"]
+all-neural = ["prosody-protocol[audio,ml-neural,api,dev]"]
 
 [tool.hatch.version]
 path = "src/prosody_protocol/_version.py"

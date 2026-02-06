@@ -313,3 +313,34 @@ class TestErrorHandling:
             data = resp.json()
             assert "valid" in data
             assert "issues" in data
+
+
+# ---------------------------------------------------------------------------
+# Upload size enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestUploadSizeLimit:
+    def test_oversized_upload_rejected(self, client: TestClient) -> None:
+        """Uploads exceeding max_upload_size_mb should return 413."""
+        from api.app import settings
+
+        # Create a payload just over the limit
+        over_limit = b"x" * (settings.max_upload_bytes + 1)
+        resp = client.post(
+            "/v1/convert/audio-to-iml",
+            files={"audio": ("big.wav", over_limit, "audio/wav")},
+            headers={"content-length": str(len(over_limit))},
+        )
+        assert resp.status_code == 413
+        assert "payload_too_large" in resp.json()["error"]
+
+    def test_small_upload_passes_size_check(self, client: TestClient) -> None:
+        """A small upload should not be rejected by the size middleware."""
+        small_payload = b"RIFF" + b"\x00" * 100
+        resp = client.post(
+            "/v1/convert/audio-to-iml",
+            files={"audio": ("small.wav", small_payload, "audio/wav")},
+        )
+        # May fail on audio processing, but should NOT be 413
+        assert resp.status_code != 413

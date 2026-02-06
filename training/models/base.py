@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-import pickle
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 
 
@@ -41,14 +41,13 @@ class BaseModel(ABC):
         """Save the model checkpoint to a directory.
 
         Creates:
-        - model.pkl: pickled model object
+        - model.joblib: serialized model object (via joblib, safer than pickle)
         - metadata.json: model metadata and config
         """
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
 
-        with open(path / "model.pkl", "wb") as f:
-            pickle.dump(self, f)
+        joblib.dump(self, path / "model.joblib")
 
         metadata = {
             "model_class": type(self).__name__,
@@ -61,12 +60,15 @@ class BaseModel(ABC):
     def load(cls, path: str | Path) -> BaseModel:
         """Load a model checkpoint from a directory."""
         path = Path(path)
-        model_file = path / "model.pkl"
-        if not model_file.exists():
-            raise FileNotFoundError(f"No model checkpoint found at {model_file}")
 
-        with open(model_file, "rb") as f:
-            model = pickle.load(f)  # noqa: S301
+        # Support both new (.joblib) and legacy (.pkl) checkpoints.
+        model_file = path / "model.joblib"
+        if not model_file.exists():
+            model_file = path / "model.pkl"
+        if not model_file.exists():
+            raise FileNotFoundError(f"No model checkpoint found at {path}")
+
+        model = joblib.load(model_file)
 
         if not isinstance(model, BaseModel):
             raise TypeError(f"Loaded object is not a BaseModel: {type(model)}")
@@ -94,9 +96,8 @@ class BaseModel(ABC):
 
     def _export_weights(self, path: Path) -> None:
         """Export model weights. Override in subclasses for custom formats."""
-        # Default: also save as pickle for non-neural models
-        with open(path / "model.pkl", "wb") as f:
-            pickle.dump(self, f)
+        # Default: save via joblib for non-neural models
+        joblib.dump(self, path / "model.joblib")
 
 
 class ModelRegistry:

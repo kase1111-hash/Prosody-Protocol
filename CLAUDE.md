@@ -27,8 +27,7 @@ Prosody-Protocol/
 ## Key Concepts
 
 - **IML (Intent Markup Language):** The XML markup format. See `spec.md` for the full specification.
-- **Core tags:** `<utterance>`, `<prosody>`, `<pause>`, `<emphasis>` (stable)
-- **Experimental tags:** `<segment>` (may change)
+- **Core tags:** `<utterance>`, `<prosody>`, `<pause>`, `<emphasis>`, `<segment>` (all stable)
 - **Extended attributes:** `f0_mean`, `f0_range`, `intensity_mean`, `jitter`, `shimmer`, etc. (for research use)
 - **Prosody profiles:** JSON documents that map atypical prosodic patterns to intended meanings (accessibility feature)
 

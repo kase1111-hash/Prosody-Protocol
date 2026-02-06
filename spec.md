@@ -265,7 +265,7 @@ I <emphasis level="strong">said</emphasis> I'm fine.
 
 Groups a stretch of speech sharing overall prosodic characteristics. Useful for characterizing entire phrases or clauses rather than individual words.
 
-**Status:** Stable (promoted from experimental in v1.0)
+**Status:** Stable (promoted from experimental in v0.1.0-alpha)
 
 **Content model:** Mixed content (text, `<prosody>`, `<pause>`, `<emphasis>`)
 
