@@ -42,7 +42,7 @@ class ProsodyProfile:
     profile_version: str
     user_id: str
     description: str | None
-    mappings: list[ProsodyMapping]
+    mappings: tuple[ProsodyMapping, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +142,7 @@ class ProfileLoader:
             profile_version=profile_version,
             user_id=user_id,
             description=description,
-            mappings=mappings,
+            mappings=tuple(mappings),
         )
 
     def validate(self, profile: ProsodyProfile) -> ValidationResult:

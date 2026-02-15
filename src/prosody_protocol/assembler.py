@@ -282,12 +282,15 @@ class IMLAssembler:
         -------
         IMLDocument
         """
-        # Pair words with their features.
-        feat_map: dict[int, SpanFeatures] = {f.start_ms: f for f in features}
+        # Pair words with their features using (start_ms, end_ms) to avoid
+        # collisions when two words share the same start timestamp.
+        feat_map: dict[tuple[int, int], SpanFeatures] = {
+            (f.start_ms, f.end_ms): f for f in features
+        }
         words = [
             _WordWithFeatures(
                 alignment=a,
-                features=feat_map.get(a.start_ms),
+                features=feat_map.get((a.start_ms, a.end_ms)),
             )
             for a in alignments
         ]

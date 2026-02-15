@@ -40,13 +40,13 @@ import training.models.pitch_contour  # noqa: F401
 
 def load_prepared_data(data_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load pre-prepared train and validation data."""
-    X_train = np.load(data_dir / "train" / "X.npy", allow_pickle=True)
-    y_train = np.load(data_dir / "train" / "y.npy", allow_pickle=True)
+    X_train = np.load(data_dir / "train" / "X.npy", allow_pickle=False)
+    y_train = np.load(data_dir / "train" / "y.npy", allow_pickle=False)
 
     val_dir = data_dir / "val"
     if val_dir.exists() and (val_dir / "X.npy").exists():
-        X_val = np.load(val_dir / "X.npy", allow_pickle=True)
-        y_val = np.load(val_dir / "y.npy", allow_pickle=True)
+        X_val = np.load(val_dir / "X.npy", allow_pickle=False)
+        y_val = np.load(val_dir / "y.npy", allow_pickle=False)
     else:
         X_val = np.zeros((0, X_train.shape[1] if X_train.ndim > 1 else 0))
         y_val = np.array([])
