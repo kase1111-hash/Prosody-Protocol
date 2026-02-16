@@ -49,6 +49,18 @@ def _strip_ns(tag: str) -> str:
     return tag
 
 
+def _extract_all_text(element: etree._Element) -> str:
+    """Recursively extract all text content from an element and its descendants."""
+    parts: list[str] = []
+    if element.text:
+        parts.append(element.text)
+    for child in element:
+        parts.append(_extract_all_text(child))
+        if child.tail:
+            parts.append(child.tail)
+    return "".join(parts)
+
+
 def _collect_children(element: etree._Element) -> tuple[ChildNode, ...]:
     """Walk mixed content of *element*, returning an ordered tuple of
     text strings and parsed child model objects.
@@ -63,6 +75,12 @@ def _collect_children(element: etree._Element) -> tuple[ChildNode, ...]:
         node = _parse_element(child_el)
         if node is not None:
             children.append(node)
+        else:
+            # Unknown element: preserve its inner text content so it
+            # isn't silently dropped from the parsed document.
+            inner_text = _extract_all_text(child_el)
+            if inner_text:
+                children.append(inner_text)
         # Tail text following the child element.
         if child_el.tail:
             children.append(child_el.tail)

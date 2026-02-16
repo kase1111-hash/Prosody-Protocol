@@ -195,6 +195,7 @@ class TestAcceptanceCriteria:
             pause_f1=0.0,
             validity_rate=1.0,
             num_samples=10,
+            num_failures=0,
             duration_seconds=1.0,
         )
 
@@ -237,6 +238,7 @@ class TestBenchmarkReport:
             pause_f1=0.88,
             validity_rate=1.0,
             num_samples=100,
+            num_failures=0,
             duration_seconds=12.5,
         )
 
@@ -285,6 +287,7 @@ class TestBenchmarkReport:
             pause_f1=0.85,
             validity_rate=1.0,
             num_samples=100,
+            num_failures=0,
             duration_seconds=10.0,
         )
         failures = sample_report.check_regression(baseline=baseline)
@@ -299,6 +302,7 @@ class TestBenchmarkReport:
             pause_f1=0.70,
             validity_rate=0.90,
             num_samples=100,
+            num_failures=0,
             duration_seconds=10.0,
         )
         baseline = BenchmarkReport(
@@ -309,6 +313,7 @@ class TestBenchmarkReport:
             pause_f1=0.90,
             validity_rate=1.0,
             num_samples=100,
+            num_failures=0,
             duration_seconds=10.0,
         )
         failures = current.check_regression(baseline=baseline)
@@ -324,6 +329,7 @@ class TestBenchmarkReport:
             pause_f1=0.9,
             validity_rate=1.0,
             num_samples=50,
+            num_failures=0,
             duration_seconds=5.0,
         )
         failures = report.check_regression(thresholds={"confidence_ece": 0.10})
@@ -517,6 +523,7 @@ class TestBenchmarkExecution:
         benchmark = Benchmark(dataset, converter, dataset_dir=SYNTHETIC_DATASET)
         report = benchmark.run()
         assert report.num_samples == 0
+        assert report.num_failures == 10
 
     def test_no_dataset_dir_uses_entry_iml(self, dataset):
         """Without dataset_dir, benchmark evaluates ground-truth IML itself."""

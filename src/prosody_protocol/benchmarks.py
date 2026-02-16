@@ -10,12 +10,15 @@ Phase 12 deliverable from EXECUTION_GUIDE.md.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from .datasets import Dataset
 from .models import IMLDocument, Pause, Prosody, Utterance
@@ -68,6 +71,7 @@ class BenchmarkReport:
     pause_f1: float
     validity_rate: float
     num_samples: int
+    num_failures: int
     duration_seconds: float
 
     def to_dict(self) -> dict[str, Any]:
@@ -80,6 +84,7 @@ class BenchmarkReport:
             "pause_f1": round(self.pause_f1, 4),
             "validity_rate": round(self.validity_rate, 4),
             "num_samples": self.num_samples,
+            "num_failures": self.num_failures,
             "duration_seconds": round(self.duration_seconds, 3),
         }
 
@@ -104,6 +109,7 @@ class BenchmarkReport:
             pause_f1=data["pause_f1"],
             validity_rate=data["validity_rate"],
             num_samples=data["num_samples"],
+            num_failures=data.get("num_failures", 0),
             duration_seconds=data["duration_seconds"],
         )
 
@@ -384,11 +390,13 @@ class Benchmark:
 
         valid_count = 0
         processed = 0
+        num_failures = 0
 
         for entry in entries:
             # Get predicted IML
             predicted_iml = self._get_predicted_iml(entry)
             if predicted_iml is None:
+                num_failures += 1
                 continue
             processed += 1
 
@@ -413,13 +421,15 @@ class Benchmark:
                 true_emotions.append(entry.emotion_label)
                 correct_flags.append(pred_emotion == entry.emotion_label)
 
-            # Pitch contour comparison
-            pred_contours = _extract_pitch_contours(pred_doc)
+            # Parse ground-truth IML once for both contour and pause comparison.
             try:
                 true_doc = self._parser.parse(entry.iml)
-                true_contours = _extract_pitch_contours(true_doc)
             except Exception:
-                true_contours = []
+                true_doc = None
+
+            # Pitch contour comparison
+            pred_contours = _extract_pitch_contours(pred_doc)
+            true_contours = _extract_pitch_contours(true_doc) if true_doc else []
 
             # Align contour lists (truncate to shorter)
             n_contours = min(len(pred_contours), len(true_contours))
@@ -429,11 +439,7 @@ class Benchmark:
 
             # Pause comparison
             pred_pauses = _extract_pauses(pred_doc)
-            try:
-                true_doc_for_pause = self._parser.parse(entry.iml)
-                true_pauses = _extract_pauses(true_doc_for_pause)
-            except Exception:
-                true_pauses = []
+            true_pauses = _extract_pauses(true_doc) if true_doc else []
 
             all_pred_pauses.extend(pred_pauses)
             all_true_pauses.extend(true_pauses)
@@ -470,6 +476,7 @@ class Benchmark:
             pause_f1=pause_f1,
             validity_rate=validity_rate,
             num_samples=processed,
+            num_failures=num_failures,
             duration_seconds=elapsed,
         )
 
@@ -480,6 +487,12 @@ class Benchmark:
             try:
                 return self.converter.convert(audio_path)
             except Exception:
+                logger.warning(
+                    "Conversion failed for entry %s (%s): skipping",
+                    getattr(entry, "id", "?"),
+                    audio_path,
+                    exc_info=True,
+                )
                 return None
         # If no dataset_dir, use the ground-truth IML as "predicted"
         # (useful for validating IML quality in the dataset itself)

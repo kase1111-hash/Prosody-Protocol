@@ -146,12 +146,13 @@ class RuleBasedEmotionClassifier:
         sorted_scores = sorted(scores.values(), reverse=True)
         if len(sorted_scores) > 1 and sorted_scores[0] > 0:
             margin = sorted_scores[0] - sorted_scores[1]
-            confidence = min(1.0, 0.5 + margin * 2)
+            relative_margin = margin / sorted_scores[0] if sorted_scores[0] > 0 else 0
+            confidence = min(1.0, 0.3 + relative_margin * 0.65)
         else:
-            confidence = 0.5
+            confidence = 0.3
 
-        # Floor at 0.5, cap at 0.95 for rule-based system.
-        confidence = max(0.5, min(0.95, confidence))
+        # Floor at 0.3 (honest uncertainty), cap at 0.95 for rule-based system.
+        confidence = max(0.3, min(0.95, confidence))
 
         return (best_emotion, round(confidence, 2))
 
