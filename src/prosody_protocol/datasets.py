@@ -267,17 +267,27 @@ class DatasetLoader:
 
     @staticmethod
     def _parse_entry(raw: dict[str, object], filename: str) -> DatasetEntry:
-        """Parse a raw JSON dict into a DatasetEntry."""
+        """Parse a raw JSON dict into a DatasetEntry.
+
+        Raises DatasetError if required fields are missing.
+        """
+        _REQUIRED_STR_FIELDS = ("id", "audio_file", "transcript", "iml", "emotion_label")
+        missing = [f for f in _REQUIRED_STR_FIELDS if not raw.get(f)]
+        if missing:
+            raise DatasetError(
+                f"Entry {filename} is missing required fields: {', '.join(missing)}"
+            )
+
         try:
             return DatasetEntry(
-                id=str(raw.get("id", "")),
+                id=str(raw["id"]),
                 timestamp=str(raw.get("timestamp", "")),
                 source=str(raw.get("source", "")),
                 language=str(raw.get("language", "")),
-                audio_file=str(raw.get("audio_file", "")),
-                transcript=str(raw.get("transcript", "")),
-                iml=str(raw.get("iml", "")),
-                emotion_label=str(raw.get("emotion_label", "")),
+                audio_file=str(raw["audio_file"]),
+                transcript=str(raw["transcript"]),
+                iml=str(raw["iml"]),
+                emotion_label=str(raw["emotion_label"]),
                 annotator=str(raw.get("annotator", "")),
                 consent=raw.get("consent") is True,
                 speaker_id=raw.get("speaker_id") if isinstance(raw.get("speaker_id"), str) else None,

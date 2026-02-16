@@ -137,15 +137,15 @@ class TestDataModels:
             profile_version="0.1.0",
             user_id="user_789",
             description="Test profile",
-            mappings=[],
+            mappings=(),
         )
         assert p.profile_version == "0.1.0"
         assert p.user_id == "user_789"
         assert p.description == "Test profile"
-        assert p.mappings == []
+        assert p.mappings == ()
 
     def test_prosody_profile_none_description(self) -> None:
-        p = ProsodyProfile("1.0.0", "u1", None, [])
+        p = ProsodyProfile("1.0.0", "u1", None, ())
         assert p.description is None
 
 

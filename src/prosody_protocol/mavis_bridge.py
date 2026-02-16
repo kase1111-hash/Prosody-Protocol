@@ -303,12 +303,12 @@ class MavisBridge:
                 word_vol = sum(e.volume for e in word_events) / len(word_events)
 
                 pitch_dev = (word_pitch - mean_pitch) / max(mean_pitch, 1) * 100
-                vol_dev = (word_vol - mean_volume) / max(mean_volume, 0.01)
+                vol_ratio = word_vol / max(mean_volume, 0.001)
 
-                if abs(pitch_dev) > 10 or abs(vol_dev) > 0.3:
+                if abs(pitch_dev) > 10 or abs(vol_ratio - 1.0) > 0.3:
                     pitch_str = f"+{pitch_dev:.0f}%" if pitch_dev > 0 else f"{pitch_dev:.0f}%"
-                    vol_db = vol_dev * 10
-                    vol_str = f"+{vol_db:.0f}dB" if vol_db > 0 else f"{vol_db:.0f}dB"
+                    vol_db = 20.0 * math.log10(max(vol_ratio, 0.001))
+                    vol_str = f"+{vol_db:.0f}dB" if vol_db >= 0 else f"{vol_db:.0f}dB"
                     parts.append(
                         f'<prosody pitch="{pitch_str}" volume="{vol_str}">{word}</prosody>'
                     )

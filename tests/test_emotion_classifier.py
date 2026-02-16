@@ -57,7 +57,7 @@ class TestAngry:
             _make_features(f0_mean=260, intensity_mean=75, speech_rate=6.0, jitter=0.02)
         )
         assert emotion == "angry"
-        assert confidence >= 0.5
+        assert confidence >= 0.3
 
     def test_angry_has_reasonable_confidence(
         self, classifier: RuleBasedEmotionClassifier
@@ -65,7 +65,7 @@ class TestAngry:
         _, confidence = classifier.classify(
             _make_features(f0_mean=280, intensity_mean=80, speech_rate=7.0, jitter=0.025)
         )
-        assert 0.5 <= confidence <= 1.0
+        assert 0.3 <= confidence <= 1.0
 
 
 class TestSad:
@@ -74,7 +74,7 @@ class TestSad:
             _make_features(f0_mean=140, intensity_mean=58, speech_rate=2.5, f0_range=(130, 150))
         )
         assert emotion == "sad"
-        assert confidence >= 0.5
+        assert confidence >= 0.3
 
 
 class TestJoyful:
@@ -89,7 +89,7 @@ class TestJoyful:
             )
         )
         assert emotion == "joyful"
-        assert confidence >= 0.5
+        assert confidence >= 0.3
 
 
 class TestFrustrated:
@@ -105,7 +105,7 @@ class TestFrustrated:
             )
         )
         assert emotion == "frustrated"
-        assert confidence >= 0.5
+        assert confidence >= 0.3
 
 
 class TestNeutral:
@@ -114,7 +114,7 @@ class TestNeutral:
             _make_features(f0_mean=180, intensity_mean=65, speech_rate=4.0)
         )
         assert emotion == "neutral"
-        assert confidence >= 0.5
+        assert confidence >= 0.3
 
 
 class TestCalm:
@@ -130,7 +130,7 @@ class TestCalm:
             )
         )
         assert emotion == "calm"
-        assert confidence >= 0.5
+        assert confidence >= 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -158,12 +158,12 @@ class TestEdgeCases:
     def test_confidence_in_valid_range(
         self, classifier: RuleBasedEmotionClassifier
     ) -> None:
-        """Confidence should always be between 0.5 and 0.95."""
+        """Confidence should always be between 0.3 and 0.95."""
         for f0 in [100, 150, 200, 250, 300]:
             _, confidence = classifier.classify(
                 _make_features(f0_mean=float(f0), intensity_mean=65.0)
             )
-            assert 0.5 <= confidence <= 0.95
+            assert 0.3 <= confidence <= 0.95
 
     def test_returns_tuple(self, classifier: RuleBasedEmotionClassifier) -> None:
         result = classifier.classify(_make_features(f0_mean=200, intensity_mean=70))

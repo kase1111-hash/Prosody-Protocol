@@ -60,11 +60,18 @@ def _run_whisper_or_stub(audio_path: Path, model_name: str) -> list[WordAlignmen
     try:
         return _run_whisper(audio_path, model_name)
     except AudioProcessingError:
-        # Minimal fallback: one word covering the whole file.
+        import warnings
+
         import parselmouth
 
         sound = parselmouth.Sound(str(audio_path))
         duration_ms = int(sound.duration * 1000)
+        warnings.warn(
+            "Whisper is not installed; transcript will contain a placeholder "
+            "'[speech]' token instead of real words. Install with: "
+            "pip install prosody-protocol[audio]",
+            stacklevel=2,
+        )
         return [WordAlignment(word="[speech]", start_ms=0, end_ms=duration_ms)]
 
 
@@ -131,11 +138,12 @@ class AudioToIML:
         alignments = _run_whisper_or_stub(path, self.stt_model)
 
         if not alignments:
-            # Edge case: no speech detected.
+            # Edge case: no speech detected -- return empty utterance with
+            # no emotion (don't fabricate a classification from silence).
             from .models import Utterance
 
             return IMLDocument(
-                utterances=(Utterance(children=("",), emotion="neutral", confidence=0.5),),
+                utterances=(Utterance(children=("",)),),
                 version="0.1.0",
                 language=self.language,
             )

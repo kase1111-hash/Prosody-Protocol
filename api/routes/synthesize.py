@@ -18,7 +18,7 @@ class SynthesizeRequest(BaseModel):
 
 @router.post("/synthesize")
 async def synthesize(request: SynthesizeRequest) -> Response:
-    synth = IMLToAudio()
+    synth = IMLToAudio(voice=request.voice)
     wav_bytes = synth.synthesize(request.iml)
     return Response(
         content=wav_bytes,

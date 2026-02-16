@@ -265,6 +265,15 @@ class IMLToAudio:
         self.voice = voice
         self.engine = engine
         self._parser = IMLParser()
+        if engine != "builtin":
+            import warnings
+
+            warnings.warn(
+                f"Engine {engine!r} is not yet implemented; falling back to "
+                f"the built-in waveform synthesizer. Output will be sine-wave "
+                f"tones, not natural speech.",
+                stacklevel=2,
+            )
 
     def synthesize(self, iml_string: str) -> bytes:
         """Synthesize IML to raw audio bytes (WAV format).

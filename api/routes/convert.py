@@ -36,17 +36,19 @@ async def audio_to_iml(audio: UploadFile, language: str | None = None) -> Conver
     converter = AudioToIML(language=language or "en-US")
     parser = IMLParser()
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        content = await audio.read()
-        tmp.write(content)
-        tmp_path = Path(tmp.name)
-
+    tmp_path: Path | None = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            content = await audio.read()
+            tmp.write(content)
+            tmp_path = Path(tmp.name)
+
         doc = converter.convert_to_doc(tmp_path)
         iml_string = parser.to_iml_string(doc)
         plain_text = parser.to_plain_text(doc)
     finally:
-        tmp_path.unlink(missing_ok=True)
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
     return ConvertResponse(iml=iml_string, plain_text=plain_text)
 

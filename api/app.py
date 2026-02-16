@@ -77,6 +77,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self.rpm = requests_per_minute
         self._window: dict[str, list[float]] = {}
+        self._last_cleanup: float = 0.0
 
     async def dispatch(self, request: Request, call_next):  # type: ignore[override]
         if self.rpm <= 0:
@@ -86,10 +87,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         client_ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
+        cutoff = now - 60
+
+        # Periodically evict stale IPs to prevent unbounded memory growth.
+        if now - self._last_cleanup > 300:  # every 5 minutes
+            stale_ips = [
+                ip for ip, timestamps in self._window.items()
+                if not timestamps or timestamps[-1] <= cutoff
+            ]
+            for ip in stale_ips:
+                del self._window[ip]
+            self._last_cleanup = now
+
         window = self._window.setdefault(client_ip, [])
 
         # Remove entries older than 60 seconds
-        cutoff = now - 60
         window[:] = [t for t in window if t > cutoff]
 
         if len(window) >= self.rpm:
