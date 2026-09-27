@@ -5,22 +5,34 @@ Covers:
 - ProfileLoader: load from file, load from dict, error handling
 - ProfileLoader.validate: version, user_id, mappings, pattern keys/values
 - ProfileApplier: pattern matching, specificity, confidence capping
+- categorize_features: measured features to pattern vocabulary
 - Data model frozen semantics
 - Edge cases: empty features, no match, multiple matches
 """
 
 from __future__ import annotations
 
+import math
+import shutil
+import statistics
+import subprocess
+import wave
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from prosody_protocol._types import PauseInterval, SpanFeatures
 from prosody_protocol.exceptions import ProfileError
 from prosody_protocol.profiles import (
+    RATE_FAST_SYLLABLES_PER_S,
+    RATE_SLOW_SYLLABLES_PER_S,
     ProfileApplier,
     ProfileLoader,
     ProsodyMapping,
     ProsodyProfile,
+    categorize_features,
 )
 
 PROFILES_DIR = Path(__file__).parent / "fixtures" / "profiles"
@@ -42,7 +54,7 @@ def autism_profile(loader: ProfileLoader) -> ProsodyProfile:
 
 
 @pytest.fixture()
-def spec_profile_json() -> dict[str, object]:
+def spec_profile_json() -> dict[str, Any]:
     """The example profile from spec Section 7.1."""
     return {
         "profile_version": "0.1.0",
@@ -264,6 +276,58 @@ class TestProfileLoaderJSON:
         })
         assert profile.mappings[0].confidence_boost == 0.0
 
+    @pytest.mark.parametrize("boost", [True, float("nan"), float("inf"), "0.1"])
+    def test_non_numeric_confidence_boost_rejected(
+        self, loader: ProfileLoader, boost: object
+    ) -> None:
+        """A bool or NaN boost used to pin every matched confidence to 1.0."""
+        with pytest.raises(ProfileError, match="confidence_boost must be a finite number"):
+            loader.load_json({
+                "profile_version": "1.0.0",
+                "user_id": "u1",
+                "prosody_mappings": [{
+                    "pattern": {"volume": "spike"},
+                    "interpretation": {"emotion": "x", "confidence_boost": boost},
+                }],
+            })
+
+    def test_nan_in_file_rejected(self, loader: ProfileLoader, tmp_path: Path) -> None:
+        path = tmp_path / "nan.json"
+        path.write_text(
+            '{"profile_version": "1.0.0", "user_id": "u1", "prosody_mappings": [{"pattern": '
+            '{"volume": "spike"}, "interpretation": {"emotion": "x", "confidence_boost": NaN}}]}',
+            encoding="utf-8",
+        )
+        with pytest.raises(ProfileError, match="NaN is not a JSON number"):
+            loader.load(path)
+
+    @pytest.mark.parametrize(
+        ("where", "match"),
+        [("profile", r"profile has unknown key\(s\) \['evil'\]"),
+         ("mapping", r"prosody_mappings\[0\] has unknown key\(s\) \['weight'\]"),
+         ("interpretation", r"interpretation has unknown key\(s\) \['note'\]")],
+    )
+    def test_unknown_keys_rejected(
+        self, loader: ProfileLoader, spec_profile_json: dict[str, Any], where: str, match: str
+    ) -> None:
+        if where == "profile":
+            spec_profile_json["evil"] = 1
+        elif where == "mapping":
+            spec_profile_json["prosody_mappings"][0]["weight"] = 2
+        else:
+            spec_profile_json["prosody_mappings"][0]["interpretation"]["note"] = "x"
+        with pytest.raises(ProfileError, match=match):
+            loader.load_json(spec_profile_json)
+
+    def test_metadata_accepted_when_an_object(
+        self, loader: ProfileLoader, spec_profile_json: dict[str, Any]
+    ) -> None:
+        spec_profile_json["metadata"] = {"author": "clinic", "created_at": "2025-01-01T00:00:00Z"}
+        assert loader.validate(loader.load_json(spec_profile_json)).valid
+        spec_profile_json["metadata"] = "clinic"
+        with pytest.raises(ProfileError, match="'metadata' must be an object"):
+            loader.load_json(spec_profile_json)
+
     def test_integer_confidence_boost_accepted(self, loader: ProfileLoader) -> None:
         profile = loader.load_json({
             "profile_version": "1.0.0",
@@ -326,23 +390,36 @@ class TestProfileValidation:
         assert not result.valid
         assert any(i.rule == "P4" for i in result.issues)
 
-    def test_unknown_pattern_key_warns(self, loader: ProfileLoader) -> None:
+    def test_unknown_pattern_key_invalid(self, loader: ProfileLoader) -> None:
+        """A key categorize_features never produces could never match."""
         profile = ProsodyProfile(
             "1.0.0", "u1", None,
             [ProsodyMapping({"unknown_key": "value"}, "excited", 0.1)],
         )
         result = loader.validate(profile)
-        assert result.valid  # Warnings don't invalidate.
-        assert any(i.rule == "P5" and i.severity == "warning" for i in result.issues)
+        assert not result.valid
+        assert any(i.rule == "P5" and i.severity == "error" for i in result.issues)
 
-    def test_invalid_pattern_value_warns(self, loader: ProfileLoader) -> None:
+    def test_invalid_pattern_value_invalid(self, loader: ProfileLoader) -> None:
         profile = ProsodyProfile(
             "1.0.0", "u1", None,
             [ProsodyMapping({"pitch": "very_high"}, "excited", 0.1)],
         )
         result = loader.validate(profile)
-        assert result.valid  # Warnings don't invalidate.
-        assert any(i.rule == "P6" and i.severity == "warning" for i in result.issues)
+        assert not result.valid
+        assert any(i.rule == "P6" and i.severity == "error" for i in result.issues)
+
+    def test_version_with_trailing_newline_invalid(self, loader: ProfileLoader) -> None:
+        profile = ProsodyProfile(
+            "1.0.0\n", "u1", None, [ProsodyMapping({"pitch": "high"}, "excited", 0.1)]
+        )
+        assert any(i.rule == "P1" for i in loader.validate(profile).errors)
+
+    def test_nan_boost_invalid(self, loader: ProfileLoader) -> None:
+        profile = ProsodyProfile(
+            "1.0.0", "u1", None, [ProsodyMapping({"pitch": "high"}, "excited", float("nan"))]
+        )
+        assert any(i.rule == "P8" for i in loader.validate(profile).errors)
 
     def test_empty_emotion_invalid(self, loader: ProfileLoader) -> None:
         profile = ProsodyProfile(
@@ -567,3 +644,289 @@ class TestEdgeCases:
         result = loader.validate(profile)
         assert not result.valid
         assert any(i.rule == "P3" for i in result.issues)
+
+
+# ---------------------------------------------------------------------------
+# categorize_features
+# ---------------------------------------------------------------------------
+
+
+def _utterance(
+    semitones: Callable[[float], float] = lambda x: 0.0,
+    n: int = 8,
+    word_ms: int = 250,
+    gap_ms: int = 50,
+    **per_span: Any,
+) -> list[SpanFeatures]:
+    """*n* word spans whose F0 follows ``semitones(x)`` relative to 200 Hz,
+    with x running from 0 to 1 over the utterance (4 samples per span).
+    Other SpanFeatures fields are given as a value or a per-span list."""
+    values: dict[str, Any] = {"intensity_mean": 65.0, "speech_rate": 4.5}
+    values.update(per_span)
+    total = 4 * n
+    spans = []
+    for i in range(n):
+        start = i * (word_ms + gap_ms)
+        contour = [200.0 * 2 ** (semitones((4 * i + k) / (total - 1)) / 12) for k in range(4)]
+        fields = {k: v[i] if isinstance(v, list) else v for k, v in values.items()}
+        fields.setdefault("f0_mean", statistics.fmean(contour))
+        spans.append(SpanFeatures(
+            start_ms=start, end_ms=start + word_ms, text=f"w{i}", f0_contour=contour, **fields
+        ))
+    return spans
+
+
+def _monotone(x: float) -> float:
+    return 0.4 * math.sin(40 * x)
+
+
+class TestCategorizeFeatures:
+    def test_empty_input(self) -> None:
+        assert categorize_features([]) == {}
+
+    def test_spec_example_flat_and_fast_means_excitement(
+        self, autism_profile: ProsodyProfile, applier: ProfileApplier
+    ) -> None:
+        """Measured monotone, fast speech drives the spec 7.1 profile."""
+        observed = categorize_features(_utterance(_monotone, speech_rate=6.8))
+        assert observed["pitch_contour"] == "flat"
+        assert observed["rate"] == "fast"
+        assert applier.apply(autism_profile, observed, "neutral", 0.5) == (
+            "excitement", pytest.approx(0.65)
+        )
+
+    def test_flat_with_many_pauses_means_thinking(
+        self, autism_profile: ProsodyProfile, applier: ProfileApplier
+    ) -> None:
+        observed = categorize_features(_utterance(_monotone, gap_ms=400))
+        assert observed["pause_frequency"] == "high"
+        assert applier.apply(autism_profile, observed, "neutral", 0.5)[0] == "thinking_carefully"
+
+    def test_volume_spike_means_emphasis_not_anger(
+        self, autism_profile: ProsodyProfile, applier: ProfileApplier
+    ) -> None:
+        levels = [64.0, 66.0, 65.0, 77.5, 65.0, 64.0, 66.0, 65.0]
+        observed = categorize_features(_utterance(lambda x: 6 * x, intensity_mean=levels))
+        assert observed["volume"] == "spike"
+        assert applier.apply(autism_profile, observed, "angry", 0.7)[0] == "emphasis_not_anger"
+
+    def test_emphasis_is_not_a_spike(self) -> None:
+        levels = [64.0, 66.0, 65.0, 73.0, 65.0, 64.0, 66.0, 65.0]
+        assert "volume" not in categorize_features(_utterance(intensity_mean=levels))
+
+    @pytest.mark.parametrize(
+        ("semitones", "expected"),
+        [
+            (lambda x: 6 * x, "rise"),
+            (lambda x: -6 * x, "fall"),
+            (lambda x: 6 * math.sin(math.pi * x), "rise-fall"),
+            (lambda x: -6 * math.sin(math.pi * x), "fall-rise"),
+        ],
+        ids=["rise", "fall", "rise-fall", "fall-rise"],
+    )
+    def test_contour_shapes(self, semitones: Callable[[float], float], expected: str) -> None:
+        assert categorize_features(_utterance(semitones))["pitch_contour"] == expected
+
+    def test_fast_large_movement_is_sharp(self) -> None:
+        short = _utterance(lambda x: 8 * x, n=4, word_ms=60, gap_ms=0)
+        assert categorize_features(short)["pitch_contour"] == "rise-sharp"
+        falling = _utterance(lambda x: -8 * x, n=4, word_ms=60, gap_ms=0)
+        assert categorize_features(falling)["pitch_contour"] == "fall-sharp"
+
+    def test_varied_pitch_without_shape_has_no_contour(self) -> None:
+        zigzag = _utterance(lambda x: 3.0 if round(x * 31) % 2 else -3.0)
+        assert "pitch_contour" not in categorize_features(zigzag)
+
+    def test_octave_errors_do_not_break_flatness(self) -> None:
+        spans = _utterance(_monotone)
+        doubled = [v * 2 for v in spans[2].f0_contour or []]
+        spans[2] = SpanFeatures(**{**spans[2].__dict__, "f0_contour": doubled})
+        assert categorize_features(spans)["pitch_contour"] == "flat"
+
+    def test_too_few_f0_samples_give_no_contour(self) -> None:
+        spans = [
+            SpanFeatures(start_ms=0, end_ms=200, text="a", f0_mean=200.0),
+            SpanFeatures(start_ms=250, end_ms=450, text="b", f0_mean=260.0),
+        ]
+        assert "pitch_contour" not in categorize_features(spans)
+
+    @pytest.mark.parametrize(
+        ("rate", "expected"),
+        [
+            (RATE_FAST_SYLLABLES_PER_S, "fast"),
+            (RATE_FAST_SYLLABLES_PER_S - 0.1, "normal"),
+            (4.5, "normal"),
+            (RATE_SLOW_SYLLABLES_PER_S + 0.1, "normal"),
+            # Without a baseline a low reading may be missed syllables.
+            (RATE_SLOW_SYLLABLES_PER_S, None),
+            (1.5, None),
+        ],
+    )
+    def test_absolute_rate(self, rate: float, expected: str | None) -> None:
+        assert categorize_features(_utterance(speech_rate=rate)).get("rate") == expected
+
+    def test_unmeasured_rate_is_left_out(self) -> None:
+        assert "rate" not in categorize_features(_utterance(speech_rate=None))
+
+    def test_sparse_rate_estimates_are_left_out(self) -> None:
+        """One voiced word in a whispered sentence is no rate for the sentence."""
+        sparse = [None, None, 1.0, None, None, None, None, None]
+        assert "rate" not in categorize_features(
+            _utterance(speech_rate=sparse), baseline=_utterance()
+        )
+        half = [7.0, None, 7.0, None, 7.0, None, 7.0, None]
+        assert categorize_features(_utterance(speech_rate=half))["rate"] == "fast"
+
+    def test_rate_relative_to_baseline(self) -> None:
+        """A slow talker speaking at an ordinary rate is fast for them."""
+        baseline = _utterance(speech_rate=3.0)
+        assert categorize_features(_utterance(speech_rate=4.5))["rate"] == "normal"
+        assert categorize_features(_utterance(speech_rate=4.5), baseline=baseline)["rate"] == (
+            "fast"
+        )
+        assert categorize_features(_utterance(speech_rate=2.2), baseline=baseline)["rate"] == (
+            "slow"
+        )
+
+    @pytest.mark.parametrize(
+        ("offset", "expected"), [(3.0, "high"), (-3.0, "low"), (1.0, "normal")]
+    )
+    def test_pitch_level_needs_baseline(self, offset: float, expected: str) -> None:
+        spans = _utterance(lambda x: offset + _monotone(x))
+        assert "pitch" not in categorize_features(spans)
+        assert categorize_features(spans, baseline=_utterance(_monotone))["pitch"] == expected
+
+    @pytest.mark.parametrize(
+        ("level", "expected"), [(70.0, "loud"), (60.0, "quiet"), (66.0, "normal")]
+    )
+    def test_volume_level_needs_baseline(self, level: float, expected: str) -> None:
+        spans = _utterance(intensity_mean=level)
+        assert "volume" not in categorize_features(spans)
+        assert categorize_features(spans, baseline=_utterance())["volume"] == expected
+
+    def test_dominant_quality(self) -> None:
+        mostly_breathy = ["breathy"] * 5 + ["modal"] * 3
+        assert categorize_features(_utterance(quality=mostly_breathy))["quality"] == "breathy"
+        split = ["breathy", "modal", "tense", "creaky"] * 2
+        assert "quality" not in categorize_features(_utterance(quality=split))
+        assert "quality" not in categorize_features(_utterance(quality="unknown"))
+
+    def test_pause_frequency_from_detected_pauses(self) -> None:
+        spans = _utterance(n=8, gap_ms=20)
+        # Three pauses between words, plus ones that do not count: before the
+        # first word, too short, and after the last word.
+        pauses = [
+            PauseInterval(start_ms=-400, end_ms=0),
+            PauseInterval(start_ms=250, end_ms=520),
+            PauseInterval(start_ms=790, end_ms=1100),
+            PauseInterval(start_ms=1330, end_ms=1400),
+            PauseInterval(start_ms=1600, end_ms=1900),
+            PauseInterval(start_ms=2150, end_ms=2600),
+        ]
+        assert categorize_features(spans)["pause_frequency"] == "normal"
+        assert categorize_features(spans, pauses)["pause_frequency"] == "high"
+
+    def test_pause_frequency_low_needs_a_long_utterance(self) -> None:
+        assert categorize_features(_utterance(n=12))["pause_frequency"] == "low"
+        assert categorize_features(_utterance(n=6))["pause_frequency"] == "normal"
+        assert "pause_frequency" not in categorize_features(_utterance(n=3))
+
+    def test_emphasis_frequency(self) -> None:
+        many = [72.0 if i % 3 == 0 else 65.0 for i in range(10)]
+        assert categorize_features(_utterance(n=10, intensity_mean=many))[
+            "emphasis_frequency"
+        ] == "high"
+        one = [72.0 if i == 4 else 65.0 for i in range(10)]
+        assert categorize_features(_utterance(n=10, intensity_mean=one))[
+            "emphasis_frequency"
+        ] == "normal"
+        assert categorize_features(_utterance(n=10))["emphasis_frequency"] == "low"
+        # Pitch alone also marks emphasis: two of five words 8 semitones up.
+        high_words = [320.0 if i in (1, 3) else 200.0 for i in range(5)]
+        assert categorize_features(_utterance(n=5, f0_mean=high_words))[
+            "emphasis_frequency"
+        ] == "high"
+
+    def test_span_order_does_not_matter(self) -> None:
+        spans = _utterance(lambda x: 6 * x)
+        assert categorize_features(list(reversed(spans))) == categorize_features(spans)
+
+
+_ESPEAK = shutil.which("espeak-ng")
+_SENTENCE = (
+    "The quick brown fox jumps over the lazy dog while the children watch from the window"
+)
+
+
+@pytest.mark.skipif(_ESPEAK is None, reason="espeak-ng is not installed")
+class TestCategorizeRealSpeech:
+    """categorize_features on speech synthesised by espeak-ng and measured
+    by ProsodyAnalyzer (word times spread evenly over the recording)."""
+
+    @staticmethod
+    def _measure(
+        tmp_path: Path, ssml: str, pitch: int = 50
+    ) -> tuple[list[SpanFeatures], list[PauseInterval]]:
+        """Speak *ssml* with espeak-ng (base *pitch* 0-99; 50 is about 100 Hz,
+        20 about 80 Hz) and measure it."""
+        pytest.importorskip("parselmouth")
+        from prosody_protocol._types import WordAlignment
+        from prosody_protocol.prosody_analyzer import ProsodyAnalyzer
+
+        wav = tmp_path / f"speech-{len(list(tmp_path.glob('*.wav')))}.wav"
+        subprocess.run(
+            [str(_ESPEAK), "-m", "-p", str(pitch), "-w", str(wav), f"<speak>{ssml}</speak>"],
+            check=True, capture_output=True,
+        )
+        analyzer = ProsodyAnalyzer()
+        pauses = analyzer.detect_pauses(wav)
+        words = _SENTENCE.split()
+        with wave.open(str(wav)) as audio:
+            step = 1000 * audio.getnframes() / audio.getframerate() / len(words)
+        alignments = [
+            WordAlignment(word, int(i * step), int((i + 1) * step)) for i, word in enumerate(words)
+        ]
+        return analyzer.analyze(wav, alignments), pauses
+
+    def test_monotone_fast_speech_reads_as_excitement(
+        self, tmp_path: Path, autism_profile: ProsodyProfile, applier: ProfileApplier
+    ) -> None:
+        spans, pauses = self._measure(
+            tmp_path, f'<prosody rate="x-fast" range="x-low">{_SENTENCE}</prosody>'
+        )
+        observed = categorize_features(spans, pauses)
+        assert observed["pitch_contour"] == "flat"
+        assert observed["rate"] == "fast"
+        assert applier.apply(autism_profile, observed, "neutral", 0.5)[0] == "excitement"
+
+    def test_slow_lively_speech_is_neither(self, tmp_path: Path) -> None:
+        baseline, _ = self._measure(tmp_path, _SENTENCE)
+        spans, pauses = self._measure(
+            tmp_path, f'<prosody rate="x-slow" range="x-high">{_SENTENCE}</prosody>'
+        )
+        observed = categorize_features(spans, pauses, baseline=baseline)
+        assert observed.get("pitch_contour") != "flat"
+        assert observed["rate"] == "slow"
+
+    def test_low_voice_at_ordinary_speed_is_not_slow(self, tmp_path: Path) -> None:
+        """An 80 Hz voice at espeak's default speed measures about 3
+        syllables/s (the analyzer misses syllables), which read as slow."""
+        spans, pauses = self._measure(tmp_path, _SENTENCE, pitch=20)
+        assert categorize_features(spans, pauses).get("rate") != "slow"
+
+    def test_low_voice_rate_against_its_own_baseline(self, tmp_path: Path) -> None:
+        baseline, _ = self._measure(tmp_path, _SENTENCE, pitch=20)
+        for rate, expected in (("x-slow", "slow"), ("default", "normal"), ("x-fast", "fast")):
+            spans, pauses = self._measure(
+                tmp_path, f'<prosody rate="{rate}">{_SENTENCE}</prosody>', pitch=20
+            )
+            assert categorize_features(spans, pauses, baseline=baseline)["rate"] == expected
+
+    def test_pauses_between_words_are_frequent(self, tmp_path: Path) -> None:
+        words = _SENTENCE.split()
+        ssml = " ".join(
+            word + (' <break time="600ms"/>' if i % 3 == 2 else "") for i, word in enumerate(words)
+        )
+        spans, pauses = self._measure(tmp_path, ssml)
+        assert len(pauses) >= 4
+        assert categorize_features(spans, pauses)["pause_frequency"] == "high"
