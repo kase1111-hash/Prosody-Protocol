@@ -2,8 +2,11 @@
 
 Requires the ``api`` extra: ``pip install 'prosody-protocol[api]'``.
 
-Run it with ``prosody-protocol serve`` or ``python -m prosody_protocol.server``.
-The ASGI application object is ``prosody_protocol.server.app:app``.
+Run it with ``python -m prosody_protocol.server``, or with any ASGI server:
+the application object is ``prosody_protocol.server.app:app``, and
+:func:`prosody_protocol.server.app.create_app` builds one from explicit
+:class:`~prosody_protocol.server.config.Settings`. Audio conversion and
+synthesis run in worker processes (see :mod:`prosody_protocol.server.jobs`).
 """
 
 from __future__ import annotations

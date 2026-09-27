@@ -1,188 +1,47 @@
 """FastAPI application for the Prosody Protocol REST API.
 
-Endpoints defined in spec:
+Endpoints:
   POST /v1/convert/audio-to-iml
-  POST /v1/synthesize
-  POST /v1/validate
   POST /v1/convert/text-to-iml
   POST /v1/convert/iml-to-ssml
+  POST /v1/synthesize
+  POST /v1/validate
   GET  /v1/health
+
+``app`` is configured from the environment (see
+:class:`~prosody_protocol.server.config.Settings`); :func:`create_app` builds
+an application from explicit settings.
 """
 
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
+import functools
+import importlib.util
+import shutil
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import APIRouter, FastAPI
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp
+from pydantic import BaseModel, Field
 
 from prosody_protocol import __version__
-from prosody_protocol.exceptions import (
-    ConversionError,
-    IMLParseError,
-    IMLValidationError,
-    ProfileError,
-    ProsodyProtocolError,
-)
 
 from .config import Settings
+from .deps import SettingsDep
+from .errors import install_error_handlers
+from .jobs import JobRunner
+from .middleware import RateLimitMiddleware, UploadSizeLimitMiddleware
 from .routes import convert, synthesize, validate
 
-settings = Settings()
-
-app = FastAPI(
-    title="Prosody Protocol API",
-    description="REST API for the Intent Markup Language (IML) SDK.",
-    version=__version__,
-)
-
-
-# ---------------------------------------------------------------------------
-# Middleware
-# ---------------------------------------------------------------------------
-
-
-class UploadSizeLimitMiddleware(BaseHTTPMiddleware):
-    """Reject requests whose Content-Length exceeds the configured maximum."""
-
-    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
-        super().__init__(app)
-        self.max_bytes = max_bytes
-
-    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
-        content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > self.max_bytes:
-            return JSONResponse(
-                status_code=413,
-                content={
-                    "error": "payload_too_large",
-                    "detail": (
-                        f"Request body ({int(content_length)} bytes) exceeds "
-                        f"maximum allowed size ({self.max_bytes} bytes)."
-                    ),
-                },
-            )
-        return await call_next(request)
-
-
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Simple in-memory rate limiter based on client IP.
-
-    For production use behind a reverse proxy, prefer nginx/Traefik rate
-    limiting instead. This middleware is a safety net for direct exposure.
-    """
-
-    def __init__(self, app: ASGIApp, requests_per_minute: int) -> None:
-        super().__init__(app)
-        self.rpm = requests_per_minute
-        self._window: dict[str, list[float]] = {}
-        self._last_cleanup: float = 0.0
-
-    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
-        if self.rpm <= 0:
-            return await call_next(request)
-
-        import time
-
-        client_ip = request.client.host if request.client else "unknown"
-        now = time.monotonic()
-        cutoff = now - 60
-
-        # Periodically evict stale IPs to prevent unbounded memory growth.
-        if now - self._last_cleanup > 300:  # every 5 minutes
-            stale_ips = [
-                ip for ip, timestamps in self._window.items()
-                if not timestamps or timestamps[-1] <= cutoff
-            ]
-            for ip in stale_ips:
-                del self._window[ip]
-            self._last_cleanup = now
-
-        window = self._window.setdefault(client_ip, [])
-
-        # Remove entries older than 60 seconds
-        window[:] = [t for t in window if t > cutoff]
-
-        if len(window) >= self.rpm:
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "error": "rate_limited",
-                    "detail": f"Rate limit exceeded ({self.rpm} requests/minute).",
-                },
-            )
-
-        window.append(now)
-        return await call_next(request)
-
-
-app.add_middleware(UploadSizeLimitMiddleware, max_bytes=settings.max_upload_bytes)
-
-if settings.rate_limit_per_minute > 0:
-    app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.rate_limit_per_minute)
-
-# CORS: only allow configured origins. Empty list → no cross-origin access.
-if settings.cors_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origins,
-        allow_methods=["GET", "POST"],
-        allow_headers=["*"],
-    )
-
-app.include_router(convert.router, prefix="/v1/convert", tags=["convert"])
-app.include_router(synthesize.router, prefix="/v1", tags=["synthesize"])
-app.include_router(validate.router, prefix="/v1", tags=["validate"])
-
-
-# ---------------------------------------------------------------------------
-# Error handling
-# ---------------------------------------------------------------------------
-
-
-@app.exception_handler(IMLParseError)
-async def iml_parse_error_handler(request: Request, exc: IMLParseError) -> JSONResponse:
-    return JSONResponse(
-        status_code=400,
-        content={"error": "iml_parse_error", "detail": str(exc)},
-    )
-
-
-@app.exception_handler(ConversionError)
-async def conversion_error_handler(request: Request, exc: ConversionError) -> JSONResponse:
-    return JSONResponse(
-        status_code=400,
-        content={"error": "conversion_error", "detail": str(exc)},
-    )
-
-
-@app.exception_handler(IMLValidationError)
-async def iml_validation_error_handler(
-    request: Request, exc: IMLValidationError
-) -> JSONResponse:
-    return JSONResponse(
-        status_code=400,
-        content={"error": "validation_error", "detail": str(exc)},
-    )
-
-
-@app.exception_handler(ProfileError)
-async def profile_error_handler(request: Request, exc: ProfileError) -> JSONResponse:
-    return JSONResponse(
-        status_code=400,
-        content={"error": "profile_error", "detail": str(exc)},
-    )
-
-
-@app.exception_handler(ProsodyProtocolError)
-async def prosody_protocol_error_handler(
-    request: Request, exc: ProsodyProtocolError
-) -> JSONResponse:
-    return JSONResponse(
-        status_code=400,
-        content={"error": "prosody_protocol_error", "detail": str(exc)},
-    )
+__all__ = [
+    "RateLimitMiddleware",
+    "UploadSizeLimitMiddleware",
+    "app",
+    "create_app",
+    "settings",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +49,117 @@ async def prosody_protocol_error_handler(
 # ---------------------------------------------------------------------------
 
 
-@app.get("/v1/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok", "version": __version__}
+class Capabilities(BaseModel):
+    """Optional backends present on this server."""
+
+    whisper: bool = Field(
+        description="Speech recognition for audio-to-iml; without it the text is placeholders."
+    )
+    espeak_ng: bool = Field(
+        description='Speech synthesis; without it /v1/synthesize renders "tones" only.'
+    )
+    ffmpeg: bool = Field(description="Decoding of OGG/Opus, WebM, M4A and similar uploads.")
+
+
+class Limits(BaseModel):
+    """Request limits this server enforces."""
+
+    max_upload_bytes: int
+    max_text_chars: int
+    max_synth_seconds: float
+    max_audio_seconds: float
+    rate_limit_per_minute: int = Field(description="0 means unlimited.")
+
+
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+    capabilities: Capabilities
+    limits: Limits
+
+
+@functools.lru_cache(maxsize=1)
+def _capabilities() -> Capabilities:
+    # Detected once: find_spec locates whisper without importing PyTorch.
+    return Capabilities(
+        whisper=importlib.util.find_spec("whisper") is not None,
+        espeak_ng=shutil.which("espeak-ng") is not None,
+        ffmpeg=shutil.which("ffmpeg") is not None,
+    )
+
+
+health_router = APIRouter()
+
+
+@health_router.get("/v1/health", response_model=HealthResponse)
+async def health(settings: SettingsDep) -> HealthResponse:
+    """Liveness check, with the server's optional backends and limits.
+
+    Not rate limited.
+    """
+    return HealthResponse(
+        status="ok",
+        version=__version__,
+        capabilities=_capabilities(),
+        limits=Limits(
+            max_upload_bytes=settings.max_upload_bytes,
+            max_text_chars=settings.max_text_chars,
+            max_synth_seconds=settings.max_synth_seconds,
+            max_audio_seconds=settings.max_audio_seconds,
+            rate_limit_per_minute=settings.rate_limit_per_minute,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
+    yield
+    jobs: JobRunner = application.state.jobs
+    await run_in_threadpool(jobs.shutdown)
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    """Build the API application; *settings* default to the environment."""
+    settings = settings if settings is not None else Settings()
+    application = FastAPI(
+        title="Prosody Protocol API",
+        description="REST API for the Intent Markup Language (IML) SDK.",
+        version=__version__,
+        lifespan=_lifespan,
+    )
+    application.state.settings = settings
+    application.state.jobs = JobRunner(settings.max_concurrent_jobs, settings.max_queued_jobs)
+
+    # Middleware added last runs first: CORS, then rate limit, then size limit.
+    application.add_middleware(UploadSizeLimitMiddleware, max_bytes=settings.max_upload_bytes)
+    if settings.rate_limit_per_minute > 0:
+        application.add_middleware(
+            RateLimitMiddleware,
+            requests_per_minute=settings.rate_limit_per_minute,
+            trusted_proxies=settings.trusted_proxy_networks(),
+        )
+    # CORS: only allow configured origins. Empty list → no cross-origin access.
+    if settings.cors_origins:
+        application.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origins,
+            allow_methods=["GET", "POST"],
+            allow_headers=["*"],
+            expose_headers=["Content-Disposition", "Retry-After", "X-Prosody-Engine"],
+        )
+
+    application.include_router(convert.router, prefix="/v1/convert", tags=["convert"])
+    application.include_router(synthesize.router, prefix="/v1", tags=["synthesize"])
+    application.include_router(validate.router, prefix="/v1", tags=["validate"])
+    application.include_router(health_router, tags=["health"])
+    install_error_handlers(application)
+    return application
+
+
+settings = Settings()
+app = create_app(settings)
