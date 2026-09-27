@@ -1,0 +1,62 @@
+{
+  "sample_rate": 16000,
+  "noise_floor_dbfs": -60.0,
+  "duration_ms": 4435,
+  "words": [
+    {
+      "word": "I",
+      "start_ms": 250,
+      "end_ms": 564
+    },
+    {
+      "word": "told",
+      "start_ms": 614,
+      "end_ms": 1086
+    },
+    {
+      "word": "you",
+      "start_ms": 1136,
+      "end_ms": 1486
+    },
+    {
+      "word": "to",
+      "start_ms": 2086,
+      "end_ms": 2387
+    },
+    {
+      "word": "call",
+      "start_ms": 2437,
+      "end_ms": 2800
+    },
+    {
+      "word": "me",
+      "start_ms": 2850,
+      "end_ms": 3216
+    },
+    {
+      "word": "yesterday.",
+      "start_ms": 3516,
+      "end_ms": 4185
+    }
+  ],
+  "pauses": [
+    {
+      "start_ms": 0,
+      "end_ms": 250
+    },
+    {
+      "start_ms": 1486,
+      "end_ms": 2086
+    },
+    {
+      "start_ms": 3216,
+      "end_ms": 3516
+    },
+    {
+      "start_ms": 4185,
+      "end_ms": 4435
+    }
+  ],
+  "syllables": 9,
+  "emphasized": "told"
+}
