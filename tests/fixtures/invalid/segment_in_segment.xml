@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INVALID: segment nested inside another segment (violates V11 / spec 5.2) -->
+<utterance>
+  <segment tempo="rushed">Outer <segment tempo="steady">inner</segment></segment>
+</utterance>

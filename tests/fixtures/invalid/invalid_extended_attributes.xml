@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INVALID: extended attributes with the wrong types (violates V27 / spec 2.6, 4) -->
+<utterance>
+  <prosody f0_mean="abc" f0_range="high" duration_ms="-1" jitter="NaN">Hello there.</prosody>
+</utterance>

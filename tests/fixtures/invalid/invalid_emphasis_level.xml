@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INVALID: emphasis level outside the spec vocabulary (violates V9 / spec 3.4) -->
+<utterance>
+  I <emphasis level="extreme">really</emphasis> mean it.
+</utterance>

@@ -1,10 +1,13 @@
 """Tests for prosody_protocol.validator.
 
-One test per validation rule (V1-V18), plus tests for:
+One test per validation rule (V1-V32), plus tests for:
 - Valid documents passing cleanly
 - Documents with multiple errors returning all of them
-- File-based validation
+- File-based validation, including non-UTF-8 files
 - Consent model validation (V17-V18)
+- Comments, processing instructions, unknown elements and namespaces
+- XML security (DOCTYPE, external entities)
+- ValidationResult.errors / .warnings / raise_for_errors
 """
 
 from __future__ import annotations
@@ -13,7 +16,38 @@ from pathlib import Path
 
 import pytest
 
+from prosody_protocol.exceptions import IMLValidationError
 from prosody_protocol.validator import IMLValidator, ValidationIssue, ValidationResult
+
+# The error rules each invalid fixture is expected to break -- exactly these.
+INVALID_FIXTURE_RULES: dict[str, set[str]] = {
+    "confidence_nan.xml": {"V4"},
+    "confidence_out_of_range.xml": {"V4"},
+    "content_outside_utterance.xml": {"V19"},
+    "doctype_entity.xml": {"V31"},
+    "emphasis_in_emphasis.xml": {"V21"},
+    "emphasis_missing_level.xml": {"V8"},
+    "encoding_latin1.xml": {"V30"},
+    "invalid_consent.xml": {"V17", "V18"},
+    "invalid_emphasis_level.xml": {"V9"},
+    "invalid_enum_values.xml": {"V22", "V23", "V24", "V25", "V26"},
+    "invalid_extended_attributes.xml": {"V27"},
+    "invalid_pitch_volume.xml": {"V13", "V14"},
+    "invalid_version_language.xml": {"V28", "V29"},
+    "missing_confidence.xml": {"V3"},
+    "missing_pause_duration.xml": {"V5"},
+    "nested_utterance.xml": {"V20"},
+    "pause_duration_not_integer.xml": {"V6"},
+    "pause_duration_too_large.xml": {"V6"},
+    "pause_with_content.xml": {"V7"},
+    "pause_with_unknown_element.xml": {"V7"},
+    "segment_in_prosody.xml": {"V10"},
+    "segment_in_segment.xml": {"V10", "V11"},
+}
+
+
+def _error_rules(result: ValidationResult) -> set[str]:
+    return {i.rule for i in result.issues if i.severity == "error"}
 
 
 @pytest.fixture()
@@ -119,6 +153,13 @@ class TestV2UtteranceExists:
         result = validator.validate("<div>not iml</div>")
         assert result.valid is False
         assert any(i.rule == "V2" for i in result.issues)
+
+    def test_foreign_default_namespace_root_is_named_by_namespace(
+        self, validator: IMLValidator
+    ) -> None:
+        result = validator.validate('<iml xmlns="urn:other"><utterance>x</utterance></iml>')
+        assert _error_rules(result) == {"V2"}
+        assert "got <{urn:other}iml>" in result.errors[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +297,20 @@ class TestV7PauseEmpty:
         assert result.valid is False
         assert any(i.rule == "V7" for i in result.issues)
 
+    def test_pause_with_whitespace_is_empty(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance>a<pause duration="500">\n  </pause>b</utterance>'
+        )
+        assert result.issues == []
+
+    def test_unknown_element_in_pause_is_content(self, validator: IMLValidator) -> None:
+        """Spec 3.3: a pause contains no elements, unknown ones included."""
+        result = validator.validate(
+            '<utterance>a<pause duration="500"><f:x xmlns:f="urn:x"/></pause>b</utterance>'
+        )
+        assert _error_rules(result) == {"V7"}
+        assert "child elements" in result.errors[0].message
+
 
 # ---------------------------------------------------------------------------
 # V8: <emphasis> has level attribute
@@ -277,13 +332,19 @@ class TestV8EmphasisLevel:
 
 
 class TestV9EmphasisLevelValue:
-    def test_unknown_level_warns(self, validator: IMLValidator) -> None:
+    def test_unknown_level_is_error(self, validator: IMLValidator) -> None:
         result = validator.validate(
             '<utterance>I <emphasis level="extreme">really</emphasis> mean it.</utterance>'
         )
-        # V9 is a warning, not an error, so document is still valid
-        assert result.valid is True
-        assert any(i.rule == "V9" and i.severity == "warning" for i in result.issues)
+        # Spec 6.3(3): an attribute outside its enumeration makes the document invalid.
+        assert result.valid is False
+        assert any(i.rule == "V9" and i.severity == "error" for i in result.issues)
+
+    def test_level_is_case_sensitive(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance><emphasis level="Strong">x</emphasis></utterance>'
+        )
+        assert _error_rules(result) == {"V9"}
 
     def test_known_level_no_warning(self, validator: IMLValidator) -> None:
         for level in ("strong", "moderate", "reduced"):
@@ -517,6 +578,41 @@ class TestValidateFile:
                 f"{xml_file.name} should be invalid but passed"
             )
 
+    def test_invalid_fixtures_break_exactly_their_rules(
+        self, validator: IMLValidator, invalid_fixtures_dir: Path
+    ) -> None:
+        names = {f.name for f in invalid_fixtures_dir.glob("*.xml")}
+        assert names == set(INVALID_FIXTURE_RULES), "update INVALID_FIXTURE_RULES"
+        for name, rules in INVALID_FIXTURE_RULES.items():
+            result = validator.validate_file(invalid_fixtures_dir / name)
+            assert _error_rules(result) == rules, name
+
+    def test_latin1_file_is_v30_not_an_exception(
+        self, validator: IMLValidator, invalid_fixtures_dir: Path
+    ) -> None:
+        result = validator.validate_file(invalid_fixtures_dir / "encoding_latin1.xml")
+        assert [i.rule for i in result.issues] == ["V30"]
+        assert result.issues[0].line == 4  # the line with the first non-UTF-8 byte
+        assert "0xe9" in result.issues[0].message
+
+    def test_utf16_file_is_v30(self, validator: IMLValidator, tmp_path: Path) -> None:
+        path = tmp_path / "utf16.xml"
+        path.write_text("<utterance>Hello</utterance>", encoding="utf-16")
+        result = validator.validate_file(path)
+        assert result.valid is False
+        assert _error_rules(result) == {"V30"}
+
+    def test_utf8_bom_file_is_valid(self, validator: IMLValidator, tmp_path: Path) -> None:
+        path = tmp_path / "bom.xml"
+        path.write_bytes(b"\xef\xbb\xbf<utterance>caf\xc3\xa9</utterance>")
+        assert validator.validate_file(path).valid is True
+
+    def test_missing_file_raises_oserror(
+        self, validator: IMLValidator, tmp_path: Path
+    ) -> None:
+        with pytest.raises(OSError):
+            validator.validate_file(tmp_path / "missing.xml")
+
 
 # ---------------------------------------------------------------------------
 # Consent model validation (V17-V18)
@@ -525,31 +621,45 @@ class TestValidateFile:
 
 class TestConsentValidation:
     def test_valid_consent_explicit(self, validator: IMLValidator) -> None:
-        iml = '<iml version="0.1.0" consent="explicit" processing="local"><utterance>Hello</utterance></iml>'
+        iml = (
+            '<iml version="0.1.0" consent="explicit" processing="local">'
+            "<utterance>Hello</utterance></iml>"
+        )
         result = validator.validate(iml)
         assert result.valid is True
         assert not any(i.rule in ("V17", "V18") for i in result.issues)
 
     def test_valid_consent_implicit(self, validator: IMLValidator) -> None:
-        iml = '<iml version="0.1.0" consent="implicit" processing="remote"><utterance>Hello</utterance></iml>'
+        iml = (
+            '<iml version="0.1.0" consent="implicit" processing="remote">'
+            "<utterance>Hello</utterance></iml>"
+        )
         result = validator.validate(iml)
         assert result.valid is True
         assert not any(i.rule in ("V17", "V18") for i in result.issues)
 
-    def test_invalid_consent_value_warns(self, validator: IMLValidator) -> None:
-        iml = '<iml version="0.1.0" consent="maybe"><utterance>Hello</utterance></iml>'
-        result = validator.validate(iml)
-        assert result.valid is True  # warnings don't invalidate
-        v17 = [i for i in result.issues if i.rule == "V17"]
-        assert len(v17) == 1
-        assert "maybe" in v17[0].message
-
-    def test_invalid_processing_value_warns(self, validator: IMLValidator) -> None:
-        iml = '<iml version="0.1.0" processing="cloud"><utterance>Hello</utterance></iml>'
+    def test_consent_none_and_processing_hybrid_ok(self, validator: IMLValidator) -> None:
+        iml = '<iml consent="none" processing="hybrid"><utterance>Hello</utterance></iml>'
         result = validator.validate(iml)
         assert result.valid is True
+        assert result.issues == []
+
+    def test_invalid_consent_value_is_error(self, validator: IMLValidator) -> None:
+        iml = '<iml version="0.1.0" consent="maybe"><utterance>Hello</utterance></iml>'
+        result = validator.validate(iml)
+        assert result.valid is False
+        v17 = [i for i in result.issues if i.rule == "V17"]
+        assert len(v17) == 1
+        assert v17[0].severity == "error"
+        assert "maybe" in v17[0].message
+
+    def test_invalid_processing_value_is_error(self, validator: IMLValidator) -> None:
+        iml = '<iml version="0.1.0" processing="cloud"><utterance>Hello</utterance></iml>'
+        result = validator.validate(iml)
+        assert result.valid is False
         v18 = [i for i in result.issues if i.rule == "V18"]
         assert len(v18) == 1
+        assert v18[0].severity == "error"
         assert "cloud" in v18[0].message
 
     def test_no_consent_no_warning(self, validator: IMLValidator) -> None:
@@ -558,33 +668,454 @@ class TestConsentValidation:
         assert not any(i.rule in ("V17", "V18") for i in result.issues)
 
 
+
+
 # ---------------------------------------------------------------------------
-# XML security tests
+# Numeric syntax (V4, V6, spec 2.6)
 # ---------------------------------------------------------------------------
 
 
-class TestXMLSecurity:
-    def test_external_entity_not_resolved(self, validator: IMLValidator) -> None:
-        """Verify external entities are not resolved (XXE prevention)."""
-        iml = '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "injected">]><utterance>&xxe;</utterance>'
+class TestNumericSyntax:
+    @pytest.mark.parametrize("raw", ["NaN", "nan", "inf", "-inf", "1_0", "0.\u0665", "0,5", ""])
+    def test_confidence_not_a_float(self, validator: IMLValidator, raw: str) -> None:
+        result = validator.validate(f'<utterance emotion="calm" confidence="{raw}">x</utterance>')
+        assert _error_rules(result) == {"V4"}
+
+    @pytest.mark.parametrize("raw", ["0.5", "1e-1", "5E-1", "+0.25", ".75", "1.", " 0.5 ", "1"])
+    def test_confidence_float_spellings_ok(self, validator: IMLValidator, raw: str) -> None:
+        result = validator.validate(f'<utterance emotion="calm" confidence="{raw}">x</utterance>')
+        assert result.valid is True, result.issues
+
+    @pytest.mark.parametrize(
+        "raw", ["8_00", "\u0668\u0660\u0660", "3.14", "1e3", "0", "-100", "abc"]
+    )
+    def test_pause_duration_not_a_positive_integer(
+        self, validator: IMLValidator, raw: str
+    ) -> None:
+        result = validator.validate(f'<utterance>a<pause duration="{raw}"/>b</utterance>')
+        assert _error_rules(result) == {"V6"}
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["1" * 5000, "9" * 100_000, "2147483648", "99999999999999999999"],
+        ids=["5000-digits", "100000-digits", "max-plus-1", "20-digits"],
+    )
+    def test_pause_duration_too_large_is_v6_not_a_crash(
+        self, validator: IMLValidator, raw: str
+    ) -> None:
+        # int() refuses strings of more than 4300 digits with ValueError.
+        result = validator.validate(f'<utterance>a<pause duration="{raw}"/>b</utterance>')
+        assert _error_rules(result) == {"V6"}
+        assert "2147483647" in result.errors[0].message
+        assert len(result.errors[0].message) < 200
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["800", "+800", "0800", " 800 ", "2147483647", "0" * 5000 + "1"],
+        ids=["plain", "plus", "leading-zero", "spaces", "max", "5000-leading-zeros"],
+    )
+    def test_pause_duration_integer_spellings_ok(
+        self, validator: IMLValidator, raw: str
+    ) -> None:
+        result = validator.validate(f'<utterance>a<pause duration="{raw}"/>b</utterance>')
+        assert result.valid is True, result.issues
+
+    def test_non_ascii_digits_in_pitch_rejected(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance><prosody pitch="+\u0661\u0665%">x</prosody></utterance>'
+        )
+        assert _error_rules(result) == {"V13"}
+
+
+# ---------------------------------------------------------------------------
+# Attribute vocabularies and formats (V13, V14, V22-V29)
+# ---------------------------------------------------------------------------
+
+
+class TestAttributeValues:
+    def test_invalid_pitch_and_volume_are_errors(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance><prosody pitch="high" volume="loud">x</prosody></utterance>'
+        )
+        assert result.valid is False
+        assert _error_rules(result) == {"V13", "V14"}
+
+    @pytest.mark.parametrize("pitch", ["15%", "+15", "+15 %", "-185Hz", "+15%\n"])
+    def test_pitch_format_is_strict(self, validator: IMLValidator, pitch: str) -> None:
+        # "+15%&#10;" puts a real newline in the value (a trailing-newline regex bug).
+        value = pitch.replace("\n", "&#10;")
+        result = validator.validate(f'<utterance><prosody pitch="{value}">x</prosody></utterance>')
+        assert _error_rules(result) == {"V13"}
+
+    @pytest.mark.parametrize("rate", ["fast", "slow", "medium", "150%", "80.5%"])
+    def test_valid_rates(self, validator: IMLValidator, rate: str) -> None:
+        result = validator.validate(f'<utterance><prosody rate="{rate}">x</prosody></utterance>')
+        assert result.valid is True
+
+    @pytest.mark.parametrize("rate", ["ludicrous", "Fast", "+150%", "x-fast", "150"])
+    def test_invalid_rate(self, validator: IMLValidator, rate: str) -> None:
+        result = validator.validate(f'<utterance><prosody rate="{rate}">x</prosody></utterance>')
+        assert _error_rules(result) == {"V22"}
+
+    def test_invalid_pitch_contour_and_quality(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance><prosody pitch_contour="wobble" quality="robotic">x</prosody></utterance>'
+        )
+        assert _error_rules(result) == {"V23", "V24"}
+
+    def test_invalid_tempo_and_rhythm(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance><segment tempo="glacial" rhythm="jazzy">x</segment></utterance>'
+        )
+        assert _error_rules(result) == {"V25", "V26"}
+
+    def test_spec_vocabularies_accepted(self, validator: IMLValidator) -> None:
+        contours = ["rise", "fall", "rise-fall", "fall-rise", "fall-sharp", "rise-sharp", "flat"]
+        qualities = ["modal", "breathy", "tense", "creaky", "whispery", "harsh"]
+        body = "".join(
+            f'<prosody pitch_contour="{c}" quality="{q}">w</prosody> '
+            for c, q in zip(contours, qualities + ["modal"], strict=True)
+        )
+        body += "".join(
+            f'<segment tempo="{t}" rhythm="{r}">s</segment>'
+            for t, r in zip(
+                ["rushed", "steady", "drawn-out"], ["staccato", "legato", "syncopated"], strict=True
+            )
+        )
+        result = validator.validate(f"<utterance>{body}</utterance>")
+        assert result.issues == []
+
+    @pytest.mark.parametrize(
+        ("attr", "value"),
+        [
+            ("f0_mean", "abc"),
+            ("f0_mean", "-120"),
+            ("f0_range", "high"),
+            ("f0_range", "120 - 240"),
+            ("f0_contour", "150, 160"),
+            ("intensity_mean", "NaN"),
+            ("intensity_range", "-3"),
+            ("speech_rate", "fast"),
+            ("duration_ms", "-1"),
+            ("duration_ms", "12.5"),
+            pytest.param("duration_ms", "1" * 5000, id="duration_ms-5000-digits"),
+            ("duration_ms", "2147483648"),
+            ("f0_mean", "1e400"),
+            ("intensity_mean", "-1e400"),
+            ("jitter", "-0.5"),
+            ("shimmer", "1%"),
+            ("hnr", "inf"),
+        ],
+    )
+    def test_invalid_extended_attribute(
+        self, validator: IMLValidator, attr: str, value: str
+    ) -> None:
+        result = validator.validate(
+            f'<utterance><prosody {attr}="{value}">x</prosody></utterance>'
+        )
+        assert _error_rules(result) == {"V27"}
+        assert attr in result.errors[0].message
+
+    def test_valid_extended_attributes(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance><prosody f0_mean="185" f0_range="120-240" f0_contour="150,165.5,180"'
+            ' intensity_mean="-12.5" intensity_range="15" speech_rate="4.2" duration_ms="840"'
+            ' jitter="1.2e-1" shimmer="3.8" hnr="-2">x</prosody></utterance>'
+        )
+        assert result.issues == []
+
+    @pytest.mark.parametrize("version", ["0.1.0", "0.1.0-alpha", "1.2.3-rc.1+build.5"])
+    def test_valid_versions(self, validator: IMLValidator, version: str) -> None:
+        result = validator.validate(f'<iml version="{version}"><utterance>x</utterance></iml>')
+        assert result.valid is True
+
+    def test_invalid_version_and_language(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<iml version="0.1" language="en_US"><utterance>x</utterance></iml>'
+        )
+        assert _error_rules(result) == {"V28", "V29"}
+
+
+# ---------------------------------------------------------------------------
+# Document structure (V19, V20, V21)
+# ---------------------------------------------------------------------------
+
+
+class TestStructure:
+    def test_markup_directly_in_iml_is_error(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            "<iml><utterance>Hello</utterance>"
+            '<prosody pitch="+20%">IMPORTANT WARNING</prosody></iml>'
+        )
+        assert result.valid is False
+        assert _error_rules(result) == {"V19"}
+
+    def test_text_directly_in_iml_is_error(self, validator: IMLValidator) -> None:
+        result = validator.validate("<iml>stray text<utterance>x</utterance></iml>")
+        assert _error_rules(result) == {"V19"}
+        assert "stray text" in result.errors[0].message
+
+    def test_whitespace_and_comments_in_iml_ok(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            "<iml>\n  <!-- first -->\n  <utterance>x</utterance>\n  <?pi y?>\n</iml>"
+        )
+        assert result.issues == []
+
+    def test_nested_utterance_is_error(self, validator: IMLValidator) -> None:
+        result = validator.validate("<utterance>a<utterance>b</utterance></utterance>")
+        assert _error_rules(result) == {"V20"}
+
+    def test_nested_utterance_is_still_checked(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance>a<utterance emotion="sad">b</utterance></utterance>'
+        )
+        assert _error_rules(result) == {"V20", "V3"}
+
+    def test_iml_inside_utterance_is_error(self, validator: IMLValidator) -> None:
+        result = validator.validate("<utterance><iml><utterance>x</utterance></iml></utterance>")
+        assert _error_rules(result) == {"V20"}
+
+    def test_iml_inside_iml_is_error(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            "<iml><utterance>x</utterance><iml><utterance>y</utterance></iml></iml>"
+        )
+        assert _error_rules(result) == {"V20"}
+
+    def test_emphasis_in_emphasis_is_error(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance><emphasis level="strong">'
+            '<emphasis level="moderate">x</emphasis></emphasis></utterance>'
+        )
+        assert _error_rules(result) == {"V21"}
+
+    def test_emphasis_in_prosody_in_emphasis_ok(self, validator: IMLValidator) -> None:
+        # Only a direct child is forbidden; depth 3 is a V12 warning.
+        result = validator.validate(
+            '<utterance><emphasis level="strong"><prosody pitch="+5%">'
+            '<emphasis level="moderate">x</emphasis></prosody></emphasis></utterance>'
+        )
+        assert result.valid is True
+        assert {i.rule for i in result.warnings} == {"V12"}
+
+    def test_pause_in_emphasis_and_prosody_in_prosody_ok(
+        self, validator: IMLValidator
+    ) -> None:
+        result = validator.validate(
+            '<utterance><emphasis level="strong">never<pause duration="300"/> again</emphasis>'
+            '<prosody pitch="+5%"><prosody volume="+3dB">x</prosody></prosody></utterance>'
+        )
+        assert result.issues == []
+
+    def test_pause_comment_is_not_content(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance>a<pause duration="5"><!-- c --></pause></utterance>'
+        )
+        assert result.issues == []
+
+    def test_utterance_root_in_iml_namespace_ok(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<iml:utterance xmlns:iml="http://prosody-protocol.org/iml/0.1"'
+            ' emotion="calm" confidence="0.94">Hello'
+            ' <iml:emphasis level="strong">world</iml:emphasis>.</iml:utterance>'
+        )
+        assert result.issues == []
+
+    def test_foreign_namespace_root_is_not_iml(self, validator: IMLValidator) -> None:
+        result = validator.validate('<x:utterance xmlns:x="urn:other">Hello</x:utterance>')
+        assert _error_rules(result) == {"V2"}
+
+
+# ---------------------------------------------------------------------------
+# Unknown elements and attributes (V16, V32, spec 6.2, 9.2)
+# ---------------------------------------------------------------------------
+
+
+class TestUnknownContent:
+    def test_errors_inside_unknown_element_are_found(self, validator: IMLValidator) -> None:
+        """Unknown elements are transparent: they must not hide invalid IML."""
+        result = validator.validate(
+            '<utterance><prosody pitch="+5%"><span><segment>x</segment><pause/></span>'
+            "</prosody></utterance>"
+        )
+        assert result.valid is False
+        assert _error_rules(result) == {"V10", "V5"}
+        assert any(i.rule == "V16" and i.severity == "info" for i in result.issues)
+
+    def test_segment_through_unknown_wrapper_is_direct_child(
+        self, validator: IMLValidator
+    ) -> None:
+        result = validator.validate("<utterance><span><segment>x</segment></span></utterance>")
+        assert result.valid is True
+
+    def test_foreign_namespace_element_is_unknown_not_iml(
+        self, validator: IMLValidator
+    ) -> None:
+        result = validator.validate(
+            '<utterance><prosody pitch="+5%"><f:segment xmlns:f="urn:other">x</f:segment>'
+            "</prosody></utterance>"
+        )
+        assert result.valid is True
+        v16 = [i for i in result.issues if i.rule == "V16"]
+        assert len(v16) == 1
+        assert "f:segment" in v16[0].message
+
+    def test_utterance_inside_unknown_wrapper_in_iml_counts(
+        self, validator: IMLValidator
+    ) -> None:
+        result = validator.validate(
+            '<iml><f:turn xmlns:f="urn:x">note<utterance>x</utterance></f:turn></iml>'
+        )
+        assert result.valid is True
+        assert not any(i.rule == "V2" for i in result.issues)
+
+    def test_markup_inside_unknown_wrapper_in_iml_is_error(
+        self, validator: IMLValidator
+    ) -> None:
+        result = validator.validate(
+            '<iml><utterance>x</utterance><meta><prosody pitch="+5%">y</prosody></meta></iml>'
+        )
+        assert _error_rules(result) == {"V19"}
+
+    def test_x_and_namespaced_attributes_are_silent(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance xmlns:a="urn:a" a:note="n" x-id="7">'
+            '<prosody x-formant-shift="+200Hz" x-nasality="0.7">x</prosody></utterance>'
+        )
+        assert result.issues == []
+
+    def test_unknown_unprefixed_attribute_warns(self, validator: IMLValidator) -> None:
+        result = validator.validate('<utterance><prosody pich="+5%">x</prosody></utterance>')
+        assert result.valid is True
+        assert [(i.severity, i.rule) for i in result.issues] == [("warning", "V32")]
+        assert "pich" in result.issues[0].message
+
+    def test_attribute_in_iml_namespace_warns(self, validator: IMLValidator) -> None:
+        """Spec 2.3: iml:emotion is not the emotion attribute, so it would be lost."""
+        result = validator.validate(
+            '<iml:utterance xmlns:iml="http://prosody-protocol.org/iml/0.1"'
+            ' iml:emotion="angry" iml:confidence="0.9">x</iml:utterance>'
+        )
+        assert result.valid is True
+        assert [(i.severity, i.rule) for i in result.issues] == [
+            ("warning", "V32"),
+            ("warning", "V32"),
+        ]
+        assert "'iml:emotion'" in result.issues[0].message
+        assert "never namespace-qualified" in result.issues[0].message
+
+    def test_extended_attribute_on_wrong_element_warns(self, validator: IMLValidator) -> None:
+        result = validator.validate('<utterance f0_mean="120">x</utterance>')
+        assert [i.rule for i in result.warnings] == ["V32"]
+
+
+# ---------------------------------------------------------------------------
+# Comments, processing instructions, entities (spec 2.5)
+# ---------------------------------------------------------------------------
+
+
+class TestNonElementNodes:
+    @pytest.mark.parametrize(
+        "iml",
+        [
+            "<iml><?pi x?><utterance>hi</utterance></iml>",
+            "<iml><utterance>hi</utterance><?pi x?></iml>",
+            "<utterance>hi<?pi x?> there</utterance>",
+            "<utterance>hi<!-- note --> there</utterance>",
+            "<iml><!-- note --><utterance>hi</utterance></iml>",
+        ],
+    )
+    def test_pi_and_comments_are_ignored(self, validator: IMLValidator, iml: str) -> None:
         result = validator.validate(iml)
-        # Should either reject the document or not resolve the entity
-        # lxml with resolve_entities=False will leave &xxe; unresolved,
-        # which means the text won't contain "injected"
-        assert result is not None  # doesn't crash
+        assert result.valid is True
+        assert result.issues == []
 
-    def test_parser_rejects_malicious_dtd(self) -> None:
-        """Parser should not fetch external DTDs."""
-        from prosody_protocol import IMLParser
+    def test_doctype_is_error(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<!DOCTYPE utterance [<!ENTITY who "Bob">]><utterance>Hi &who; there</utterance>'
+        )
+        assert result.valid is False
+        assert _error_rules(result) == {"V31"}
 
-        parser = IMLParser()
-        # This should not attempt a network fetch
-        iml = '<?xml version="1.0"?><!DOCTYPE foo SYSTEM "http://evil.example.com/xxe.dtd"><utterance>test</utterance>'
-        # Should either parse safely or raise an error, but never fetch the URL
-        try:
-            doc = parser.parse(iml)
-            # If it parses, verify content is safe
-            plain = parser.to_plain_text(doc)
-            assert "test" in plain
-        except Exception:
-            pass  # Rejecting the document is also acceptable
+    def test_billion_laughs_is_rejected(self, validator: IMLValidator) -> None:
+        entities = '<!ENTITY lol "lol">' + "".join(
+            f'<!ENTITY lol{i} "{("&lol%s;" % (i - 1 or "")) * 10}">' for i in range(1, 10)
+        )
+        result = validator.validate(
+            f"<!DOCTYPE utterance [{entities}]><utterance>&lol9;</utterance>"
+        )
+        assert result.valid is False
+        assert _error_rules(result) & {"V1", "V31"}
+
+
+# ---------------------------------------------------------------------------
+# Encoding (V30, spec 2.2)
+# ---------------------------------------------------------------------------
+
+
+class TestEncoding:
+    def test_non_utf8_declaration_is_error(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<?xml version="1.0" encoding="ISO-8859-1"?><utterance>caf\u00e9</utterance>'
+        )
+        assert result.valid is False
+        assert _error_rules(result) == {"V30"}
+        assert "ISO-8859-1" in result.errors[0].message
+
+    @pytest.mark.parametrize("declared", ["UTF-8", "utf-8", "UTF8"])
+    def test_utf8_declaration_ok(self, validator: IMLValidator, declared: str) -> None:
+        result = validator.validate(
+            f"<?xml version='1.0' encoding='{declared}'?><utterance>caf\u00e9</utterance>"
+        )
+        assert result.issues == []
+
+    def test_lone_surrogate_is_error_not_exception(self, validator: IMLValidator) -> None:
+        result = validator.validate("<utterance>\ud800</utterance>")
+        assert [i.rule for i in result.issues] == ["V30"]
+
+
+# ---------------------------------------------------------------------------
+# ValidationResult helpers
+# ---------------------------------------------------------------------------
+
+
+class TestValidationResultHelpers:
+    def test_errors_and_warnings(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance emotion="excited"><prosody pich="+5%">x</prosody></utterance>'
+        )
+        assert [i.rule for i in result.errors] == ["V3"]
+        assert [i.rule for i in result.warnings] == ["V32"]
+        assert any(i.severity == "info" for i in result.issues)  # V15 is neither
+
+    def test_readme_pattern(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance emotion="happy"><prosody pitch="+20%">This is great!</prosody></utterance>'
+        )
+        report = "Valid" if result.valid else f"Errors: {result.errors}"
+        assert report.startswith("Errors:")
+        assert "V3" in report
+
+    def test_raise_for_errors_valid(self, validator: IMLValidator) -> None:
+        validator.validate("<utterance>fine</utterance>").raise_for_errors()
+
+    def test_raise_for_errors_invalid(self, validator: IMLValidator) -> None:
+        result = validator.validate('<utterance emotion="angry"><pause/></utterance>')
+        with pytest.raises(IMLValidationError) as info:
+            result.raise_for_errors()
+        assert [i.rule for i in info.value.issues] == ["V3", "V5"]
+        assert "V3" in str(info.value)
+        assert "V5" in str(info.value)
+
+    def test_raise_for_errors_ignores_warnings(self, validator: IMLValidator) -> None:
+        result = validator.validate('<utterance><prosody pich="+5%">x</prosody></utterance>')
+        assert result.warnings
+        result.raise_for_errors()
+
+    def test_raise_for_errors_truncates_long_lists(self, validator: IMLValidator) -> None:
+        result = validator.validate("<utterance>" + "<pause/>" * 8 + "</utterance>")
+        with pytest.raises(IMLValidationError, match="and 3 more") as info:
+            result.raise_for_errors()
+        assert len(info.value.issues) == 8
+
+    def test_validation_error_default_issues(self) -> None:
+        assert IMLValidationError("bad").issues == ()

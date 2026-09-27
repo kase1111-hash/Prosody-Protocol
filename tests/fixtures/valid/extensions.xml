@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/css" href="iml.css"?>
+<!-- Spec 9.2 / 6.2: extension attributes, foreign elements, comments,
+     processing instructions and CDATA are all allowed and ignored. -->
+<iml version="0.1.0" language="en-US" x-session="demo-42"
+     xmlns:ann="urn:example:annotations">
+  <ann:source device="studio-mic"/>
+  <utterance emotion="joyful" confidence="0.83" x-annotator="human" ann:reviewed="true">
+    <!-- reviewer note: laughter trimmed -->
+    That was <prosody pitch="+10%" x-formant-shift="+200Hz" x-nasality="0.7">amazing</prosody>,
+    <ann:highlight>truly</ann:highlight><?render bold?> <![CDATA[A & B]]> rock!
+  </utterance>
+</iml>

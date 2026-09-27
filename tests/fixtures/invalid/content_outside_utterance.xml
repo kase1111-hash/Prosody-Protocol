@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INVALID: text and markup directly inside <iml>, outside any <utterance> (violates V19 / spec 2.4, 5.2) -->
+<iml version="0.1.0">
+  <utterance>Hello.</utterance>
+  Stray text.
+  <prosody pitch="+20%">IMPORTANT WARNING</prosody>
+</iml>

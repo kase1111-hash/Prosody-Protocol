@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INVALID: emphasis directly inside emphasis (violates V21 / spec 3.4, 5.2) -->
+<utterance>
+  I <emphasis level="strong">really <emphasis level="moderate">do</emphasis></emphasis> care.
+</utterance>

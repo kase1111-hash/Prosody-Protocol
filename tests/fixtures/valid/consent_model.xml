@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Spec 8.3 consent model: explicit opt-in, on-device processing -->
+<iml version="0.1.0" consent="explicit" processing="local">
+  <utterance emotion="calm" confidence="0.91">
+    Sure, go ahead and record this.
+  </utterance>
+</iml>

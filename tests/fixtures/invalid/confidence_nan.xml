@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INVALID: confidence is NaN, not a float in [0.0, 1.0] (violates V4 / spec 2.6, 3.1) -->
+<utterance emotion="calm" confidence="NaN">
+  Everything is fine.
+</utterance>

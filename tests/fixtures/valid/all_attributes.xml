@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Every core attribute value form, nested prosody, pause inside emphasis,
+     and extended attributes (exponent notation is a valid Float). -->
+<iml version="0.1.0-alpha" language="en-GB" consent="implicit" processing="hybrid">
+  <utterance emotion="uncertain" confidence="0.45" speaker_id="user_002">
+    <segment tempo="drawn-out" rhythm="legato">
+      I <emphasis level="reduced">guess<pause duration="250"/> so</emphasis>,
+      <prosody rate="slow" quality="creaky" pitch="185Hz" pitch_contour="flat">maybe</prosody>
+    </segment>
+    <prosody rate="80%" volume="-3dB" quality="whispery" f0_mean="142.5" f0_range="120-190"
+             f0_contour="150,142,138,131" intensity_mean="61" intensity_range="9.5"
+             speech_rate="3.1" duration_ms="840" jitter="1.2e-1" shimmer="2.4" hnr="-1.5">
+      not <prosody pitch="+3st" pitch_contour="rise-sharp">today</prosody>
+    </prosody>
+    <prosody rate="fast" quality="tense" pitch_contour="fall-rise">or</prosody>
+    <prosody rate="medium" quality="modal" pitch_contour="rise">tomorrow</prosody>
+    <prosody quality="breathy" pitch_contour="rise-fall">then</prosody>
+    <prosody quality="harsh" pitch_contour="fall-sharp">fine</prosody>?
+    <segment tempo="rushed" rhythm="staccato">no</segment>
+    <segment tempo="steady" rhythm="syncopated">
+      <emphasis level="strong">never</emphasis>
+    </segment>
+  </utterance>
+</iml>

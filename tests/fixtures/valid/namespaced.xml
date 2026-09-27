@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Spec 2.3: IML embedded with the IML namespace -->
+<iml:iml xmlns:iml="http://prosody-protocol.org/iml/0.1" version="0.1.0" language="en-US">
+  <iml:utterance emotion="calm" confidence="0.94" speaker_id="agent">
+    Hello <iml:emphasis level="moderate">world</iml:emphasis>.
+  </iml:utterance>
+  <iml:utterance>
+    Well<iml:pause duration="600"/> maybe
+    <iml:prosody pitch="-2st" pitch_contour="fall">later</iml:prosody>.
+  </iml:utterance>
+</iml:iml>

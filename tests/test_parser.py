@@ -2,20 +2,30 @@
 
 Covers:
 - Parsing all Appendix C examples from the spec
-- Round-trip: parse -> serialize -> parse produces identical documents
+- Round-trip: parse -> serialize -> parse produces identical documents,
+  including consent/processing, extension attributes and invalid values
 - Malformed XML raises IMLParseError
 - Mixed content ordering (text + child interleaving)
 - Extended attributes on <prosody>
-- File-based parsing
-- Plain text extraction
+- File-based parsing and UTF-8 enforcement
+- Plain text extraction and whitespace normalization
+- Comments, processing instructions, CDATA, unknown elements, namespaces
+- XML security: DOCTYPE, external entities (file and network), billion laughs
 """
 
 from __future__ import annotations
 
+import http.server
+import threading
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from lxml import etree
 
+from prosody_protocol import parser as parser_module
+from prosody_protocol import validator as validator_module
 from prosody_protocol.exceptions import IMLParseError
 from prosody_protocol.models import (
     Emphasis,
@@ -25,7 +35,8 @@ from prosody_protocol.models import (
     Segment,
     Utterance,
 )
-from prosody_protocol.parser import IMLParser
+from prosody_protocol.parser import MAX_INTEGER, IMLParser
+from prosody_protocol.validator import IMLValidator
 
 
 @pytest.fixture()
@@ -213,7 +224,7 @@ class TestRoundTrip:
         assert doc1.version == doc2.version
         assert doc1.language == doc2.language
         assert len(doc1.utterances) == len(doc2.utterances)
-        for u1, u2 in zip(doc1.utterances, doc2.utterances):
+        for u1, u2 in zip(doc1.utterances, doc2.utterances, strict=True):
             assert u1.emotion == u2.emotion
             assert u1.confidence == u2.confidence
             assert u1.speaker_id == u2.speaker_id
@@ -386,8 +397,7 @@ class TestToIMLString:
 class TestEdgeCases:
     def test_xml_comment_ignored(self, parser: IMLParser) -> None:
         doc = parser.parse("<utterance><!-- comment -->Hello</utterance>")
-        for child in doc.utterances[0].children:
-            assert isinstance(child, str)
+        assert doc.utterances[0].children == ("Hello",)
 
     def test_empty_utterance(self, parser: IMLParser) -> None:
         doc = parser.parse("<utterance></utterance>")
@@ -404,3 +414,537 @@ class TestEdgeCases:
         doc = parser.parse("<utterance>A &amp; B &lt; C</utterance>")
         text = parser.to_plain_text(doc)
         assert "A & B < C" in text
+
+    def test_cdata_is_text(self, parser: IMLParser) -> None:
+        doc = parser.parse("<utterance>a <![CDATA[<b> & c]]> d</utterance>")
+        assert doc.utterances[0].children == ("a <b> & c d",)
+        assert parser.to_iml_string(doc) == "<utterance>a &lt;b&gt; &amp; c d</utterance>"
+
+
+# ---------------------------------------------------------------------------
+# Comments, processing instructions and unknown elements (spec 2.5, 6.2)
+# ---------------------------------------------------------------------------
+
+
+class TestNonIMLContent:
+    def test_comment_text_never_becomes_content(self, parser: IMLParser) -> None:
+        doc = parser.parse("<utterance>Hello <!-- secret note --> world</utterance>")
+        assert doc.utterances[0].children == ("Hello  world",)
+        assert "secret" not in parser.to_iml_string(doc)
+        assert parser.to_plain_text(doc) == "Hello world"
+
+    @pytest.mark.parametrize(
+        "iml",
+        [
+            "<iml><?pi x?><utterance>hi there</utterance></iml>",
+            "<iml><utterance>hi there</utterance><?pi x?></iml>",
+            "<utterance>hi<?pi x?> there</utterance>",
+            "<utterance><?pi x?>hi there</utterance>",
+        ],
+    )
+    def test_processing_instructions_are_skipped(self, parser: IMLParser, iml: str) -> None:
+        doc = parser.parse(iml)
+        assert parser.to_plain_text(doc) == "hi there"
+
+    def test_comment_and_pi_inside_unknown_element(self, parser: IMLParser) -> None:
+        doc = parser.parse("<utterance><span>a<!-- secret -->b<?foo bar?>c</span></utterance>")
+        assert doc.utterances[0].children == ("abc",)
+
+    def test_unknown_element_keeps_iml_markup(self, parser: IMLParser) -> None:
+        doc = parser.parse(
+            '<utterance>I <span>really <emphasis level="strong">mean</emphasis></span>'
+            " it</utterance>"
+        )
+        assert doc.utterances[0].children == (
+            "I really ",
+            Emphasis(level="strong", children=("mean",)),
+            " it",
+        )
+
+    def test_foreign_namespace_element_is_unknown(self, parser: IMLParser) -> None:
+        doc = parser.parse(
+            '<utterance><prosody pitch="+5%"><f:segment xmlns:f="urn:other">x</f:segment>'
+            "</prosody></utterance>"
+        )
+        assert doc.utterances[0].children == (Prosody(pitch="+5%", children=("x",)),)
+
+    def test_iml_namespace_is_iml(self, parser: IMLParser) -> None:
+        doc = parser.parse(
+            '<iml:iml xmlns:iml="http://prosody-protocol.org/iml/0.1" version="0.1.0">'
+            '<iml:utterance emotion="calm" confidence="0.94">Hello'
+            ' <iml:emphasis level="strong">world</iml:emphasis>.</iml:utterance></iml:iml>'
+        )
+        assert doc.version == "0.1.0"
+        utt = doc.utterances[0]
+        assert utt.emotion == "calm"
+        assert utt.children == ("Hello ", Emphasis(level="strong", children=("world",)), ".")
+
+    def test_utterances_inside_unknown_wrapper_in_iml(self, parser: IMLParser) -> None:
+        doc = parser.parse(
+            '<iml><f:meta xmlns:f="urn:x">recorded on device 42</f:meta>'
+            "<turn><utterance>x</utterance></turn><utterance>y</utterance></iml>"
+        )
+        assert [u.children for u in doc.utterances] == [("x",), ("y",)]
+
+    def test_foreign_root_is_rejected(self, parser: IMLParser) -> None:
+        with pytest.raises(IMLParseError, match="x:utterance"):
+            parser.parse('<x:utterance xmlns:x="urn:other">Hello</x:utterance>')
+
+    def test_foreign_default_namespace_root_is_named_by_namespace(
+        self, parser: IMLParser
+    ) -> None:
+        # Without a prefix, "got <iml>" would read as if <iml> were refused.
+        with pytest.raises(IMLParseError, match=r"got <\{urn:other\}iml>"):
+            parser.parse('<iml xmlns="urn:other"><utterance>x</utterance></iml>')
+
+    def test_long_text_split_by_comments_parses_in_linear_time(
+        self, parser: IMLParser
+    ) -> None:
+        """Text runs split by comments or unknown tags are joined once, not repeatedly."""
+
+        def best_time(n: int) -> float:
+            iml = "<utterance>" + "word <!----><span/>" * n + "</utterance>"
+            times = []
+            for _ in range(3):
+                start = time.perf_counter()
+                doc = parser.parse(iml)
+                times.append(time.perf_counter() - start)
+            assert doc.utterances[0].children == ("word " * n,)
+            return min(times)
+
+        # Linear work grows 4x from n to 4n; the old repeated concatenation
+        # grew about 16x.
+        assert best_time(160_000) < 8 * best_time(40_000)
+
+
+# ---------------------------------------------------------------------------
+# Content the model cannot hold raises instead of being dropped
+# ---------------------------------------------------------------------------
+
+
+class TestUnrepresentableContent:
+    def test_markup_directly_in_iml(self, parser: IMLParser) -> None:
+        with pytest.raises(IMLParseError, match="<prosody> must be inside an <utterance>"):
+            parser.parse(
+                "<iml><utterance>Hello</utterance>"
+                '<prosody pitch="+20%">IMPORTANT WARNING</prosody></iml>'
+            )
+
+    def test_text_directly_in_iml(self, parser: IMLParser) -> None:
+        with pytest.raises(IMLParseError, match="stray text"):
+            parser.parse("<iml>stray text<utterance>x</utterance></iml>")
+
+    def test_markup_in_unknown_wrapper_in_iml(self, parser: IMLParser) -> None:
+        with pytest.raises(IMLParseError, match="<pause>"):
+            parser.parse('<iml><utterance>x</utterance><meta><pause duration="5"/></meta></iml>')
+
+    def test_nested_utterance(self, parser: IMLParser) -> None:
+        with pytest.raises(IMLParseError, match="<utterance> cannot be nested"):
+            parser.parse("<iml><utterance>Hi <utterance>nested</utterance></utterance></iml>")
+
+    def test_iml_inside_utterance(self, parser: IMLParser) -> None:
+        with pytest.raises(IMLParseError, match="<iml> cannot be nested"):
+            parser.parse("<utterance><iml><utterance>x</utterance></iml></utterance>")
+
+    def test_pause_with_content(self, parser: IMLParser) -> None:
+        with pytest.raises(IMLParseError, match="<pause> must be an empty element"):
+            parser.parse('<utterance>Wait <pause duration="500">oops</pause> there.</utterance>')
+
+    def test_pause_with_whitespace_or_comment_is_empty(self, parser: IMLParser) -> None:
+        doc = parser.parse('<utterance>a<pause duration="5"> <!-- c --> </pause>b</utterance>')
+        assert doc.utterances[0].children == ("a", Pause(duration=5), "b")
+
+    def test_unknown_element_in_pause_is_content(self, parser: IMLParser) -> None:
+        # Spec 3.3; dropping it would turn this V7-invalid document into a valid one.
+        with pytest.raises(IMLParseError, match="<pause> must be an empty element"):
+            parser.parse(
+                '<utterance>a<pause duration="5"><f:x xmlns:f="urn:x"/></pause>b</utterance>'
+            )
+
+
+# ---------------------------------------------------------------------------
+# Plain text (spec M9)
+# ---------------------------------------------------------------------------
+
+
+class TestPlainTextNormalization:
+    def test_quickstart_output(self, parser: IMLParser, valid_fixtures_dir: Path) -> None:
+        doc = parser.parse_file(valid_fixtures_dir / "sarcasm.xml")
+        assert parser.to_plain_text(doc) == "Oh, that's GREAT."
+
+    def test_utterances_joined_with_space(self, parser: IMLParser) -> None:
+        doc = parser.parse(
+            '<iml><utterance speaker_id="a">Is it?</utterance>'
+            '<utterance speaker_id="b">No.</utterance><utterance/>'
+            "<utterance>Yes!</utterance></iml>"
+        )
+        assert parser.to_plain_text(doc) == "Is it? No. Yes!"
+
+    def test_pretty_printed_multi_speaker(
+        self, parser: IMLParser, valid_fixtures_dir: Path
+    ) -> None:
+        doc = parser.parse_file(valid_fixtures_dir / "multi_speaker.xml")
+        assert parser.to_plain_text(doc) == (
+            "How can I help you today? "
+            "I've been on hold for thirty minutes and my account is still locked. "
+            "I'm so sorry about that. Let me fix this right away."
+        )
+
+    def test_space_inside_element_still_separates_words(self, parser: IMLParser) -> None:
+        doc = parser.parse(
+            '<utterance>I <emphasis level="strong">told </emphasis>you</utterance>'
+        )
+        assert parser.to_plain_text(doc) == "I told you"
+
+    def test_source_text_spacing_is_kept(self, parser: IMLParser) -> None:
+        # Only XML whitespace at an element boundary is treated as formatting.
+        doc = parser.parse("<utterance>Bonjour ! Caf\u00e9\u00a0cr\u00e8me.</utterance>")
+        assert parser.to_plain_text(doc) == "Bonjour ! Caf\u00e9\u00a0cr\u00e8me."
+
+    def test_pause_between_spaces(self, parser: IMLParser) -> None:
+        doc = parser.parse('<utterance>Well <pause duration="800"/> I suppose.</utterance>')
+        assert parser.to_plain_text(doc) == "Well I suppose."
+
+    @pytest.mark.parametrize(
+        ("iml", "text"),
+        [
+            ('<utterance>Wait<pause duration="300"/>.</utterance>', "Wait."),
+            ('<utterance>Wait<pause duration="300"/>, then go.</utterance>', "Wait, then go."),
+            (
+                '<utterance><prosody rate="slow">Wait<pause duration="300"/></prosody>!'
+                "</utterance>",
+                "Wait!",
+            ),
+        ],
+    )
+    def test_pause_before_punctuation_adds_no_space(
+        self, parser: IMLParser, iml: str, text: str
+    ) -> None:
+        assert parser.to_plain_text(parser.parse(iml)) == text
+
+    def test_empty_document(self, parser: IMLParser) -> None:
+        assert parser.to_plain_text(IMLDocument()) == ""
+
+
+# ---------------------------------------------------------------------------
+# Numeric attributes (spec 2.6)
+# ---------------------------------------------------------------------------
+
+
+class TestNumericAttributes:
+    @pytest.mark.parametrize("raw", ["NaN", "nan", "inf", "1_0", "1.5", "-0.1", "high"])
+    def test_invalid_confidence_is_not_a_number_in_the_model(
+        self, parser: IMLParser, raw: str
+    ) -> None:
+        doc = parser.parse(f'<utterance emotion="calm" confidence="{raw}">x</utterance>')
+        utt = doc.utterances[0]
+        assert utt.confidence is None
+        assert utt.extra_attributes == (("confidence", raw),)
+
+    def test_exponent_confidence(self, parser: IMLParser) -> None:
+        doc = parser.parse('<utterance emotion="calm" confidence="1e-1">x</utterance>')
+        assert doc.utterances[0].confidence == pytest.approx(0.1)
+
+    @pytest.mark.parametrize("raw", ["8_00", "\u0668\u0660\u0660", "0", "-5", "3.5"])
+    def test_invalid_pause_duration(self, parser: IMLParser, raw: str) -> None:
+        doc = parser.parse(f'<utterance><pause duration="{raw}"/></utterance>')
+        pause = doc.utterances[0].children[0]
+        assert pause == Pause(duration=0, extra_attributes=(("duration", raw),))
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["1" * 5000, "9" * 100_000, str(MAX_INTEGER + 1), "99999999999999999999"],
+        ids=["5000-digits", "100000-digits", "max-plus-1", "20-digits"],
+    )
+    def test_too_large_pause_duration_is_invalid_not_a_crash(
+        self, parser: IMLParser, raw: str
+    ) -> None:
+        # int() refuses strings of more than 4300 digits with ValueError.
+        doc = parser.parse(f'<utterance>a<pause duration="{raw}"/>b</utterance>')
+        pause = doc.utterances[0].children[1]
+        assert pause == Pause(duration=0, extra_attributes=(("duration", raw),))
+
+    def test_too_large_duration_ms_is_invalid_not_a_crash(self, parser: IMLParser) -> None:
+        raw = "1" * 5000
+        p = parser.parse(
+            f'<utterance><prosody duration_ms="{raw}">x</prosody></utterance>'
+        ).utterances[0].children[0]
+        assert isinstance(p, Prosody)
+        assert p.duration_ms is None
+        assert p.extra_attributes == (("duration_ms", raw),)
+
+    @pytest.mark.parametrize(
+        ("raw", "value"),
+        [(str(MAX_INTEGER), MAX_INTEGER), ("0" * 5000 + "800", 800), ("+0800", 800)],
+        ids=["max", "5000-leading-zeros", "plus-sign"],
+    )
+    def test_integer_limits(self, parser: IMLParser, raw: str, value: int) -> None:
+        doc = parser.parse(f'<utterance><pause duration="{raw}"/></utterance>')
+        assert doc.utterances[0].children == (Pause(duration=value),)
+
+    def test_invalid_extended_values_are_kept_raw(self, parser: IMLParser) -> None:
+        p = parser.parse(
+            '<utterance><prosody f0_mean="abc" jitter="-1" duration_ms="12.5" hnr="-3">x'
+            "</prosody></utterance>"
+        ).utterances[0].children[0]
+        assert isinstance(p, Prosody)
+        assert (p.f0_mean, p.jitter, p.duration_ms, p.hnr) == (None, None, None, -3.0)
+        assert p.extra_attributes == (("f0_mean", "abc"), ("jitter", "-1"), ("duration_ms", "12.5"))
+
+
+# ---------------------------------------------------------------------------
+# Lossless round trip
+# ---------------------------------------------------------------------------
+
+
+def _round_trip(parser: IMLParser, iml: str) -> str:
+    return parser.to_iml_string(parser.parse(iml))
+
+
+class TestLosslessRoundTrip:
+    def test_consent_and_processing_kept_on_single_utterance(self, parser: IMLParser) -> None:
+        doc = parser.parse(
+            '<iml consent="explicit" processing="local"><utterance emotion="sad"'
+            ' confidence="0.8">I miss her.</utterance></iml>'
+        )
+        out = parser.to_iml_string(doc)
+        assert out.startswith('<iml consent="explicit" processing="local">')
+        again = parser.parse(out)
+        assert (again.consent, again.processing) == ("explicit", "local")
+
+    def test_extension_and_unknown_attributes_kept(self, parser: IMLParser) -> None:
+        iml = (
+            '<iml version="0.1.0" x-session="7"><utterance x-annotator="human" foo="bar">'
+            '<prosody pitch="+5%" x-formant-shift="+200Hz" x-nasality="0.7">x</prosody>'
+            '<pause duration="300" x-kind="breath"/>'
+            '<emphasis level="strong" x-w="1">y</emphasis>'
+            '<segment tempo="steady" x-s="2">z</segment></utterance></iml>'
+        )
+        out = _round_trip(parser, iml)
+        assert out == iml
+        assert IMLValidator().validate(out).valid is True
+
+    def test_namespaced_attributes_kept(self, parser: IMLParser) -> None:
+        iml = (
+            '<utterance xmlns:a="urn:a" xml:lang="fr" a:note="n&#10;2">'
+            "Bonjour</utterance>"
+        )
+        doc = parser.parse(iml)
+        assert doc.utterances[0].extra_attributes == (
+            ("{http://www.w3.org/XML/1998/namespace}lang", "fr"),
+            ("{urn:a}note", "n\n2"),
+        )
+        assert parser.parse(parser.to_iml_string(doc)) == doc
+
+    def test_empty_level_is_kept_apart_from_missing_level(self, parser: IMLParser) -> None:
+        empty = parser.parse('<utterance><emphasis level="">x</emphasis></utterance>')
+        missing = parser.parse("<utterance><emphasis>x</emphasis></utterance>")
+        assert empty.utterances[0].children == (
+            Emphasis(level="", children=("x",), extra_attributes=(("level", ""),)),
+        )
+        assert empty != missing
+
+    def test_xml_declaration_is_not_written(self, parser: IMLParser) -> None:
+        # The output is a str with no declaration; a non-UTF-8 one (V30) is not kept.
+        out = _round_trip(
+            parser, '<?xml version="1.0" encoding="ISO-8859-1"?><utterance>caf\u00e9</utterance>'
+        )
+        assert out == "<utterance>caf\u00e9</utterance>"
+
+    def test_carriage_return_survives(self, parser: IMLParser) -> None:
+        doc = parser.parse("<utterance>a&#13;b</utterance>")
+        assert parser.parse(parser.to_iml_string(doc)) == doc
+
+    @pytest.mark.parametrize(
+        ("iml", "rules"),
+        [
+            ('<utterance emotion="calm" confidence="NaN">x</utterance>', {"V4"}),
+            ("<utterance>Wait <pause/> there.</utterance>", {"V5"}),
+            ('<utterance>Wait <pause duration="-5"/> there.</utterance>', {"V6"}),
+            ('<utterance>Wait <pause duration="0"/> there.</utterance>', {"V6"}),
+            ("<utterance>I <emphasis>really</emphasis> mean it.</utterance>", {"V8"}),
+            ('<utterance>I <emphasis level="">really</emphasis> mean it.</utterance>', {"V9"}),
+            pytest.param(
+                f'<utterance>Wait <pause duration="{"1" * 5000}"/> there.</utterance>',
+                {"V6"},
+                id="pause-duration-5000-digits",
+            ),
+            ('<utterance><prosody f0_mean="abc">x</prosody></utterance>', {"V27"}),
+        ],
+    )
+    def test_invalid_input_stays_invalid(
+        self, parser: IMLParser, iml: str, rules: set[str]
+    ) -> None:
+        out = _round_trip(parser, iml)
+        assert out == iml
+        errors = {i.rule for i in IMLValidator().validate(out).errors}
+        assert errors == rules
+
+    def test_invalid_fixtures_keep_their_errors(
+        self, parser: IMLParser, invalid_fixtures_dir: Path
+    ) -> None:
+        validator = IMLValidator()
+        checked = 0
+        for xml_file in sorted(invalid_fixtures_dir.glob("*.xml")):
+            try:
+                doc = parser.parse_file(xml_file)
+            except IMLParseError:
+                continue  # content the model cannot hold -- covered elsewhere
+            before = {i.rule for i in validator.validate_file(xml_file).errors}
+            after = {i.rule for i in validator.validate(parser.to_iml_string(doc)).errors}
+            assert after == before, xml_file.name
+            checked += 1
+        assert checked >= 10
+
+    def test_valid_fixtures_round_trip(
+        self, parser: IMLParser, valid_fixtures_dir: Path
+    ) -> None:
+        validator = IMLValidator()
+        for xml_file in sorted(valid_fixtures_dir.glob("*.xml")):
+            doc = parser.parse_file(xml_file)
+            out = parser.to_iml_string(doc)
+            assert parser.parse(out) == doc, xml_file.name
+            assert validator.validate(out).errors == [], xml_file.name
+
+    def test_programmatic_duplicate_extra_attribute_not_written_twice(
+        self, parser: IMLParser
+    ) -> None:
+        doc = IMLDocument(
+            utterances=(
+                Utterance(children=("x",), confidence=0.5, extra_attributes=(("confidence", "?"),)),
+            )
+        )
+        assert parser.to_iml_string(doc) == '<utterance confidence="0.5">x</utterance>'
+
+
+# ---------------------------------------------------------------------------
+# Encoding (spec 2.2)
+# ---------------------------------------------------------------------------
+
+
+class TestEncoding:
+    def test_declared_latin1_string_is_not_double_decoded(self, parser: IMLParser) -> None:
+        doc = parser.parse(
+            '<?xml version="1.0" encoding="ISO-8859-1"?><utterance>caf\u00e9</utterance>'
+        )
+        assert doc.utterances[0].children == ("caf\u00e9",)
+
+    def test_latin1_file_raises_parse_error(
+        self, parser: IMLParser, invalid_fixtures_dir: Path
+    ) -> None:
+        with pytest.raises(IMLParseError, match="UTF-8") as info:
+            parser.parse_file(invalid_fixtures_dir / "encoding_latin1.xml")
+        assert info.value.line == 4
+
+    def test_utf16_file_raises_parse_error(self, parser: IMLParser, tmp_path: Path) -> None:
+        path = tmp_path / "utf16.xml"
+        path.write_text("<utterance>Hello</utterance>", encoding="utf-16")
+        with pytest.raises(IMLParseError, match="UTF-8"):
+            parser.parse_file(path)
+
+    def test_utf8_bom_file(self, parser: IMLParser, tmp_path: Path) -> None:
+        path = tmp_path / "bom.xml"
+        path.write_bytes(b"\xef\xbb\xbf<utterance>caf\xc3\xa9</utterance>")
+        assert parser.parse_file(path).utterances[0].children == ("caf\u00e9",)
+
+    def test_lone_surrogate_raises_parse_error(self, parser: IMLParser) -> None:
+        with pytest.raises(IMLParseError, match="UTF-8"):
+            parser.parse("<utterance>\ud800</utterance>")
+
+
+# ---------------------------------------------------------------------------
+# XML security (spec 2.5)
+# ---------------------------------------------------------------------------
+
+SECRET = "xxe-secret-7f3a"
+# What a parser that resolves entities would do; used as a positive control so
+# the tests below cannot pass vacuously.
+_INSECURE_PARSER = etree.XMLParser(resolve_entities=True, no_network=False, load_dtd=True)
+
+
+@pytest.fixture()
+def secret_file(tmp_path: Path) -> Path:
+    path = tmp_path / "secret.txt"
+    path.write_text(SECRET)
+    return path
+
+
+def _xxe_documents(secret_file: Path) -> Iterator[str]:
+    """Documents that pull *secret_file* in through an external entity."""
+    yield (
+        f'<!DOCTYPE utterance [<!ENTITY xxe SYSTEM "{secret_file.as_uri()}">]>'
+        "<utterance>Hi &xxe;</utterance>"
+    )
+    dtd = secret_file.with_name("evil.dtd")
+    dtd.write_text(f'<!ENTITY xxe SYSTEM "{secret_file.as_uri()}">')
+    yield f'<!DOCTYPE utterance SYSTEM "{dtd.as_uri()}"><utterance>Hi &xxe;</utterance>'
+
+
+class TestXMLSecurity:
+    def test_positive_control_insecure_parser_leaks(self, secret_file: Path) -> None:
+        for doc in _xxe_documents(secret_file):
+            root = etree.fromstring(doc.encode(), parser=_INSECURE_PARSER)
+            assert SECRET in "".join(root.itertext())
+
+    @pytest.mark.parametrize("module", [parser_module, validator_module])
+    def test_hardened_parser_never_reads_entities(self, secret_file: Path, module: object) -> None:
+        secure = module._SECURE_PARSER  # type: ignore[attr-defined]
+        for doc in _xxe_documents(secret_file):
+            root = etree.fromstring(doc.encode(), parser=secure)
+            assert SECRET not in etree.tostring(root, encoding="unicode")
+
+    def test_parser_rejects_external_entities(self, parser: IMLParser, secret_file: Path) -> None:
+        for doc in _xxe_documents(secret_file):
+            with pytest.raises(IMLParseError, match="DOCTYPE") as info:
+                parser.parse(doc)
+            assert SECRET not in str(info.value)
+
+    def test_validator_rejects_external_entities(self, secret_file: Path) -> None:
+        for doc in _xxe_documents(secret_file):
+            result = IMLValidator().validate(doc)
+            assert result.valid is False
+            assert {i.rule for i in result.errors} == {"V31"}
+            assert all(SECRET not in i.message for i in result.issues)
+
+    def test_internal_entity_rejected(self, parser: IMLParser) -> None:
+        with pytest.raises(IMLParseError, match="DOCTYPE"):
+            parser.parse(
+                '<!DOCTYPE utterance [<!ENTITY who "Bob">]><utterance>Hi &who;</utterance>'
+            )
+
+    def test_billion_laughs_rejected(self, parser: IMLParser) -> None:
+        entities = '<!ENTITY lol "lol">' + "".join(
+            f'<!ENTITY lol{i} "{("&lol%s;" % (i - 1 or "")) * 10}">' for i in range(1, 10)
+        )
+        with pytest.raises(IMLParseError):
+            parser.parse(f"<!DOCTYPE utterance [{entities}]><utterance>&lol9;</utterance>")
+
+    def test_external_dtd_not_fetched(self, parser: IMLParser) -> None:
+        """A DOCTYPE pointing at a URL is rejected without being fetched.
+
+        (libxml2 builds without HTTP support could not fetch it anyway; the
+        request counter guards builds that can.)
+        """
+        hits: list[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - http.server API
+                hits.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'<!ENTITY xxe "fetched">')
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/xxe.dtd"
+            with pytest.raises(IMLParseError, match="DOCTYPE"):
+                parser.parse(f'<!DOCTYPE utterance SYSTEM "{url}"><utterance>&xxe;</utterance>')
+        finally:
+            server.shutdown()
+            server.server_close()
+        assert hits == []

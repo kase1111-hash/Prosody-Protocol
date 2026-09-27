@@ -60,7 +60,7 @@ SSML (Speech Synthesis Markup Language) is designed for text-to-speech **output*
 
 ### 2.1 Content Model
 
-An IML document consists of one or more `<utterance>` elements at the root level. Each utterance contains mixed content: plain text interspersed with inline prosodic markup elements.
+The root element of an IML document is either a single `<utterance>` or an `<iml>` element that wraps one or more utterances (Section 2.4). Each utterance contains mixed content: plain text interspersed with inline prosodic markup elements.
 
 ```xml
 <utterance emotion="frustrated" confidence="0.92">
@@ -77,6 +77,8 @@ IML documents MUST be encoded in UTF-8. The XML declaration is optional but reco
 <?xml version="1.0" encoding="UTF-8"?>
 ```
 
+If the XML declaration includes an encoding declaration, it MUST name `UTF-8`. A UTF-8 byte order mark MAY precede the document. Consumers MUST NOT decode an IML document with any encoding other than UTF-8; a document that is not valid UTF-8 is not a valid IML document.
+
 ### 2.3 Namespacing
 
 IML uses no namespace by default. When embedded in other XML formats, the namespace `http://prosody-protocol.org/iml/0.1` SHOULD be used:
@@ -86,6 +88,10 @@ IML uses no namespace by default. When embedded in other XML formats, the namesp
   Hello world.
 </iml:utterance>
 ```
+
+An element in the IML namespace is equivalent to the un-namespaced element with the same local name. A document SHOULD use one form for all of its IML elements. Elements in any other namespace are unknown elements (Section 6.2), even when their local name matches an IML tag. IML attributes are never namespace-qualified, including on namespaced elements: `iml:emotion` is not the `emotion` attribute, and consumers ignore it like any other unknown attribute. Producers SHOULD NOT put attributes in the IML namespace.
+
+The published XML Schema (`schemas/iml-1.0.xsd`) describes un-namespaced IML. Namespaced IML can be validated with a schema whose `targetNamespace` is the IML namespace and which includes `iml-1.0.xsd`.
 
 ### 2.4 Multi-Utterance Documents
 
@@ -102,12 +108,42 @@ Multiple utterances can be wrapped in a root `<iml>` element:
 </iml>
 ```
 
+**Content model:** `<utterance>` elements only. Whitespace, comments and processing instructions MAY appear between utterances; other text and other IML elements MUST NOT appear directly inside `<iml>`.
+
 **`<iml>` Attributes:**
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `version` | String | RECOMMENDED | IML specification version (e.g., `"0.1.0"`) |
-| `language` | BCP-47 | OPTIONAL | Primary language of the content |
+| `version` | SemVer | RECOMMENDED | IML specification version (e.g., `"0.1.0"`, `"0.1.0-alpha"`) |
+| `language` | BCP-47 | OPTIONAL | Primary language of the content (e.g., `"en-US"`) |
+| `consent` | Enum | OPTIONAL | Consent recorded for the prosodic and emotional annotations (Section 8.3) |
+| `processing` | Enum | OPTIONAL | Where the audio was analyzed (Section 8.3) |
+
+**Consent values:**
+
+- `explicit` - The speaker explicitly opted in to prosodic and emotional analysis
+- `implicit` - Consent was inferred from context rather than given as an opt-in. This does not meet the explicit-consent requirement of Section 8.1.
+- `none` - No consent was recorded
+
+**Processing values:**
+
+- `local` - Analysis ran on the user's device
+- `remote` - Analysis ran on a remote service
+- `hybrid` - Analysis ran partly on the device and partly remotely
+
+### 2.5 XML Features
+
+1. IML documents MUST NOT contain a document type declaration (`<!DOCTYPE ...>`). IML defines no DTD, and DTD-declared entities enable XML external entity (XXE) and entity-expansion attacks. Consumers MAY reject a document that contains one, and MUST NOT resolve external entities or fetch external resources while parsing IML.
+2. Comments and processing instructions MAY appear anywhere XML allows them. They carry no IML content: consumers MUST NOT treat their contents as text.
+3. CDATA sections are ordinary text.
+
+### 2.6 Attribute Value Syntax
+
+Attribute values MUST conform to the types given in this specification:
+
+- **Integer:** one or more ASCII digits (`0`-`9`), optionally preceded by `+`. Where a positive integer is required, the value MUST be greater than zero and MUST NOT exceed 2147483647 (2^31 - 1; as milliseconds, about 24.8 days).
+- **Float:** ASCII digits with an optional sign, decimal point and exponent (`0.87`, `-3.5`, `1e-1`). The value MUST be finite as an IEEE 754 double: `NaN`, infinities and values too large to represent (such as `1e400`) are not valid, and neither are digit-group separators (`1_000`) or non-ASCII digits.
+- **Enumerations** and patterned values (Sections 2.4, 3.2, 4) are case-sensitive and MUST NOT contain surrounding whitespace. XML whitespace around an Integer or Float is ignored.
 
 ---
 
@@ -117,7 +153,7 @@ Multiple utterances can be wrapped in a root `<iml>` element:
 
 Container for a complete spoken phrase or sentence.
 
-**Content model:** Mixed content (text, `<prosody>`, `<pause>`, `<emphasis>`, `<segment>`)
+**Content model:** Mixed content (text, `<prosody>`, `<pause>`, `<emphasis>`, `<segment>`). An `<utterance>` MUST NOT contain another `<utterance>` or an `<iml>`.
 
 **Attributes:**
 
@@ -157,7 +193,7 @@ Producers MAY use values outside this set. Consumers SHOULD handle unknown emoti
 
 Marks a span of text with specific prosodic features. This is the primary tag for encoding pitch, volume, rate, and voice quality.
 
-**Content model:** Mixed content (text, other inline elements)
+**Content model:** Mixed content (text, `<prosody>`, `<emphasis>`, `<pause>`)
 
 **Attributes:**
 
@@ -175,6 +211,8 @@ Marks a span of text with specific prosodic features. This is the primary tag fo
 - Semitone offset: `+3st`, `-2st`
 - Absolute Hz (extended): `185Hz`
 
+Relative values MUST carry an explicit sign; absolute values MUST NOT. Each is a decimal number (e.g., `+2.5st`) immediately followed by its unit.
+
 **Pitch contour values:**
 
 - `rise` - Upward pitch movement
@@ -187,12 +225,12 @@ Marks a span of text with specific prosodic features. This is the primary tag fo
 
 **Volume values:**
 
-- Relative dB: `+6dB`, `-3dB`
+- Relative dB with an explicit sign: `+6dB`, `-3dB`
 
 **Rate values:**
 
 - Named: `fast`, `slow`, `medium`
-- Percentage of baseline: `150%`, `80%`
+- Percentage of baseline, without a sign: `150%`, `80%`
 
 **Quality values:**
 
@@ -213,13 +251,13 @@ I <prosody pitch="-10%" volume="-3dB" quality="breathy">really</prosody> don't c
 
 An explicit timing gap that is significant for interpretation. Not every silence needs to be marked -- only pauses that carry meaning (hesitation, emphasis, turn-taking).
 
-**Content model:** Empty element (self-closing)
+**Content model:** Empty. A `<pause>` MUST NOT contain elements, including unknown elements (Section 6.2), or text other than whitespace; comments and processing instructions are ignored (Section 2.5). Producers SHOULD write it as a self-closing tag: `<pause duration="800"/>`.
 
 **Attributes:**
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `duration` | Integer (ms) | REQUIRED | Duration in milliseconds |
+| `duration` | Positive integer (ms) | REQUIRED | Duration in whole milliseconds |
 
 **Semantic guidelines:**
 
@@ -241,7 +279,7 @@ Well<pause duration="800"/> I suppose that could work.
 
 Marks words or phrases with notable stress or emphasis.
 
-**Content model:** Mixed content (text, `<prosody>`)
+**Content model:** Mixed content (text, `<prosody>`, `<pause>`). An `<emphasis>` MUST NOT directly contain another `<emphasis>`.
 
 **Attributes:**
 
@@ -300,36 +338,36 @@ Groups a stretch of speech sharing overall prosodic characteristics. Useful for 
 
 ## 4. Extended Attributes
 
-These attributes provide detailed acoustic measurements for research and advanced analysis. Producers are NOT required to include them; consumers MUST NOT depend on their presence.
+These attributes provide detailed acoustic measurements for research and advanced analysis. They appear on `<prosody>`. Producers are NOT required to include them; consumers MUST NOT depend on their presence. When present, their values MUST have the types below (Section 2.6); frequencies, ranges, rates and perturbation percentages MUST NOT be negative.
 
 ### 4.1 Fundamental Frequency (F0)
 
 | Attribute | Type | Unit | Description |
 |-----------|------|------|-------------|
-| `f0_mean` | Float | Hz | Mean fundamental frequency over the span |
+| `f0_mean` | Float, >= 0 | Hz | Mean fundamental frequency over the span |
 | `f0_range` | String | Hz | Pitch range as `"low-high"` (e.g., `"120-240"`) |
-| `f0_contour` | String | Hz sequence | Sampled F0 values (e.g., `"150,165,180,170,140"`) |
+| `f0_contour` | String | Hz sequence | Sampled F0 values, comma-separated without spaces (e.g., `"150,165,180,170,140"`) |
 
 ### 4.2 Intensity
 
 | Attribute | Type | Unit | Description |
 |-----------|------|------|-------------|
 | `intensity_mean` | Float | dB | Mean intensity over the span |
-| `intensity_range` | Float | dB | Dynamic range (max - min) |
+| `intensity_range` | Float, >= 0 | dB | Dynamic range (max - min) |
 
 ### 4.3 Temporal
 
 | Attribute | Type | Unit | Description |
 |-----------|------|------|-------------|
-| `speech_rate` | Float | syllables/sec | Articulation rate |
-| `duration_ms` | Integer | ms | Total duration of the span |
+| `speech_rate` | Float, >= 0 | syllables/sec | Articulation rate |
+| `duration_ms` | Positive integer | ms | Total duration of the span |
 
 ### 4.4 Voice Quality Measures
 
 | Attribute | Type | Unit | Description |
 |-----------|------|------|-------------|
-| `jitter` | Float | % | Cycle-to-cycle frequency perturbation |
-| `shimmer` | Float | % | Cycle-to-cycle amplitude perturbation |
+| `jitter` | Float, >= 0 | % | Cycle-to-cycle frequency perturbation |
+| `shimmer` | Float, >= 0 | % | Cycle-to-cycle amplitude perturbation |
 | `hnr` | Float | dB | Harmonics-to-noise ratio |
 
 **Example:**
@@ -352,11 +390,13 @@ These attributes provide detailed acoustic measurements for research and advance
         ├── text
         ├── <prosody>
         │     ├── text
+        │     ├── <prosody>
         │     ├── <emphasis>
         │     └── <pause/>
         ├── <emphasis>
         │     ├── text
-        │     └── <prosody>
+        │     ├── <prosody>
+        │     └── <pause/>
         ├── <pause/>
         └── <segment>
               ├── text
@@ -365,13 +405,18 @@ These attributes provide detailed acoustic measurements for research and advance
               └── <pause/>
 ```
 
+Every element MUST contain only the content its content model allows (Appendix A). The constraints below restate the consequences.
+
 ### 5.2 Constraints
 
-1. `<utterance>` MUST be the top-level content element (or wrapped in `<iml>`).
-2. `<prosody>` MAY nest inside `<emphasis>` and vice versa, but SHOULD NOT nest more than 2 levels deep.
-3. `<pause>` is always a self-closing empty element.
+1. `<utterance>` MUST be the top-level content element (or wrapped in `<iml>`). `<utterance>` and `<iml>` MUST NOT appear inside `<utterance>` or any inline element, and `<iml>` MUST contain only `<utterance>` elements (Section 2.4).
+2. `<prosody>` MAY nest inside `<emphasis>` and vice versa, and `<prosody>` MAY nest inside `<prosody>`, but the combined nesting depth of `<prosody>` and `<emphasis>` SHOULD NOT exceed 2 levels. Depth is counted from the enclosing `<utterance>` or `<segment>`.
+3. `<pause>` MUST NOT have content other than whitespace (Section 3.3) and SHOULD be written as a self-closing tag.
 4. `<segment>` MUST be a direct child of `<utterance>` (not nested inside `<prosody>` or `<emphasis>`).
 5. `<segment>` elements MUST NOT nest within other `<segment>` elements.
+6. `<emphasis>` MUST NOT be a direct child of another `<emphasis>`.
+
+Unknown elements (Section 6.2) do not count as parents: constraints 1, 2 and 4-6 apply as if their start and end tags were absent. Constraint 3 is the exception: an unknown element inside `<pause>` is content, which `<pause>` MUST NOT have.
 
 ---
 
@@ -397,15 +442,22 @@ A **consumer** is any system that reads and interprets IML (e.g., an LLM, a TTS 
 4. Consumers SHOULD use speaker-specific baselines when `speaker_id` is present.
 5. Consumers MUST NOT assume the presence of extended attributes (Section 4).
 
+An unknown element is one that this specification does not define, including any element in a namespace other than the IML namespace (Section 2.3). Ignoring an unknown element means processing its content as if its start and end tags were absent: text inside it remains part of the enclosing utterance, and IML elements inside it are processed in place. Text inside an unknown element that is not within any `<utterance>` (for example, a metadata element directly inside `<iml>`) is not IML content and is ignored; `<utterance>` elements inside such an element are processed as if they were children of `<iml>`.
+
 ### 6.3 Validation
 
 A valid IML document:
 
-1. Is well-formed XML.
+1. Is well-formed XML, encoded in UTF-8, with no document type declaration (Sections 2.2, 2.5).
 2. Contains at least one `<utterance>` element.
-3. Has valid attribute types (e.g., `confidence` is a float between 0.0 and 1.0).
-4. Follows the nesting rules defined in Section 5.
+3. Has valid attribute types (Section 2.6; e.g., `confidence` is a float between 0.0 and 1.0), including the enumerations and value formats of Sections 2.4, 3 and 4.
+4. Follows the content models and nesting rules defined in Section 5.
 5. Does not contain `emotion` without an accompanying `confidence` value.
+6. Has every REQUIRED attribute (`duration` on `<pause>`, `level` on `<emphasis>`).
+
+Unknown elements and attributes do not make a document invalid, except that a `<pause>` MUST NOT contain any element (Section 3.3). Validators SHOULD report violations of MUST-level requirements as errors, which make a document invalid, and SHOULD-level recommendations (such as the nesting depth in Section 5.2) as warnings, which do not.
+
+*Non-normative:* the reference validator (`prosody_protocol.IMLValidator`) implements these rules, and `schemas/iml-1.0.xsd` expresses the subset that XML Schema 1.0 can.
 
 ---
 
@@ -485,11 +537,18 @@ IML MUST NOT be used for:
 
 ### 8.3 Consent Model
 
+The `consent` and `processing` attributes on `<iml>` (Section 2.4) record how the annotations were obtained, so that downstream systems can apply the requirements of Section 8.1:
+
 ```xml
 <iml version="0.1.0" consent="explicit" processing="local">
   <!-- User has explicitly opted in; processing occurs on-device -->
+  <utterance emotion="calm" confidence="0.91">
+    Sure, go ahead and record this.
+  </utterance>
 </iml>
 ```
+
+Consumers that re-serialize an IML document MUST preserve `consent` and `processing`.
 
 ---
 
@@ -505,7 +564,7 @@ IML follows Semantic Versioning:
 
 ### 9.2 Extension Mechanism
 
-Custom attributes MAY be added using the `x-` prefix:
+Custom attributes MAY be added using the `x-` prefix, or as namespace-qualified attributes:
 
 ```xml
 <prosody x-formant-shift="+200Hz" x-nasality="0.7">
@@ -513,7 +572,7 @@ Custom attributes MAY be added using the `x-` prefix:
 </prosody>
 ```
 
-Consumers MUST ignore `x-` prefixed attributes they do not understand.
+Consumers MUST ignore `x-` prefixed attributes they do not understand. Producers SHOULD NOT emit other unprefixed attributes that this specification does not define; consumers ignore them like any unknown attribute (Section 6.2).
 
 ### 9.3 Stability Levels
 
@@ -540,19 +599,25 @@ The following features are under discussion for future versions:
 
 ## Appendix A: Complete Tag Reference
 
+This table is normative for content models (Section 5.1).
+
 | Tag | Status | Content | Self-closing | Parent |
 |-----|--------|---------|-------------|--------|
 | `<iml>` | Stable | `<utterance>` elements | No | Root |
-| `<utterance>` | Stable | Mixed (text + inline elements) | No | `<iml>` or root |
-| `<prosody>` | Stable | Mixed (text + inline elements) | No | `<utterance>`, `<emphasis>`, `<segment>` |
-| `<pause>` | Stable | Empty | Yes | `<utterance>`, `<prosody>`, `<segment>` |
-| `<emphasis>` | Stable | Mixed (text + `<prosody>`) | No | `<utterance>`, `<prosody>`, `<segment>` |
-| `<segment>` | Stable | Mixed (text + inline elements) | No | `<utterance>` |
+| `<utterance>` | Stable | Mixed (text + `<prosody>`, `<pause>`, `<emphasis>`, `<segment>`) | No | `<iml>` or root |
+| `<prosody>` | Stable | Mixed (text + `<prosody>`, `<emphasis>`, `<pause>`) | No | `<utterance>`, `<prosody>`, `<emphasis>`, `<segment>` |
+| `<pause>` | Stable | Empty | Yes | `<utterance>`, `<prosody>`, `<emphasis>`, `<segment>` |
+| `<emphasis>` | Stable | Mixed (text + `<prosody>`, `<pause>`) | No | `<utterance>`, `<prosody>`, `<segment>` |
+| `<segment>` | Stable | Mixed (text + `<prosody>`, `<emphasis>`, `<pause>`) | No | `<utterance>` |
 
 ## Appendix B: Attribute Quick Reference
 
 | Attribute | Tags | Type | Example Values |
 |-----------|------|------|----------------|
+| `version` | `<iml>` | SemVer | `0.1.0` |
+| `language` | `<iml>` | BCP-47 | `en-US` |
+| `consent` | `<iml>` | Enum | `explicit`, `implicit`, `none` |
+| `processing` | `<iml>` | Enum | `local`, `remote`, `hybrid` |
 | `emotion` | `<utterance>` | String | `sarcastic`, `frustrated`, `calm` |
 | `confidence` | `<utterance>` | Float 0.0-1.0 | `0.87` |
 | `speaker_id` | `<utterance>` | String | `user_001` |
@@ -561,7 +626,7 @@ The following features are under discussion for future versions:
 | `volume` | `<prosody>` | Relative dB | `+6dB`, `-3dB` |
 | `rate` | `<prosody>` | Enum/Pct | `fast`, `150%` |
 | `quality` | `<prosody>` | Enum | `breathy`, `tense`, `creaky` |
-| `duration` | `<pause>` | Integer ms | `800` |
+| `duration` | `<pause>` | Positive integer ms | `800` |
 | `level` | `<emphasis>` | Enum | `strong`, `moderate`, `reduced` |
 | `tempo` | `<segment>` | Enum | `rushed`, `steady`, `drawn-out` |
 | `rhythm` | `<segment>` | Enum | `staccato`, `legato`, `syncopated` |
@@ -637,7 +702,7 @@ This specification uses the key words MUST, MUST NOT, SHOULD, SHOULD NOT, MAY, R
 |----|-------------|---------|
 | M1 | IML documents MUST be encoded in UTF-8. | 2.2 |
 | M2 | `<utterance>` MUST be the top-level content element (or wrapped in `<iml>`). | 5.2 |
-| M3 | `<pause>` MUST be a self-closing empty element. | 5.2 |
+| M3 | `<pause>` MUST NOT contain elements or text other than whitespace. | 3.3, 5.2 |
 | M4 | `<segment>` MUST be a direct child of `<utterance>`. | 5.2 |
 | M5 | `<segment>` elements MUST NOT nest within other `<segment>` elements. | 5.2 |
 | M6 | Producers MUST generate well-formed XML. | 6.1 |
@@ -653,13 +718,23 @@ This specification uses the key words MUST, MUST NOT, SHOULD, SHOULD NOT, MAY, R
 | M16 | IML MUST NOT be used for covert emotional surveillance. | 8.2 |
 | M17 | IML MUST NOT be used for discriminatory profiling. | 8.2 |
 | M18 | Consumers MUST ignore `x-` prefixed attributes they do not understand. | 9.2 |
+| M19 | An encoding declaration, if present, MUST name UTF-8; consumers MUST NOT decode IML with another encoding. | 2.2 |
+| M20 | IML documents MUST NOT contain a document type declaration. | 2.5 |
+| M21 | Consumers MUST NOT resolve external entities or fetch external resources while parsing IML. | 2.5 |
+| M22 | Consumers MUST NOT treat the contents of comments or processing instructions as text. | 2.5 |
+| M23 | Attribute values MUST conform to their types and enumerations (Integers at most 2147483647, Floats finite). | 2.6, 3, 4 |
+| M24 | `<iml>` MUST contain only `<utterance>` elements (no text or other IML elements). | 2.4, 5.2 |
+| M25 | `<utterance>` and `<iml>` MUST NOT appear inside `<utterance>` or any inline element. | 3.1, 5.2 |
+| M26 | `<emphasis>` MUST NOT be a direct child of another `<emphasis>`. | 3.4, 5.2 |
+| M27 | Every element MUST contain only the content its content model allows. | 5.1, App. A |
+| M28 | Consumers that re-serialize an IML document MUST preserve `consent` and `processing`. | 8.3 |
 
 ### D.2 SHOULD / SHOULD NOT
 
 | ID | Requirement | Section |
 |----|-------------|---------|
 | S1 | The IML namespace `http://prosody-protocol.org/iml/0.1` SHOULD be used when embedding IML in other XML formats. | 2.3 |
-| S2 | Nesting depth of `<prosody>` inside `<emphasis>` (or vice versa) SHOULD NOT exceed 2 levels. | 5.2 |
+| S2 | The combined nesting depth of `<prosody>` and `<emphasis>` SHOULD NOT exceed 2 levels. | 5.2 |
 | S3 | Producers SHOULD omit attributes when values are at speaker baseline. | 6.1 |
 | S4 | Producers SHOULD use the core emotion vocabulary where applicable. | 6.1 |
 | S5 | Consumers SHOULD treat `confidence` values below 0.5 as low-confidence annotations. | 6.2 |
@@ -669,6 +744,11 @@ This specification uses the key words MUST, MUST NOT, SHOULD, SHOULD NOT, MAY, R
 | S9 | When a prosody profile is active, consumers SHOULD add the `confidence_boost` to the baseline confidence score (capped at 1.0). | 7.2 |
 | S10 | When a prosody profile is active, consumers SHOULD indicate profile usage in any downstream reporting. | 7.2 |
 | S11 | Systems handling IML data SHOULD support local/on-device processing where feasible. | 8.1 |
+| S12 | A document SHOULD use one form (namespaced or un-namespaced) for all of its IML elements. | 2.3 |
+| S13 | Producers SHOULD NOT emit unprefixed attributes that this specification does not define. | 9.2 |
+| S14 | Validators SHOULD report MUST violations as errors and SHOULD violations as warnings. | 6.3 |
+| S15 | Producers SHOULD write `<pause>` as a self-closing tag. | 3.3, 5.2 |
+| S16 | Producers SHOULD NOT put attributes in the IML namespace. | 2.3 |
 
 ### D.3 MAY / OPTIONAL
 
@@ -683,4 +763,8 @@ This specification uses the key words MUST, MUST NOT, SHOULD, SHOULD NOT, MAY, R
 | O7 | All `<prosody>` attributes are OPTIONAL. | 3.2 |
 | O8 | `<segment>` attributes (`tempo`, `rhythm`) are OPTIONAL. | 3.5 |
 | O9 | Extended attributes (Section 4) are OPTIONAL; producers are NOT required to include them. | 4 |
-| O10 | Custom attributes MAY be added using the `x-` prefix. | 9.2 |
+| O10 | Custom attributes MAY be added using the `x-` prefix or as namespace-qualified attributes. | 9.2 |
+| O11 | `consent` and `processing` on `<iml>` are OPTIONAL. | 2.4 |
+| O12 | A UTF-8 byte order mark MAY precede the document. | 2.2 |
+| O13 | Comments and processing instructions MAY appear anywhere XML allows them. | 2.5 |
+| O14 | Consumers MAY reject a document that contains a document type declaration. | 2.5 |

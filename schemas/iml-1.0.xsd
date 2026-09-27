@@ -1,13 +1,38 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   Intent Markup Language (IML) XML Schema Definition
-  Version: 1.0.0
+  Version: 1.0.0 (describes IML specification 0.1.0-alpha, spec.md)
   License: CC-BY-4.0
 
-  This schema enforces the structural and type constraints defined in spec.md.
-  Note: Certain semantic rules (e.g., "confidence REQUIRED when emotion present")
-  cannot be fully expressed in XSD 1.0 and are enforced via xs:assert (XSD 1.1)
-  or application-level validation.
+  This schema enforces the structural and type constraints defined in spec.md
+  for un-namespaced IML. For IML in the namespace
+  http://prosody-protocol.org/iml/0.1 (spec Section 2.3), include this file
+  from a schema whose targetNamespace is that namespace (a "chameleon"
+  include):
+
+    <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+               targetNamespace="http://prosody-protocol.org/iml/0.1"
+               elementFormDefault="qualified">
+      <xs:include schemaLocation="iml-1.0.xsd"/>
+    </xs:schema>
+
+  The reference validator (prosody_protocol.IMLValidator) is authoritative.
+  XSD 1.0 cannot express these rules, so this schema does not check them:
+    - confidence is REQUIRED when emotion is present (V3)
+    - prosody/emphasis nesting depth SHOULD NOT exceed 2 (V12, a warning)
+    - the document is UTF-8 and has no DOCTYPE (V30, V31; Sections 2.2, 2.5)
+    - unknown elements are transparent (Section 6.2). The schema accepts an
+      unknown element only when it is namespace-qualified (in a namespace
+      other than the one the IML elements use), and it rejects unqualified
+      unknown elements. Inside an utterance it does not look into an
+      unknown element at all. Directly inside <iml> it validates the
+      <utterance> elements an unknown element contains, but it still
+      requires at least one <utterance> directly inside <iml>, whereas the
+      validator (V2) also counts utterances wrapped in unknown elements.
+  Unknown attributes are accepted: x- extension attributes (Section 9.2) and
+  namespaced attributes are valid, and the validator only warns (V32) about
+  other attributes the specification does not define and about attributes
+  in the IML namespace.
 -->
 <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
            elementFormDefault="qualified">
@@ -16,18 +41,56 @@
   <!-- Simple Types                                                        -->
   <!-- ================================================================== -->
 
-  <!-- Confidence: float between 0.0 and 1.0 -->
-  <xs:simpleType name="confidenceType">
-    <xs:restriction base="xs:decimal">
-      <xs:minInclusive value="0.0"/>
-      <xs:maxInclusive value="1.0"/>
+  <!--
+    Float (spec Section 2.6): ASCII decimal digits with an optional sign,
+    decimal point and exponent. NaN and INF are not valid IML values; the
+    pattern rejects their spellings and the bounds (the largest finite
+    double) reject values such as 1e400 that overflow to infinity.
+  -->
+  <xs:simpleType name="floatType">
+    <xs:restriction base="xs:double">
+      <xs:pattern value="[+\-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+\-]?[0-9]+)?"/>
+      <xs:minInclusive value="-1.7976931348623157E308"/>
+      <xs:maxInclusive value="1.7976931348623157E308"/>
     </xs:restriction>
   </xs:simpleType>
 
-  <!-- Semantic version string (e.g., "1.0.0", "0.1.0-alpha") -->
+  <xs:simpleType name="nonNegativeFloatType">
+    <xs:restriction base="floatType">
+      <xs:minInclusive value="0"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Confidence: float between 0.0 and 1.0 -->
+  <xs:simpleType name="confidenceType">
+    <xs:restriction base="floatType">
+      <xs:minInclusive value="0"/>
+      <xs:maxInclusive value="1"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!--
+    Positive integer written with ASCII digits, at most 2^31 - 1 (spec
+    Section 2.6): pause duration and duration_ms.
+  -->
+  <xs:simpleType name="positiveIntegerType">
+    <xs:restriction base="xs:positiveInteger">
+      <xs:pattern value="\+?[0-9]+"/>
+      <xs:maxInclusive value="2147483647"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Whitespace-only text: the content allowed in <pause> (Section 3.3) -->
+  <xs:simpleType name="whitespaceType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[ \t\r\n]*"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Semantic Version (e.g., "0.1.0", "0.1.0-alpha", "1.0.0+build.5") -->
   <xs:simpleType name="semverType">
     <xs:restriction base="xs:string">
-      <xs:pattern value="\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?"/>
+      <xs:pattern value="[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z\-]+(\.[0-9A-Za-z\-]+)*)?(\+[0-9A-Za-z\-]+(\.[0-9A-Za-z\-]+)*)?"/>
     </xs:restriction>
   </xs:simpleType>
 
@@ -41,9 +104,9 @@
   <!-- Pitch: relative percentage (+15%, -10%), semitones (+3st, -2st), or absolute Hz (185Hz) -->
   <xs:simpleType name="pitchType">
     <xs:restriction base="xs:string">
-      <xs:pattern value="[+\-]\d+(\.\d+)?%"/>        <!-- relative percentage -->
-      <xs:pattern value="[+\-]\d+(\.\d+)?st"/>       <!-- semitones -->
-      <xs:pattern value="\d+(\.\d+)?Hz"/>             <!-- absolute Hz -->
+      <xs:pattern value="[+\-][0-9]+(\.[0-9]+)?%"/>   <!-- relative percentage -->
+      <xs:pattern value="[+\-][0-9]+(\.[0-9]+)?st"/>  <!-- semitones -->
+      <xs:pattern value="[0-9]+(\.[0-9]+)?Hz"/>       <!-- absolute Hz -->
     </xs:restriction>
   </xs:simpleType>
 
@@ -63,7 +126,7 @@
   <!-- Volume: relative dB (+6dB, -3dB) -->
   <xs:simpleType name="volumeType">
     <xs:restriction base="xs:string">
-      <xs:pattern value="[+\-]\d+(\.\d+)?dB"/>
+      <xs:pattern value="[+\-][0-9]+(\.[0-9]+)?dB"/>
     </xs:restriction>
   </xs:simpleType>
 
@@ -78,7 +141,7 @@
 
   <xs:simpleType name="ratePercentType">
     <xs:restriction base="xs:string">
-      <xs:pattern value="\d+(\.\d+)?%"/>
+      <xs:pattern value="[0-9]+(\.[0-9]+)?%"/>
     </xs:restriction>
   </xs:simpleType>
 
@@ -152,18 +215,18 @@
   <!-- F0 range: "low-high" (e.g., "120-240") -->
   <xs:simpleType name="f0RangeType">
     <xs:restriction base="xs:string">
-      <xs:pattern value="\d+(\.\d+)?-\d+(\.\d+)?"/>
+      <xs:pattern value="[0-9]+(\.[0-9]+)?-[0-9]+(\.[0-9]+)?"/>
     </xs:restriction>
   </xs:simpleType>
 
   <!-- F0 contour: comma-separated Hz values (e.g., "150,165,180,170,140") -->
   <xs:simpleType name="f0ContourType">
     <xs:restriction base="xs:string">
-      <xs:pattern value="\d+(\.\d+)?(,\d+(\.\d+)?)*"/>
+      <xs:pattern value="[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*"/>
     </xs:restriction>
   </xs:simpleType>
 
-  <!-- Consent model enumeration -->
+  <!-- Consent model enumeration (Section 2.4, 8.3) -->
   <xs:simpleType name="consentType">
     <xs:restriction base="xs:string">
       <xs:enumeration value="explicit"/>
@@ -172,7 +235,7 @@
     </xs:restriction>
   </xs:simpleType>
 
-  <!-- Processing location enumeration -->
+  <!-- Processing location enumeration (Section 2.4, 8.3) -->
   <xs:simpleType name="processingType">
     <xs:restriction base="xs:string">
       <xs:enumeration value="local"/>
@@ -183,35 +246,49 @@
 
   <!-- ================================================================== -->
   <!-- Complex Types                                                       -->
+  <!--                                                                    -->
+  <!-- Every element accepts any attribute the schema does not declare:   -->
+  <!-- x-* extension attributes (Section 9.2), namespaced attributes, and -->
+  <!-- other unknown attributes that consumers ignore (Section 6.2).      -->
+  <!-- Declared attributes are still type-checked. Mixed content accepts  -->
+  <!-- elements from other namespaces, which consumers ignore.            -->
   <!-- ================================================================== -->
 
   <!--
     pauseType: <pause> element.
-    MUST be self-closing (empty). duration is required, in whole milliseconds.
+    No content: no elements (not even unknown ones) and no text other than
+    whitespace; it SHOULD be written self-closing. duration is required, in
+    whole milliseconds.
     Spec reference: Section 3.3, 5.2 constraint 3.
   -->
   <xs:complexType name="pauseType">
-    <xs:attribute name="duration" type="xs:positiveInteger" use="required"/>
+    <xs:simpleContent>
+      <xs:extension base="whitespaceType">
+        <xs:attribute name="duration" type="positiveIntegerType" use="required"/>
+        <xs:anyAttribute namespace="##any" processContents="lax"/>
+      </xs:extension>
+    </xs:simpleContent>
   </xs:complexType>
 
   <!--
     emphasisType: <emphasis> element.
-    Mixed content: text + <prosody> children.
+    Mixed content: text + <prosody>, <pause> children (no <emphasis>).
     Nesting depth of prosody inside emphasis should not exceed 2 levels (advisory).
-    Spec reference: Section 3.4, 5.2 constraint 2.
+    Spec reference: Section 3.4, 5.2 constraints 2 and 6.
   -->
   <xs:complexType name="emphasisType" mixed="true">
     <xs:choice minOccurs="0" maxOccurs="unbounded">
       <xs:element name="prosody" type="prosodyType"/>
       <xs:element name="pause" type="pauseType"/>
+      <xs:any namespace="##other" processContents="skip"/>
     </xs:choice>
     <xs:attribute name="level" type="emphasisLevelType" use="required"/>
-    <xs:anyAttribute namespace="##other" processContents="lax"/>
+    <xs:anyAttribute namespace="##any" processContents="lax"/>
   </xs:complexType>
 
   <!--
     prosodyType: <prosody> element.
-    Mixed content: text + <emphasis>, <pause> children.
+    Mixed content: text + <prosody>, <emphasis>, <pause> children.
     All attributes optional (but at least one should be present by convention).
     Includes both core and extended attributes.
     Spec reference: Sections 3.2, 4.
@@ -221,6 +298,7 @@
       <xs:element name="emphasis" type="emphasisType"/>
       <xs:element name="pause" type="pauseType"/>
       <xs:element name="prosody" type="prosodyType"/>
+      <xs:any namespace="##other" processContents="skip"/>
     </xs:choice>
     <!-- Core attributes (Section 3.2) -->
     <xs:attribute name="pitch" type="pitchType"/>
@@ -229,21 +307,21 @@
     <xs:attribute name="rate" type="rateType"/>
     <xs:attribute name="quality" type="qualityType"/>
     <!-- Extended attributes: Fundamental Frequency (Section 4.1) -->
-    <xs:attribute name="f0_mean" type="xs:decimal"/>
+    <xs:attribute name="f0_mean" type="nonNegativeFloatType"/>
     <xs:attribute name="f0_range" type="f0RangeType"/>
     <xs:attribute name="f0_contour" type="f0ContourType"/>
     <!-- Extended attributes: Intensity (Section 4.2) -->
-    <xs:attribute name="intensity_mean" type="xs:decimal"/>
-    <xs:attribute name="intensity_range" type="xs:decimal"/>
+    <xs:attribute name="intensity_mean" type="floatType"/>
+    <xs:attribute name="intensity_range" type="nonNegativeFloatType"/>
     <!-- Extended attributes: Temporal (Section 4.3) -->
-    <xs:attribute name="speech_rate" type="xs:decimal"/>
-    <xs:attribute name="duration_ms" type="xs:positiveInteger"/>
+    <xs:attribute name="speech_rate" type="nonNegativeFloatType"/>
+    <xs:attribute name="duration_ms" type="positiveIntegerType"/>
     <!-- Extended attributes: Voice Quality Measures (Section 4.4) -->
-    <xs:attribute name="jitter" type="xs:decimal"/>
-    <xs:attribute name="shimmer" type="xs:decimal"/>
-    <xs:attribute name="hnr" type="xs:decimal"/>
+    <xs:attribute name="jitter" type="nonNegativeFloatType"/>
+    <xs:attribute name="shimmer" type="nonNegativeFloatType"/>
+    <xs:attribute name="hnr" type="floatType"/>
     <!-- Extension mechanism: x-* attributes (Section 9.2) -->
-    <xs:anyAttribute namespace="##other" processContents="lax"/>
+    <xs:anyAttribute namespace="##any" processContents="lax"/>
   </xs:complexType>
 
   <!--
@@ -252,22 +330,23 @@
     MUST be direct child of <utterance> only (enforced by parent content model).
     MUST NOT nest within other <segment> elements (no self-reference).
     Spec reference: Section 3.5, 5.2 constraints 4-5.
-    Status: Stable (promoted from experimental in v1.0).
+    Status: Stable (promoted from experimental in v0.1.0-alpha).
   -->
   <xs:complexType name="segmentType" mixed="true">
     <xs:choice minOccurs="0" maxOccurs="unbounded">
       <xs:element name="prosody" type="prosodyType"/>
       <xs:element name="emphasis" type="emphasisType"/>
       <xs:element name="pause" type="pauseType"/>
+      <xs:any namespace="##other" processContents="skip"/>
     </xs:choice>
     <xs:attribute name="tempo" type="tempoType"/>
     <xs:attribute name="rhythm" type="rhythmType"/>
-    <xs:anyAttribute namespace="##other" processContents="lax"/>
+    <xs:anyAttribute namespace="##any" processContents="lax"/>
   </xs:complexType>
 
   <!--
     utteranceType: <utterance> element.
-    Mixed content: text + all inline elements.
+    Mixed content: text + all inline elements (no nested <utterance>).
     Semantic constraint: confidence MUST be present when emotion is present.
     (This co-occurrence constraint cannot be fully enforced in XSD 1.0;
      use xs:assert in XSD 1.1 or application-level validation.)
@@ -279,27 +358,35 @@
       <xs:element name="emphasis" type="emphasisType"/>
       <xs:element name="pause" type="pauseType"/>
       <xs:element name="segment" type="segmentType"/>
+      <xs:any namespace="##other" processContents="skip"/>
     </xs:choice>
     <xs:attribute name="emotion" type="emotionType"/>
     <xs:attribute name="confidence" type="confidenceType"/>
     <xs:attribute name="speaker_id" type="xs:string"/>
-    <xs:anyAttribute namespace="##other" processContents="lax"/>
+    <xs:anyAttribute namespace="##any" processContents="lax"/>
   </xs:complexType>
 
   <!--
     imlType: <iml> root wrapper element.
-    Contains one or more <utterance> elements.
-    Spec reference: Section 2.4, 8.3.
+    Contains one or more <utterance> elements and no text. Elements from
+    other namespaces may appear between utterances; <utterance> elements
+    inside them are validated too.
+    Spec reference: Section 2.4, 5.2 constraint 1, 8.3.
   -->
   <xs:complexType name="imlType">
     <xs:sequence>
-      <xs:element name="utterance" type="utteranceType" maxOccurs="unbounded"/>
+      <xs:any namespace="##other" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+      <xs:element name="utterance" type="utteranceType"/>
+      <xs:choice minOccurs="0" maxOccurs="unbounded">
+        <xs:element name="utterance" type="utteranceType"/>
+        <xs:any namespace="##other" processContents="lax"/>
+      </xs:choice>
     </xs:sequence>
     <xs:attribute name="version" type="semverType"/>
     <xs:attribute name="language" type="bcp47Type"/>
     <xs:attribute name="consent" type="consentType"/>
     <xs:attribute name="processing" type="processingType"/>
-    <xs:anyAttribute namespace="##other" processContents="lax"/>
+    <xs:anyAttribute namespace="##any" processContents="lax"/>
   </xs:complexType>
 
   <!-- ================================================================== -->
