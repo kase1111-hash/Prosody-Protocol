@@ -14,9 +14,9 @@ Steps:
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
+from ._types import PauseInterval, SpanFeatures, WordAlignment
 from .emotion_classifier import EmotionClassifier, RuleBasedEmotionClassifier
 from .models import (
     ChildNode,
@@ -26,8 +26,6 @@ from .models import (
     Prosody,
     Utterance,
 )
-from .prosody_analyzer import PauseInterval, SpanFeatures, WordAlignment
-
 
 # ---------------------------------------------------------------------------
 # Configuration

@@ -11,6 +11,9 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("numpy")
+pytest.importorskip("parselmouth")
+
 from prosody_protocol.exceptions import AudioProcessingError
 from prosody_protocol.prosody_analyzer import (
     PauseInterval,

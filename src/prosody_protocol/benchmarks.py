@@ -12,19 +12,23 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError as exc:  # pragma: no cover - exercised only without numpy
+    raise ImportError(
+        "Benchmark requires numpy. Install with: pip install 'prosody-protocol[audio]'"
+    ) from exc
 
 logger = logging.getLogger(__name__)
 
 from .datasets import Dataset
-from .models import IMLDocument, Pause, Prosody, Utterance
+from .models import IMLDocument, Pause, Prosody
 from .parser import IMLParser
 from .validator import IMLValidator
-
 
 # ---------------------------------------------------------------------------
 # Converter protocol -- accepts AudioToIML or any compatible object
@@ -251,9 +255,7 @@ def _collect_pauses(children: tuple, pauses: list[int]) -> None:
     for child in children:
         if isinstance(child, Pause):
             pauses.append(child.duration)
-        elif isinstance(child, (Prosody,)):
-            _collect_pauses(child.children, pauses)
-        elif hasattr(child, "children"):
+        elif isinstance(child, (Prosody,)) or hasattr(child, "children"):
             _collect_pauses(child.children, pauses)
 
 

@@ -16,9 +16,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("fastapi")
+pytest.importorskip("httpx")
+pytest.importorskip("numpy")
+pytest.importorskip("parselmouth")
+
 from fastapi.testclient import TestClient
 
-from api.app import app
+from prosody_protocol.server.app import app
 
 AUDIO_FIXTURES = Path(__file__).parent / "fixtures" / "audio"
 
@@ -323,7 +329,7 @@ class TestErrorHandling:
 class TestUploadSizeLimit:
     def test_oversized_upload_rejected(self, client: TestClient) -> None:
         """Uploads exceeding max_upload_size_mb should return 413."""
-        from api.app import settings
+        from prosody_protocol.server.app import settings
 
         # Create a payload just over the limit
         over_limit = b"x" * (settings.max_upload_bytes + 1)

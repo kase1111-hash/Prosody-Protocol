@@ -1,65 +1,34 @@
 """ProsodyAnalyzer -- extract acoustic features from audio.
 
-Uses parselmouth (Praat) and librosa to measure F0, intensity,
+Uses parselmouth (Praat) and numpy to measure F0, intensity,
 speech rate, jitter, shimmer, HNR, and voice quality.
 Spec reference: Section 4 (extended attributes).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from pathlib import Path
 
-import numpy as np
-import parselmouth
-from parselmouth.praat import call
+try:
+    import numpy as np
+    import parselmouth
+    from parselmouth.praat import call
+except ImportError as exc:  # pragma: no cover - exercised only without the extra
+    raise ImportError(
+        "Audio analysis requires numpy and praat-parselmouth. "
+        "Install with: pip install 'prosody-protocol[audio]'"
+    ) from exc
 
+from ._types import PauseInterval, SpanFeatures, WordAlignment
 from .exceptions import AudioProcessingError
 
-
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class WordAlignment:
-    """A word with its time boundaries in the audio."""
-
-    word: str
-    start_ms: int
-    end_ms: int
-
-
-@dataclass(frozen=True)
-class SpanFeatures:
-    """Acoustic features measured over a span of audio."""
-
-    start_ms: int
-    end_ms: int
-    text: str
-    f0_mean: float | None = None
-    f0_range: tuple[float, float] | None = None
-    f0_contour: list[float] | None = None
-    intensity_mean: float | None = None
-    intensity_range: float | None = None
-    speech_rate: float | None = None
-    jitter: float | None = None
-    shimmer: float | None = None
-    hnr: float | None = None
-    quality: str | None = None
-
-
-@dataclass
-class PauseInterval:
-    """A detected silence gap between speech segments."""
-
-    start_ms: int
-    end_ms: int
-
-    @property
-    def duration_ms(self) -> int:
-        return self.end_ms - self.start_ms
+__all__ = [
+    "PauseInterval",
+    "ProsodyAnalyzer",
+    "SpanFeatures",
+    "WordAlignment",
+    "detect_pauses",
+]
 
 
 # ---------------------------------------------------------------------------

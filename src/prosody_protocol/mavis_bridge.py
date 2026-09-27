@@ -32,11 +32,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError as exc:  # pragma: no cover - exercised only without numpy
+    raise ImportError(
+        "MavisBridge requires numpy. Install with: pip install 'prosody-protocol[audio]'"
+    ) from exc
 
-from .datasets import Dataset, DatasetEntry, DatasetLoader
+from .datasets import Dataset, DatasetEntry
 from .exceptions import DatasetError
-
 
 # ---------------------------------------------------------------------------
 # Mavis data types (mirrors mavis.llm_processor.PhonemeEvent)

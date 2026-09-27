@@ -15,16 +15,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import numpy as np
 import pytest
 
+pytest.importorskip("numpy")
+
+import numpy as np
+
+from prosody_protocol import DatasetEntry, DatasetLoader, IMLParser, IMLValidator
 from prosody_protocol.mavis_bridge import (
     MAVIS_FEATURE_NAMES,
     MavisBridge,
     PhonemeEvent,
 )
-from prosody_protocol import DatasetEntry, DatasetLoader, IMLParser, IMLValidator
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -374,6 +376,7 @@ class TestSklearnIntegration:
         self, bridge: MavisBridge, sample_events: list[PhonemeEvent], quiet_events: list[PhonemeEvent]
     ) -> None:
         """Full pipeline: Mavis events → features → sklearn training."""
+        pytest.importorskip("sklearn")
         from sklearn.linear_model import LogisticRegression
         from sklearn.preprocessing import StandardScaler
 

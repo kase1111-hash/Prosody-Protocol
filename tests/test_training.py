@@ -11,11 +11,16 @@ from __future__ import annotations
 
 import json
 import sys
-import tempfile
 from pathlib import Path
 
-import numpy as np
 import pytest
+
+pytest.importorskip("numpy")
+pytest.importorskip("yaml")
+pytest.importorskip("sklearn")
+pytest.importorskip("joblib")
+
+import numpy as np
 import yaml
 
 # Ensure project root is importable
@@ -23,12 +28,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
-from training.config import TrainingConfig, load_config
+from training.config import load_config
 from training.metrics import ClassMetrics, EvaluationReport, compute_metrics
-from training.models import ModelRegistry, SERModel, TextProsodyModel, PitchContourModel
+from training.models import ModelRegistry, PitchContourModel, SERModel, TextProsodyModel
 from training.models.base import BaseModel
-from training.models.text_prosody import extract_text_features
 from training.models.pitch_contour import resample_f0
+from training.models.text_prosody import extract_text_features
 
 FIXTURES = Path(__file__).parent / "fixtures"
 CONFIGS_DIR = _PROJECT_ROOT / "training" / "configs"
@@ -61,8 +66,8 @@ class TestAcceptanceCriteria:
 
     def test_evaluation_produces_precision_recall_f1(self, tmp_path):
         """AC2: Evaluation script produces precision/recall/F1 per emotion class."""
-        from training.scripts.train import train
         from training.scripts.evaluate import evaluate
+        from training.scripts.train import train
 
         # Train first
         train(
@@ -95,8 +100,8 @@ class TestAcceptanceCriteria:
 
     def test_exported_model_loads_and_runs_inference(self, tmp_path):
         """AC3: Exported model loads and runs inference via the SDK classes."""
-        from training.scripts.train import train
         from training.scripts.export import export_model
+        from training.scripts.train import train
 
         # Train
         train(
@@ -447,8 +452,8 @@ class TestDataPrep:
     """Test data preparation scripts."""
 
     def test_prepare_ser_data(self, tmp_path):
-        from training.scripts.data_prep import prepare_ser_data
         from training.config import load_config
+        from training.scripts.data_prep import prepare_ser_data
 
         config = load_config(CONFIGS_DIR / "ser_wav2vec2.yaml")
         stats = prepare_ser_data(SYNTHETIC_DATASET, config.data, tmp_path)
@@ -464,8 +469,8 @@ class TestDataPrep:
         assert X.shape[1] == 7  # 7 features
 
     def test_prepare_text_prosody_data(self, tmp_path):
-        from training.scripts.data_prep import prepare_text_prosody_data
         from training.config import load_config
+        from training.scripts.data_prep import prepare_text_prosody_data
 
         config = load_config(CONFIGS_DIR / "text_to_prosody_bert.yaml")
         stats = prepare_text_prosody_data(SYNTHETIC_DATASET, config.data, tmp_path)
@@ -476,8 +481,8 @@ class TestDataPrep:
         assert X.shape[1] == 7  # text features
 
     def test_prepare_pitch_contour_data(self, tmp_path):
-        from training.scripts.data_prep import prepare_pitch_contour_data
         from training.config import load_config
+        from training.scripts.data_prep import prepare_pitch_contour_data
 
         config = load_config(CONFIGS_DIR / "pitch_contour_cnn.yaml")
         stats = prepare_pitch_contour_data(SYNTHETIC_DATASET, config.data, tmp_path)
@@ -497,9 +502,9 @@ class TestEndToEnd:
     """Test full training pipeline for each task."""
 
     def test_ser_pipeline(self, tmp_path):
-        from training.scripts.train import train
         from training.scripts.evaluate import evaluate
         from training.scripts.export import export_model
+        from training.scripts.train import train
 
         # Train
         results = train(

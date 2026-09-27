@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from prosody_protocol.models import Emphasis, Pause, Prosody
+from prosody_protocol.models import Emphasis
 from prosody_protocol.text_to_iml import TextToIML
 from prosody_protocol.validator import IMLValidator
 

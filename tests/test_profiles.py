@@ -23,7 +23,6 @@ from prosody_protocol.profiles import (
     ProsodyProfile,
 )
 
-
 PROFILES_DIR = Path(__file__).parent / "fixtures" / "profiles"
 
 

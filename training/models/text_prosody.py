@@ -11,8 +11,8 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from sklearn.tree import DecisionTreeClassifier
 from sklearn.preprocessing import LabelEncoder
+from sklearn.tree import DecisionTreeClassifier
 
 from .base import BaseModel, ModelRegistry
 

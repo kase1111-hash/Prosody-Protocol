@@ -26,8 +26,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
+from training.metrics import EvaluationReport, compute_metrics
 from training.models.base import BaseModel
-from training.metrics import compute_metrics, EvaluationReport
 
 
 def evaluate(
@@ -70,9 +70,10 @@ def evaluate(
     elif dataset_dir is not None:
         if config_path is None:
             raise ValueError("--config is required when using --dataset")
+        import tempfile
+
         from training.config import load_config
         from training.scripts.data_prep import _TASK_PREPARERS
-        import tempfile
 
         config = load_config(config_path)
         preparer = _TASK_PREPARERS.get(config.task)

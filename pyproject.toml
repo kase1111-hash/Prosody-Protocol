@@ -30,22 +30,28 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Prosody analysis from audio (AudioToIML, ProsodyAnalyzer) and waveform
+# utilities (IMLToAudio, Benchmark, MavisBridge). No deep-learning stack.
 audio = [
-    "librosa>=0.10",
-    "soundfile>=0.12",
-    "openai-whisper>=2023",
+    "numpy>=1.24",
     "praat-parselmouth>=0.4",
 ]
+# Built-in speech recognition for AudioToIML. Pulls in PyTorch; skip it if you
+# bring word timings from another STT service.
+whisper = [
+    "prosody-protocol[audio]",
+    "openai-whisper>=20231117",
+]
+# scikit-learn baselines for the training pipeline (source checkout only).
 ml = [
+    "prosody-protocol[audio]",
     "scikit-learn>=1.3",
+    "joblib>=1.2",
     "pyyaml>=6.0",
 ]
-ml-neural = [
-    "prosody-protocol[ml]",
-    "torch>=2.0",
-    "transformers>=4.30",
-]
+# REST API server (prosody-protocol serve).
 api = [
+    "prosody-protocol[audio]",
     "fastapi>=0.100",
     "uvicorn>=0.23",
     "python-multipart>=0.0.6",
@@ -56,9 +62,18 @@ dev = [
     "ruff>=0.1",
     "mypy>=1.5",
     "lxml-stubs",
+    "httpx>=0.24",
+    "jsonschema>=4.0",
 ]
-all = ["prosody-protocol[audio,ml,api,dev]"]
-all-neural = ["prosody-protocol[audio,ml-neural,api,dev]"]
+all = ["prosody-protocol[audio,whisper,ml,api]"]
+
+[project.scripts]
+prosody-protocol = "prosody_protocol.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/kase1111-hash/Prosody-Protocol"
+Repository = "https://github.com/kase1111-hash/Prosody-Protocol"
+Changelog = "https://github.com/kase1111-hash/Prosody-Protocol/blob/main/CHANGELOG.md"
 
 [tool.hatch.version]
 path = "src/prosody_protocol/_version.py"
@@ -74,6 +89,14 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+# Test modules call pytest.importorskip() before importing optional deps.
+"tests/*" = ["E402"]
+
 [tool.mypy]
 python_version = "3.10"
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["parselmouth", "parselmouth.*", "whisper", "whisper.*"]
+ignore_missing_imports = true

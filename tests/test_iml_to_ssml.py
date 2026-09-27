@@ -12,13 +12,12 @@ Covers:
 
 from __future__ import annotations
 
-from lxml import etree
 import pytest
+from lxml import etree
 
 from prosody_protocol.exceptions import ConversionError
 from prosody_protocol.iml_to_ssml import IMLToSSML
 from prosody_protocol.models import (
-    Emphasis,
     IMLDocument,
     Pause,
     Prosody,

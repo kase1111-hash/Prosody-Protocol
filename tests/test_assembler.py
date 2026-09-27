@@ -8,15 +8,14 @@ from __future__ import annotations
 
 import pytest
 
+from prosody_protocol import PauseInterval, SpanFeatures, WordAlignment
 from prosody_protocol.assembler import IMLAssembler
 from prosody_protocol.models import (
     Emphasis,
     IMLDocument,
     Pause,
     Prosody,
-    Utterance,
 )
-from prosody_protocol.prosody_analyzer import PauseInterval, SpanFeatures, WordAlignment
 from prosody_protocol.validator import IMLValidator
 
 

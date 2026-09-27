@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import pytest
 
+from prosody_protocol import SpanFeatures
 from prosody_protocol.emotion_classifier import RuleBasedEmotionClassifier
-from prosody_protocol.prosody_analyzer import SpanFeatures
 
 
 @pytest.fixture()

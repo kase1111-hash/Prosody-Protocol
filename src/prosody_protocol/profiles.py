@@ -20,7 +20,6 @@ from pathlib import Path
 from .exceptions import ProfileError
 from .validator import ValidationIssue, ValidationResult
 
-
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------

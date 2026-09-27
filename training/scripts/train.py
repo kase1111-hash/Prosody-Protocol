@@ -29,13 +29,13 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
-from training.config import load_config
-from training.models import ModelRegistry
+import training.models.pitch_contour  # noqa: F401
 
 # Ensure all model types are registered
 import training.models.ser  # noqa: F401
 import training.models.text_prosody  # noqa: F401
-import training.models.pitch_contour  # noqa: F401
+from training.config import load_config
+from training.models import ModelRegistry
 
 
 def load_prepared_data(data_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -60,6 +60,7 @@ def prepare_and_load(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Prepare data from a raw dataset directory and return arrays."""
     import tempfile
+
     from training.scripts.data_prep import _TASK_PREPARERS
 
     preparer = _TASK_PREPARERS.get(config_obj.task)

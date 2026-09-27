@@ -12,27 +12,26 @@ Uses parselmouth to verify acoustic properties of generated audio.
 from __future__ import annotations
 
 import io
-import struct
 import wave
 from pathlib import Path
+
+import pytest
+
+pytest.importorskip("numpy")
+pytest.importorskip("parselmouth")
 
 import numpy as np
 import parselmouth
 from parselmouth.praat import call
-import pytest
 
 from prosody_protocol.exceptions import ConversionError
 from prosody_protocol.iml_to_audio import (
-    BASE_FREQ,
     IMLToAudio,
     _parse_pitch,
     _parse_volume,
 )
 from prosody_protocol.models import (
-    Emphasis,
     IMLDocument,
-    Pause,
-    Prosody,
     Utterance,
 )
 

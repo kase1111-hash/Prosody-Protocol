@@ -1,9 +1,9 @@
 """Model implementations for prosody training tasks."""
 
 from .base import BaseModel, ModelRegistry
+from .pitch_contour import PitchContourModel
 from .ser import SERModel
 from .text_prosody import TextProsodyModel
-from .pitch_contour import PitchContourModel
 
 __all__ = [
     "BaseModel",

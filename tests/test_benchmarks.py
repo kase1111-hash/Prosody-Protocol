@@ -9,19 +9,20 @@ Covers acceptance criteria:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
+pytest.importorskip("numpy")
+
 from prosody_protocol import Benchmark, BenchmarkReport
 from prosody_protocol.benchmarks import (
-    compute_ece,
-    compute_f1_from_counts,
     _compute_pause_f1,
     _extract_pauses,
     _extract_pitch_contours,
     _per_class_f1,
+    compute_ece,
+    compute_f1_from_counts,
 )
 from prosody_protocol.datasets import Dataset, DatasetEntry, DatasetLoader
 from prosody_protocol.parser import IMLParser

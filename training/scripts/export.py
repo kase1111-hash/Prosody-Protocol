@@ -81,7 +81,7 @@ def main() -> None:
 
     meta = export_model(args.checkpoint, args.output, args.format)
 
-    print(f"Model exported successfully:")
+    print("Model exported successfully:")
     print(f"  Model class: {meta['model_class']}")
     print(f"  Export path: {meta['export_path']}")
     print(f"  Format: {meta['export_format']}")

@@ -11,7 +11,7 @@ class Settings:
     """Application settings, configurable via environment variables.
 
     Environment variables:
-        PP_HOST: Server bind address (default "0.0.0.0")
+        PP_HOST: Server bind address (default "127.0.0.1")
         PP_PORT: Server port (default 8000)
         PP_DEBUG: Enable debug mode ("1" or "true")
         PP_CORS_ORIGINS: Comma-separated allowed origins (default: none, reject cross-origin)
@@ -19,7 +19,7 @@ class Settings:
         PP_RATE_LIMIT: Requests per minute per client (default 60, 0 = unlimited)
     """
 
-    host: str = field(default_factory=lambda: os.getenv("PP_HOST", "0.0.0.0"))
+    host: str = field(default_factory=lambda: os.getenv("PP_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: int(os.getenv("PP_PORT", "8000")))
     debug: bool = field(
         default_factory=lambda: os.getenv("PP_DEBUG", "").lower() in ("1", "true")

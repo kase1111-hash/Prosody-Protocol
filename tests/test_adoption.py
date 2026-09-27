@@ -34,44 +34,21 @@ class TestAdoptionChecklist:
         assert IMLValidator is not None
 
     def test_all_public_classes_importable(self):
-        """All classes listed in __all__ should be importable."""
-        from prosody_protocol import (
-            AudioToIML,
-            Benchmark,
-            BenchmarkReport,
-            Dataset,
-            DatasetEntry,
-            DatasetLoader,
-            EmotionClassifier,
-            Emphasis,
-            IMLAssembler,
-            IMLDocument,
-            IMLParser,
-            IMLToAudio,
-            IMLToSSML,
-            IMLValidator,
-            Pause,
-            PauseInterval,
-            ProfileApplier,
-            ProfileLoader,
-            Prosody,
-            ProsodyAnalyzer,
-            ProsodyMapping,
-            ProsodyProfile,
-            RuleBasedEmotionClassifier,
-            Segment,
-            SpanFeatures,
-            TextToIML,
-            Utterance,
-            ValidationIssue,
-            ValidationResult,
-            WordAlignment,
-        )
+        """Every name in __all__ resolves when the optional deps are installed."""
+        pytest.importorskip("numpy")
+        pytest.importorskip("parselmouth")
+        import prosody_protocol
 
-        # Just verify they're all real classes/objects
-        assert IMLParser is not None
-        assert Benchmark is not None
-        assert DatasetLoader is not None
+        for name in prosody_protocol.__all__:
+            assert getattr(prosody_protocol, name) is not None, name
+
+    def test_core_import_needs_only_lxml(self):
+        """The base install exposes the lxml-only API without numpy/parselmouth."""
+        import prosody_protocol
+
+        core = [n for n in prosody_protocol.__all__ if n not in prosody_protocol._LAZY]
+        for name in core:
+            assert getattr(prosody_protocol, name) is not None, name
 
     def test_readme_parse_example(self):
         """AC3: README quick-start code (parse) runs without modification."""
@@ -114,6 +91,7 @@ class TestAdoptionChecklist:
 
     def test_integration_whisper_example(self):
         """AC4: Whisper integration example runs (SDK parts)."""
+        pytest.importorskip("parselmouth")
         from prosody_protocol import AudioToIML, IMLParser, IMLValidator
 
         # Verify the converter can be instantiated
@@ -171,9 +149,9 @@ class TestAdoptionChecklist:
 
         content = dockerfile.read_text()
         assert "FROM python:" in content
-        assert "uvicorn" in content
         assert "EXPOSE" in content
-        assert "api.app:app" in content
+        assert '".[api]"' in content
+        assert "prosody_protocol.server" in content
 
     def test_benchmark_docs_exist(self):
         """AC6: Benchmark results published in README or docs."""
@@ -276,7 +254,7 @@ class TestQuickstartSmoke:
 
     def test_text_to_iml_to_ssml_pipeline(self):
         """Full text -> IML -> SSML pipeline."""
-        from prosody_protocol import TextToIML, IMLToSSML, IMLValidator
+        from prosody_protocol import IMLToSSML, IMLValidator, TextToIML
 
         predictor = TextToIML()
         iml = predictor.predict("This is amazing!")
@@ -291,6 +269,7 @@ class TestQuickstartSmoke:
 
     def test_iml_to_audio_pipeline(self):
         """IML -> Audio synthesis pipeline."""
+        pytest.importorskip("numpy")
         from prosody_protocol import IMLToAudio
 
         synthesizer = IMLToAudio()

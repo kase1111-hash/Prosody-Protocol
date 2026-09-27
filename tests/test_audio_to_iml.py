@@ -14,9 +14,12 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("numpy")
+pytest.importorskip("parselmouth")
+
 from prosody_protocol.audio_to_iml import AudioToIML
 from prosody_protocol.exceptions import AudioProcessingError
-from prosody_protocol.models import IMLDocument, Pause, Prosody
+from prosody_protocol.models import IMLDocument, Pause
 from prosody_protocol.parser import IMLParser
 from prosody_protocol.validator import IMLValidator
 
