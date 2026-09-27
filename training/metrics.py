@@ -1,6 +1,12 @@
 """Evaluation metrics for training pipelines.
 
 Computes per-class and macro-averaged precision, recall, and F1 scores.
+
+The macro average covers the classes that occur in the evaluated split --
+in its true labels or its predictions -- as scikit-learn's does when it is
+given no label list. Classes that are only listed (say, config labels
+absent from a small test split) still get a row in the report, marked as
+not evaluated, but do not pull the average down.
 """
 
 from __future__ import annotations
@@ -19,6 +25,11 @@ class ClassMetrics:
     recall: float
     f1: float
     support: int
+    #: False when the class occurs in neither the true labels nor the
+    #: predictions: its scores are then undefined (reported as 0.0 here,
+    #: ``None`` by :meth:`EvaluationReport.to_dict`, ``n/a`` in the table)
+    #: and it is not part of the macro average.
+    evaluated: bool = True
 
 
 @dataclass
@@ -38,9 +49,9 @@ class EvaluationReport:
             "per_class": [
                 {
                     "label": m.label,
-                    "precision": round(m.precision, 4),
-                    "recall": round(m.recall, 4),
-                    "f1": round(m.f1, 4),
+                    "precision": round(m.precision, 4) if m.evaluated else None,
+                    "recall": round(m.recall, 4) if m.evaluated else None,
+                    "f1": round(m.f1, 4) if m.evaluated else None,
                     "support": m.support,
                 }
                 for m in self.per_class
@@ -61,10 +72,11 @@ class EvaluationReport:
         lines.append(header)
         lines.append("-" * len(header))
         for m in self.per_class:
-            lines.append(
-                f"{m.label:<20} {m.precision:>10.4f} {m.recall:>10.4f} "
-                f"{m.f1:>10.4f} {m.support:>8d}"
-            )
+            if m.evaluated:
+                scores = f"{m.precision:>10.4f} {m.recall:>10.4f} {m.f1:>10.4f}"
+            else:
+                scores = f"{'n/a':>10} {'n/a':>10} {'n/a':>10}"
+            lines.append(f"{m.label:<20} {scores} {m.support:>8d}")
         lines.append("-" * len(header))
         lines.append(
             f"{'macro avg':<20} {self.macro_precision:>10.4f} "
@@ -90,36 +102,45 @@ def compute_metrics(
     y_pred:
         Predicted labels.
     labels:
-        Optional explicit label order. If None, derived from data.
+        Optional explicit label order for the per-class rows. If None,
+        derived from data. Labels that occur in the data but not in this
+        list are appended, so no sample is left out of the report.
 
     Returns
     -------
     EvaluationReport
-        Complete evaluation report.
+        Complete evaluation report. Its macro averages cover the labels
+        that occur in *y_true* or *y_pred*.
     """
-    if labels is None:
-        labels = sorted(set(y_true) | set(y_pred))
+    present = set(y_true) | set(y_pred)
+    listed = [] if labels is None else list(labels)
+    labels = listed + sorted(present - set(listed))
 
-    precision, recall, f1, support = precision_recall_fscore_support(
-        y_true, y_pred, labels=labels, zero_division=0.0,
-    )
-
-    per_class = [
-        ClassMetrics(
-            label=label,
-            precision=float(p),
-            recall=float(r),
-            f1=float(f),
-            support=int(s),
+    per_class: list[ClassMetrics] = []
+    if labels:
+        precision, recall, f1, support = precision_recall_fscore_support(
+            y_true, y_pred, labels=labels, zero_division=0.0,
         )
-        for label, p, r, f, s in zip(labels, precision, recall, f1, support)
-    ]
+        per_class = [
+            ClassMetrics(
+                label=label,
+                precision=float(p),
+                recall=float(r),
+                f1=float(f),
+                support=int(s),
+                evaluated=label in present,
+            )
+            for label, p, r, f, s in zip(labels, precision, recall, f1, support, strict=True)
+        ]
 
-    macro_p, macro_r, macro_f, _ = precision_recall_fscore_support(
-        y_true, y_pred, labels=labels, average="macro", zero_division=0.0,
-    )
+    macro_p = macro_r = macro_f = 0.0
+    evaluated = [label for label in labels if label in present]
+    if evaluated:
+        macro_p, macro_r, macro_f, _ = precision_recall_fscore_support(
+            y_true, y_pred, labels=evaluated, average="macro", zero_division=0.0,
+        )
 
-    correct = sum(1 for t, p in zip(y_true, y_pred) if t == p)
+    correct = sum(1 for t, p in zip(y_true, y_pred, strict=True) if t == p)
     accuracy = correct / len(y_true) if y_true else 0.0
 
     return EvaluationReport(
