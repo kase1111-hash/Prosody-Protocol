@@ -95,7 +95,7 @@ class TestAdoptionChecklist:
         from prosody_protocol import AudioToIML, IMLParser, IMLValidator
 
         # Verify the converter can be instantiated
-        converter = AudioToIML()
+        assert isinstance(AudioToIML(), AudioToIML)
         parser = IMLParser()
         validator = IMLValidator()
 

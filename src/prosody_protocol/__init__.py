@@ -8,7 +8,8 @@ The core (parsing, validation, SSML conversion, text prediction, profiles,
 datasets) needs only ``lxml``. Classes that need optional dependencies are
 loaded lazily on first access, so ``import prosody_protocol`` always works:
 
-- ``AudioToIML``, ``ProsodyAnalyzer``: ``pip install 'prosody-protocol[audio]'``
+- ``AudioToIML``, ``ConversionResult``, ``ProsodyAnalyzer``:
+  ``pip install 'prosody-protocol[audio]'``
 - ``IMLToAudio``, ``Benchmark``, ``BenchmarkReport``, ``MavisBridge``,
   ``PhonemeEvent``: ``numpy`` (included in the ``audio`` extra)
 """
@@ -20,9 +21,15 @@ from typing import TYPE_CHECKING, Any
 
 from ._types import PauseInterval, SpanFeatures, WordAlignment
 from ._version import __version__
+from .alignment import load_word_timings, parse_word_timings
 from .assembler import IMLAssembler
 from .datasets import Dataset, DatasetEntry, DatasetLoader
-from .emotion_classifier import EmotionClassifier, RuleBasedEmotionClassifier
+from .emotion_classifier import (
+    BaselineAwareEmotionClassifier,
+    EmotionClassifier,
+    RuleBasedEmotionClassifier,
+    SpeakerBaseline,
+)
 from .exceptions import (
     AudioProcessingError,
     ConversionError,
@@ -34,6 +41,7 @@ from .exceptions import (
     TrainingError,
 )
 from .iml_to_ssml import IMLToSSML
+from .llm import build_messages, to_llm_context
 from .models import (
     Emphasis,
     IMLDocument,
@@ -43,12 +51,18 @@ from .models import (
     Utterance,
 )
 from .parser import IMLParser
-from .profiles import ProfileApplier, ProfileLoader, ProsodyMapping, ProsodyProfile
+from .profiles import (
+    ProfileApplier,
+    ProfileLoader,
+    ProsodyMapping,
+    ProsodyProfile,
+    categorize_features,
+)
 from .text_to_iml import TextToIML
 from .validator import IMLValidator, ValidationIssue, ValidationResult
 
 if TYPE_CHECKING:
-    from .audio_to_iml import AudioToIML
+    from .audio_to_iml import AudioToIML, ConversionResult
     from .benchmarks import Benchmark, BenchmarkReport
     from .iml_to_audio import IMLToAudio
     from .mavis_bridge import MavisBridge, PhonemeEvent
@@ -58,6 +72,7 @@ if TYPE_CHECKING:
 # They are imported on first attribute access (PEP 562).
 _LAZY: dict[str, str] = {
     "AudioToIML": ".audio_to_iml",
+    "ConversionResult": ".audio_to_iml",
     "ProsodyAnalyzer": ".prosody_analyzer",
     "IMLToAudio": ".iml_to_audio",
     "Benchmark": ".benchmarks",
@@ -97,6 +112,7 @@ __all__ = [
     "Segment",
     # Conversion
     "AudioToIML",
+    "ConversionResult",
     "IMLToAudio",
     "IMLToSSML",
     "TextToIML",
@@ -106,14 +122,23 @@ __all__ = [
     "SpanFeatures",
     "WordAlignment",
     "PauseInterval",
+    # Word timings from external speech-to-text services
+    "load_word_timings",
+    "parse_word_timings",
+    # LLM hand-off
+    "to_llm_context",
+    "build_messages",
     # Emotion
     "EmotionClassifier",
+    "BaselineAwareEmotionClassifier",
     "RuleBasedEmotionClassifier",
+    "SpeakerBaseline",
     # Profiles
     "ProfileLoader",
     "ProfileApplier",
     "ProsodyProfile",
     "ProsodyMapping",
+    "categorize_features",
     # Benchmarks
     "Benchmark",
     "BenchmarkReport",
