@@ -1,6 +1,6 @@
 """Prosody Protocol REST API server (FastAPI).
 
-Requires the ``api`` extra: ``pip install 'prosody-protocol[api]'``.
+Requires the ``api`` extra (see README "Install").
 
 Run it with ``python -m prosody_protocol.server``, or with any ASGI server:
 the application object is ``prosody_protocol.server.app:app``, and
@@ -10,6 +10,8 @@ synthesis run in worker processes (see :mod:`prosody_protocol.server.jobs`).
 """
 
 from __future__ import annotations
+
+from .._install import install_hint
 
 
 def run(host: str | None = None, port: int | None = None) -> None:
@@ -24,8 +26,7 @@ def run(host: str | None = None, port: int | None = None) -> None:
         import uvicorn
     except ImportError as exc:
         raise ImportError(
-            "The REST API requires the api extra. "
-            "Install with: pip install 'prosody-protocol[api]'"
+            "The REST API requires the api extra. Install with: " + install_hint("api")
         ) from exc
 
     from .config import MAX_PORT, Settings

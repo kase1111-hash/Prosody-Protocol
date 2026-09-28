@@ -50,6 +50,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
+from ._install import install_hint
 from ._version import __version__
 from .exceptions import ProsodyProtocolError
 
@@ -186,7 +187,7 @@ def _require(module: str, command: str, extra: str) -> ModuleType:
         missing = f" ({name} is not installed)" if name and name != module else ""
         raise CLIError(
             f"{command} needs the '{extra}' extra{missing}: "
-            f"pip install 'prosody-protocol[{extra}]'",
+            f"{install_hint(extra)}",
             EXIT_USAGE,
         ) from None
 
@@ -458,7 +459,7 @@ def _require_whisper(command: str, alternatives: str) -> None:
     if not _installed("whisper"):
         raise CLIError(
             f"{command} --stt whisper needs the 'whisper' extra (openai-whisper is not "
-            f"installed): pip install 'prosody-protocol[whisper]'{alternatives}",
+            f"installed): {install_hint('whisper')}{alternatives}",
             EXIT_USAGE,
         )
 
@@ -708,7 +709,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     if missing:
         raise CLIError(
             f"serve needs the 'api' extra ({', '.join(missing)} not installed): "
-            "pip install 'prosody-protocol[api]'",
+            f"{install_hint('api')}",
             EXIT_USAGE,
         )
     server = _require("prosody_protocol.server", "serve", "api")
@@ -742,21 +743,21 @@ def _capabilities() -> list[tuple[bool, str, str, str]]:
             _installed("lxml"),
             f"core (lxml{_version('lxml')})",
             "validate, to-text, to-ssml, to-prompt, from-text",
-            "pip install prosody-protocol",
+            install_hint(),
         ),
         (
             audio,
             f"audio analysis (numpy{_version('numpy')}, "
             f"praat-parselmouth{_version('praat-parselmouth')})",
             "from-audio, benchmark, synthesize",
-            "pip install 'prosody-protocol[audio]'",
+            install_hint("audio"),
         ),
         (
             _installed("whisper"),
             f"speech recognition (openai-whisper{_version('openai-whisper')})",
             "from-audio transcribes audio given without --words or --transcript "
             "(otherwise each stretch of speech is a [speech] placeholder)",
-            "pip install 'prosody-protocol[whisper]' (pulls in PyTorch)",
+            f"{install_hint('whisper')} (pulls in PyTorch)",
         ),
         (
             espeak is not None,
@@ -776,13 +777,13 @@ def _capabilities() -> list[tuple[bool, str, str, str]]:
             f"REST API (fastapi{_version('fastapi')}, uvicorn{_version('uvicorn')}, "
             f"python-multipart{_version('python-multipart')})",
             "serve",
-            "pip install 'prosody-protocol[api]'",
+            install_hint("api"),
         ),
         (
             _installed("sklearn"),
             f"training baselines (scikit-learn{_version('scikit-learn')})",
             "the training/ scripts of a source checkout",
-            "pip install 'prosody-protocol[ml]'",
+            install_hint("ml"),
         ),
     ]
 

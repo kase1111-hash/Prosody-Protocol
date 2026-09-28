@@ -54,11 +54,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from ._install import install_hint
+
 try:
     import numpy as np
 except ImportError as exc:  # pragma: no cover - exercised only without numpy
     raise ImportError(
-        "IMLToAudio requires numpy. Install with: pip install 'prosody-protocol[audio]'"
+        "IMLToAudio requires numpy. Install with: " + install_hint("audio")
     ) from exc
 
 from .exceptions import ConversionError, IMLParseError

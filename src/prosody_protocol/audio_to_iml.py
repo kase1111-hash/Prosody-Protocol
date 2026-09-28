@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from ._install import install_hint
 from ._types import PauseInterval, SpanFeatures, WordAlignment
 from .assembler import (
     DEFAULT_MIN_EMOTION_CONFIDENCE,
@@ -547,8 +548,7 @@ class AudioToIML:
             if self.stt == "whisper":
                 raise AudioProcessingError(
                     "openai-whisper is required for stt='whisper'. Install with: "
-                    "pip install 'prosody-protocol[whisper]', or pass words= or "
-                    "transcript= instead."
+                    f"{install_hint('whisper')}, or pass words= or transcript= instead."
                 ) from exc
             return None
         return whisper

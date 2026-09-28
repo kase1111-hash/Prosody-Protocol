@@ -40,11 +40,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ._install import install_hint
+
 try:
     import numpy as np
 except ImportError as exc:  # pragma: no cover - exercised only without numpy
     raise ImportError(
-        "MavisBridge requires numpy. Install with: pip install 'prosody-protocol[audio]'"
+        "MavisBridge requires numpy. Install with: " + install_hint("audio")
     ) from exc
 
 from .datasets import (

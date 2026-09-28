@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 
 from prosody_protocol import __version__, cli
+from prosody_protocol._install import install_hint
 from prosody_protocol.cli import main
 from prosody_protocol.llm import build_messages, to_llm_context
 from prosody_protocol.parser import IMLParser
@@ -560,7 +561,7 @@ class TestFromAudio:
         assert (code, out) == (2, "")
         assert err == (
             "error: from-audio --stt whisper needs the 'whisper' extra (openai-whisper is not "
-            "installed): pip install 'prosody-protocol[whisper]', or give the words with "
+            f"installed): {install_hint('whisper')}, or give the words with "
             "--words or --transcript\n"
         )
         # With the words given, Whisper is not needed.
@@ -666,7 +667,7 @@ class TestMissingExtras:
         monkeypatch.setitem(sys.modules, module, None)  # makes the import fail
         code, out, err = run(capsys, *argv)
         assert (code, out) == (2, "")
-        assert err.endswith(f"pip install 'prosody-protocol[{extra}]'\n")
+        assert err.endswith(f"{install_hint(extra)}\n")
         assert err.count("\n") == 1
 
     def test_serve_without_the_api_extra(
@@ -677,7 +678,7 @@ class TestMissingExtras:
         assert code == 2
         assert err == (
             "error: serve needs the 'api' extra (uvicorn not installed): "
-            "pip install 'prosody-protocol[api]'\n"
+            f"{install_hint('api')}\n"
         )
 
 
@@ -854,7 +855,7 @@ class TestBenchmark:
         assert code == 2
         assert err == (
             "error: benchmark --stt whisper needs the 'whisper' extra (openai-whisper is not "
-            "installed): pip install 'prosody-protocol[whisper]'\n"
+            f"installed): {install_hint('whisper')}\n"
         )
 
 
@@ -948,8 +949,8 @@ class TestServeAndDoctor:
         assert code == 0
         assert out.count("[missing]") == 6
         assert "install: install espeak-ng with your package manager" in out
-        assert "install: pip install 'prosody-protocol[whisper]'" in out
-        assert "install: pip install 'prosody-protocol[api]'" in out
+        assert f"install: {install_hint('whisper')}" in out
+        assert f"install: {install_hint('api')}" in out
 
 
 # ---------------------------------------------------------------------------

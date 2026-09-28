@@ -9,7 +9,7 @@ datasets) needs only ``lxml``. Classes that need optional dependencies are
 loaded lazily on first access, so ``import prosody_protocol`` always works:
 
 - ``AudioToIML``, ``ConversionResult``, ``ProsodyAnalyzer``:
-  ``pip install 'prosody-protocol[audio]'``
+  the ``audio`` extra
 - ``IMLToAudio``, ``Benchmark``, ``BenchmarkReport``, ``MavisBridge``,
   ``PhonemeEvent``: ``numpy`` (included in the ``audio`` extra)
 """
@@ -17,6 +17,7 @@ loaded lazily on first access, so ``import prosody_protocol`` always works:
 from __future__ import annotations
 
 import importlib
+import importlib.util
 from typing import TYPE_CHECKING, Any
 
 from ._types import PauseInterval, SpanFeatures, WordAlignment
@@ -62,11 +63,14 @@ from .text_to_iml import TextToIML
 from .validator import IMLValidator, ValidationIssue, ValidationResult
 
 if TYPE_CHECKING:
-    from .audio_to_iml import AudioToIML, ConversionResult
-    from .benchmarks import Benchmark, BenchmarkReport
-    from .iml_to_audio import IMLToAudio
-    from .mavis_bridge import MavisBridge, PhonemeEvent
-    from .prosody_analyzer import ProsodyAnalyzer
+    from .audio_to_iml import AudioToIML as AudioToIML
+    from .audio_to_iml import ConversionResult as ConversionResult
+    from .benchmarks import Benchmark as Benchmark
+    from .benchmarks import BenchmarkReport as BenchmarkReport
+    from .iml_to_audio import IMLToAudio as IMLToAudio
+    from .mavis_bridge import MavisBridge as MavisBridge
+    from .mavis_bridge import PhonemeEvent as PhonemeEvent
+    from .prosody_analyzer import ProsodyAnalyzer as ProsodyAnalyzer
 
 # Names whose modules need optional third-party packages (numpy, parselmouth).
 # They are imported on first attribute access (PEP 562).
@@ -111,14 +115,10 @@ __all__ = [
     "Emphasis",
     "Segment",
     # Conversion
-    "AudioToIML",
-    "ConversionResult",
-    "IMLToAudio",
     "IMLToSSML",
     "TextToIML",
     "IMLAssembler",
     # Analysis
-    "ProsodyAnalyzer",
     "SpanFeatures",
     "WordAlignment",
     "PauseInterval",
@@ -140,16 +140,10 @@ __all__ = [
     "ProsodyMapping",
     "ProfileMatch",
     "categorize_features",
-    # Benchmarks
-    "Benchmark",
-    "BenchmarkReport",
     # Datasets
     "DatasetLoader",
     "DatasetEntry",
     "Dataset",
-    # Mavis Bridge
-    "MavisBridge",
-    "PhonemeEvent",
     # Exceptions
     "ProsodyProtocolError",
     "IMLParseError",
@@ -159,4 +153,28 @@ __all__ = [
     "ConversionError",
     "DatasetError",
     "TrainingError",
+]
+
+# The lazily loaded names join __all__ only when their dependencies are
+# installed, so ``from prosody_protocol import *`` works on the lxml-only core.
+_LAZY_REQUIRES: dict[str, tuple[str, ...]] = {
+    ".audio_to_iml": ("numpy", "parselmouth"),
+    ".prosody_analyzer": ("numpy", "parselmouth"),
+    ".iml_to_audio": ("numpy",),
+    ".benchmarks": ("numpy",),
+    ".mavis_bridge": ("numpy",),
+}
+
+
+def _installed(module: str) -> bool:
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+__all__ += [
+    name
+    for name, module in _LAZY.items()
+    if all(_installed(dep) for dep in _LAZY_REQUIRES[module])
 ]

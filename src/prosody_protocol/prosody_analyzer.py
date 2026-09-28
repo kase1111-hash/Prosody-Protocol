@@ -40,6 +40,8 @@ from functools import cached_property
 from pathlib import Path
 from typing import TypeVar
 
+from ._install import install_hint
+
 try:
     import numpy as np
     import numpy.typing as npt
@@ -48,7 +50,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
         "Audio analysis requires numpy and praat-parselmouth. "
-        "Install with: pip install 'prosody-protocol[audio]'"
+        "Install with: " + install_hint("audio")
     ) from exc
 
 from ._types import PauseInterval, SpanFeatures, WordAlignment

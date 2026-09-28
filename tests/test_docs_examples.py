@@ -109,7 +109,7 @@ def _skip_if_optional_missing(exc: BaseException) -> None:
     if isinstance(exc, ImportError):
         name = (getattr(exc, "name", None) or "").split(".")[0]
         text = str(exc)
-        if name in OPTIONAL_MODULES or "pip install 'prosody-protocol[" in text:
+        if name in OPTIONAL_MODULES or "prosody-protocol[" in text:
             pytest.skip(f"optional dependency missing: {exc}")
 
 

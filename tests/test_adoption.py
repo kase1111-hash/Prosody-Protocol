@@ -213,6 +213,9 @@ class TestCoreOnlyInstall:
         assert pp.IMLToSSML().convert(iml).startswith("<speak")
         assert "<utterance" in pp.TextToIML().predict("Oh, that's GREAT.")
         assert main(["doctor"]) == 0
+        star = {}
+        exec("from prosody_protocol import *", star)
+        assert "IMLParser" in star and "AudioToIML" not in star
         for name in sorted(pp._LAZY):
             try:
                 getattr(pp, name)
@@ -236,6 +239,12 @@ class TestCoreOnlyInstall:
         )
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout.strip().endswith("core ok")
+
+    def test_star_import_works_on_any_install(self) -> None:
+        """``from prosody_protocol import *`` never needs an optional extra."""
+        namespace: dict[str, object] = {}
+        exec("from prosody_protocol import *", namespace)
+        assert "IMLParser" in namespace and "to_llm_context" in namespace
 
     def test_every_public_name_resolves(self) -> None:
         """With the optional packages present, every exported name imports."""

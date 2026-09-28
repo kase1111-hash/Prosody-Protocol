@@ -12,10 +12,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # mypy checks against the oldest supported Python (pyproject
+      # python_version = "3.10"); on 3.12 the resolver picks numpy releases
+      # whose stubs use 3.12-only syntax that a 3.10 target cannot parse.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.10"
 
       - name: Install dependencies
         run: |
