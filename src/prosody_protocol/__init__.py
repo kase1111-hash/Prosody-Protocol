@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 from ._types import PauseInterval, SpanFeatures, WordAlignment
 from ._version import __version__
 from .alignment import load_word_timings, parse_word_timings
-from .assembler import IMLAssembler
+from .assembler import IMLAssembler, ProfileMatch
 from .datasets import Dataset, DatasetEntry, DatasetLoader
 from .emotion_classifier import (
     BaselineAwareEmotionClassifier,
@@ -138,6 +138,7 @@ __all__ = [
     "ProfileApplier",
     "ProsodyProfile",
     "ProsodyMapping",
+    "ProfileMatch",
     "categorize_features",
     # Benchmarks
     "Benchmark",

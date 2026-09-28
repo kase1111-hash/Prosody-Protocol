@@ -4,7 +4,7 @@ Covers:
 - Acceptance criteria from the execution guide
 - ProfileLoader: load from file, load from dict, error handling
 - ProfileLoader.validate: version, user_id, mappings, pattern keys/values
-- ProfileApplier: pattern matching, specificity, confidence capping
+- ProfileApplier: pattern matching (match), specificity, confidence capping
 - categorize_features: measured features to pattern vocabulary
 - Data model frozen semantics
 - Edge cases: empty features, no match, multiple matches
@@ -12,6 +12,8 @@ Covers:
 
 from __future__ import annotations
 
+import ast
+import inspect
 import math
 import shutil
 import statistics
@@ -193,6 +195,38 @@ class TestProfileLoaderFile:
         with pytest.raises(ProfileError, match="user_id"):
             loader.load(PROFILES_DIR / "invalid_missing_user.json")
 
+    @pytest.mark.parametrize(
+        "text",
+        ["[" * 50_000, '{"a": ' * 50_000, "1" * 5_000],
+        ids=["deep array", "deep object", "integer too long to convert"],
+    )
+    def test_json_python_cannot_parse_raises_profile_error(
+        self, loader: ProfileLoader, tmp_path: Path, text: str
+    ) -> None:
+        """RecursionError and the int-conversion ValueError used to escape."""
+        path = tmp_path / "hostile.json"
+        path.write_text(text, encoding="utf-8")
+        with pytest.raises(ProfileError, match="Invalid JSON in profile file"):
+            loader.load(path)
+
+    def test_non_utf8_file_raises_profile_error(
+        self, loader: ProfileLoader, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "latin1.json"
+        path.write_bytes('{"user_id": "Jos\u00e9"}'.encode("latin-1"))
+        with pytest.raises(ProfileError, match="not UTF-8"):
+            loader.load(path)
+
+    def test_path_with_nul_raises_profile_error(self, loader: ProfileLoader) -> None:
+        """Path.read_text raises a bare ValueError for an embedded NUL."""
+        with pytest.raises(ProfileError, match="Cannot read profile file"):
+            loader.load("profile\x00.json")
+
+    def test_byte_order_mark_is_allowed(self, loader: ProfileLoader, tmp_path: Path) -> None:
+        path = tmp_path / "bom.json"
+        path.write_bytes(b"\xef\xbb\xbf" + (PROFILES_DIR / "minimal_valid.json").read_bytes())
+        assert loader.load(path).user_id == "user_001"
+
 
 # ---------------------------------------------------------------------------
 # ProfileLoader.load_json (dict)
@@ -327,6 +361,34 @@ class TestProfileLoaderJSON:
         spec_profile_json["metadata"] = "clinic"
         with pytest.raises(ProfileError, match="'metadata' must be an object"):
             loader.load_json(spec_profile_json)
+
+    @pytest.mark.parametrize("digits", [400, 5_000])
+    def test_integer_too_large_for_a_float_rejected(
+        self, loader: ProfileLoader, digits: int
+    ) -> None:
+        """OverflowError used to escape (and a 5000-digit int cannot even be printed)."""
+        with pytest.raises(ProfileError, match="confidence_boost must be a finite number"):
+            loader.load_json({
+                "profile_version": "1.0.0",
+                "user_id": "u1",
+                "prosody_mappings": [{
+                    "pattern": {"pitch": "high"},
+                    "interpretation": {"emotion": "excited", "confidence_boost": 10**digits},
+                }],
+            })
+
+    def test_integer_too_large_in_a_file_rejected(
+        self, loader: ProfileLoader, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "huge.json"
+        path.write_text(
+            '{"profile_version": "1.0.0", "user_id": "u1", "prosody_mappings": [{"pattern": '
+            '{"pitch": "high"}, "interpretation": {"emotion": "x", "confidence_boost": 1'
+            + "0" * 400 + "}}]}",
+            encoding="utf-8",
+        )
+        with pytest.raises(ProfileError, match=r"finite number, got 1000.*\.\.\.$"):
+            loader.load(path)
 
     def test_integer_confidence_boost_accepted(self, loader: ProfileLoader) -> None:
         profile = loader.load_json({
@@ -535,6 +597,53 @@ class TestProfileApplierSpecificity:
         assert emotion == "first"
 
 
+class TestProfileApplierMatch:
+    """ProfileApplier.match: the mapping apply() uses, and the assembler too."""
+
+    def test_most_specific_matching_mapping(self, applier: ProfileApplier) -> None:
+        general = ProsodyMapping({"pitch_contour": "flat"}, "calm", 0.15)
+        specific = ProsodyMapping({"pitch_contour": "flat", "rate": "fast"}, "joyful", 0.3)
+        profile = ProsodyProfile("1.0.0", "u1", None, (general, specific))
+        assert applier.match(profile, {"pitch_contour": "flat", "rate": "fast"}) is specific
+        assert applier.match(profile, {"pitch_contour": "flat", "rate": "slow"}) is general
+        assert applier.match(profile, {"rate": "fast"}) is None
+        assert applier.match(profile, {}) is None
+
+    def test_first_wins_a_tie(self, applier: ProfileApplier) -> None:
+        first = ProsodyMapping({"pitch": "high", "rate": "fast"}, "first", 0.1)
+        second = ProsodyMapping({"rate": "fast", "volume": "loud"}, "second", 0.1)
+        profile = ProsodyProfile("1.0.0", "u1", None, (first, second))
+        features = {"pitch": "high", "rate": "fast", "volume": "loud"}
+        assert applier.match(profile, features) is first
+
+    def test_empty_pattern_never_matches(self, applier: ProfileApplier) -> None:
+        """An empty pattern (invalid, rule P4) would otherwise match everything."""
+        profile = ProsodyProfile("1.0.0", "u1", None, (ProsodyMapping({}, "calm", 0.5),))
+        assert applier.match(profile, {"pitch": "high"}) is None
+        assert applier.apply(profile, {"pitch": "high"}, "neutral", 0.4) == ("neutral", 0.4)
+
+    def test_any_mapping_of_features(self, applier: ProfileApplier) -> None:
+        from types import MappingProxyType
+
+        mapping = ProsodyMapping({"volume": "spike"}, "sincere", 0.2)
+        profile = ProsodyProfile("1.0.0", "u1", None, (mapping,))
+        assert applier.match(profile, MappingProxyType({"volume": "spike"})) is mapping
+
+    def test_apply_uses_match(self) -> None:
+        chosen = ProsodyMapping({"rate": "fast"}, "chosen", 0.25)
+
+        class Custom(ProfileApplier):
+            def match(
+                self, profile: ProsodyProfile, features: Any
+            ) -> ProsodyMapping | None:
+                return chosen
+
+        profile = ProsodyProfile("1.0.0", "u1", None, (
+            ProsodyMapping({"pitch": "high"}, "excited", 0.1),
+        ))
+        assert Custom().apply(profile, {"pitch": "high"}, "neutral", 0.5) == ("chosen", 0.75)
+
+
 class TestProfileApplierConfidence:
     def test_confidence_boost_applied(self, applier: ProfileApplier) -> None:
         profile = ProsodyProfile("1.0.0", "u1", None, [
@@ -644,6 +753,39 @@ class TestEdgeCases:
         result = loader.validate(profile)
         assert not result.valid
         assert any(i.rule == "P3" for i in result.issues)
+
+
+# ---------------------------------------------------------------------------
+# SpanFeatures, the input of categorize_features
+# ---------------------------------------------------------------------------
+
+
+def test_span_features_quality_doc_matches_the_analyzer() -> None:
+    """SpanFeatures.quality documents the labels ProsodyAnalyzer can give
+    (read from its source, so this runs without numpy or parselmouth)."""
+    import prosody_protocol
+
+    source = Path(prosody_protocol.__file__).with_name("prosody_analyzer.py").read_text(
+        encoding="utf-8"
+    )
+    classify = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "_classify_quality"
+    )
+    labels = {
+        constant.value
+        for ret in ast.walk(classify) if isinstance(ret, ast.Return) and ret.value is not None
+        for constant in ast.walk(ret.value)
+        if isinstance(constant, ast.Constant) and isinstance(constant.value, str)
+    }
+    assert labels == {"creaky", "harsh", "breathy", "modal"}
+
+    doc = inspect.getdoc(SpanFeatures) or ""
+    section = " ".join(doc.split("\nquality:\n", 1)[1].split())
+    assert all(f"``{label}``" in section for label in labels)
+    assert "relative to the speaker's usual voice" in section
+    assert "never yields ``tense`` or ``whispery``" in section
+    assert "``None`` when it cannot tell" in section
 
 
 # ---------------------------------------------------------------------------

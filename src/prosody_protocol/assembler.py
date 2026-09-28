@@ -66,10 +66,10 @@ from .models import (
     Prosody,
     Utterance,
 )
+from .parser import _XML_INVALID_CHAR_RE
 from .profiles import (
     ProfileApplier,
     ProfileLoader,
-    ProsodyMapping,
     ProsodyProfile,
     categorize_features,
 )
@@ -825,25 +825,6 @@ def _typical_utterances(
     return None
 
 
-def _best_mapping(profile: ProsodyProfile, observed: dict[str, str]) -> ProsodyMapping | None:
-    """The mapping :class:`ProfileApplier` applies to *observed*, if any.
-
-    That is the most specific one (most pattern keys) whose pattern
-    *observed* matches entirely; the first in the profile wins a tie.
-    """
-    best: ProsodyMapping | None = None
-    for mapping in profile.mappings:
-        if all(observed.get(key) == value for key, value in mapping.pattern.items()) and (
-            best is None or len(mapping.pattern) > len(best.pattern)
-        ):
-            best = mapping
-    return best
-
-
-# Characters outside the XML 1.0 ``Char`` production cannot appear in IML.
-_XML_INVALID_CHARS = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
-
-
 def _checked_profile(profile: object) -> ProsodyProfile:
     """Check that *profile* is a valid :class:`ProsodyProfile` whose emotions IML can hold."""
     if not isinstance(profile, ProsodyProfile):
@@ -854,7 +835,7 @@ def _checked_profile(profile: object) -> ProsodyProfile:
         raise ProfileError(f"Prosody profile {profile.user_id!r} is invalid: {problems}")
     for index, mapping in enumerate(profile.mappings):
         # Checked now, not when a mapping first applies after a long analysis.
-        if _XML_INVALID_CHARS.search(mapping.interpretation_emotion):
+        if _XML_INVALID_CHAR_RE.search(mapping.interpretation_emotion):
             raise ProfileError(
                 f"Prosody profile {profile.user_id!r} is invalid: prosody_mappings[{index}]"
                 f".interpretation.emotion {mapping.interpretation_emotion!r} contains "
@@ -1111,6 +1092,7 @@ class IMLAssembler:
 
         utterances: list[Utterance] = []
         matches: list[ProfileMatch] = []
+        applier = ProfileApplier()
         for index, ((leading_pause, indices), spans) in enumerate(
             zip(groups, group_spans, strict=True)
         ):
@@ -1124,9 +1106,9 @@ class IMLAssembler:
             extra: tuple[tuple[str, str], ...] = ()
             if self._profile is not None:
                 observed = categorize_features(spans, pauses, baseline=profile_baseline)
-                mapping = _best_mapping(self._profile, observed)
+                mapping = applier.match(self._profile, observed)
                 if mapping is not None:
-                    emotion, confidence = ProfileApplier().apply(
+                    emotion, confidence = applier.apply(
                         self._profile, observed, emotion, confidence or 0.0
                     )
                     # Rounded, so 0.38 + 0.2 is written as 0.58.

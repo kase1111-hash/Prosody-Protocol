@@ -8,6 +8,7 @@ Covers:
 - IML generation from phoneme events
 - Emotion inference from prosody
 - Edge cases (empty events, single event, etc.)
+- Typed text with characters XML does not allow
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import json
 import shutil
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -801,6 +803,179 @@ class TestEscaping:
         utterance = IMLParser().parse(iml).utterances[0]
         assert utterance.emotion == label
         assert utterance.confidence != 0.1
+
+
+class TestCharactersXMLDoesNotAllow:
+    """Typed transcripts can hold control characters (a terminal's escape
+    sequences, say), which IMLParser.to_iml_string refuses to write."""
+
+    @pytest.mark.parametrize(
+        ("transcript", "cleaned", "codes"),
+        [
+            ("the \x1b[1mSUN\x1b[0m is up", "the [1mSUN[0m is up", "U+001B"),
+            ("bell\x07 and nul\x00", "bell and nul", "U+0007, U+0000"),
+            ("lone \ud800surrogate", "lone surrogate", "U+D800"),
+            ("not\ufffe a\uffff char", "not a char", "U+FFFE, U+FFFF"),
+            ("\x01\x02\x03\x04 four", " four", "U+0001, U+0002, U+0003, ..."),
+        ],
+    )
+    def test_dropped_with_a_warning(
+        self,
+        bridge: MavisBridge,
+        sample_events: list[PhonemeEvent],
+        transcript: str,
+        cleaned: str,
+        codes: str,
+    ) -> None:
+        with pytest.warns(UserWarning, match="XML does not allow") as caught:
+            entry = bridge.phoneme_events_to_entry(sample_events, transcript, "s1")
+        assert len(caught) == 1
+        assert f"({codes}) from the transcript of session 's1'" in str(caught[0].message)
+        assert caught[0].filename == __file__  # points at the caller
+        assert entry.transcript == cleaned
+        assert IMLValidator().validate(entry.iml).valid
+        assert IMLParser().to_plain_text(IMLParser().parse(entry.iml)) == " ".join(
+            cleaned.split()
+        )
+
+    def test_word_separators_become_spaces(
+        self, bridge: MavisBridge, sample_events: list[PhonemeEvent]
+    ) -> None:
+        """U+001F splits words for str.split(), so the words (and a
+        phonemes_per_word that counts them) stay the same."""
+        with pytest.warns(UserWarning, match=r"Dropped 3 characters .*\(U\+001F, U\+000B\)"):
+            entry = bridge.phoneme_events_to_entry(
+                sample_events, "the\x1fSUN\x0bis\x1fRISING", "s1",
+                phonemes_per_word=[2, 3, 2, 5],
+            )
+        assert entry.transcript == "the SUN is RISING"
+        assert _word_offsets(entry.iml) == _word_offsets(
+            bridge.phoneme_events_to_entry(
+                sample_events, "the SUN is RISING", "s1", phonemes_per_word=[2, 3, 2, 5]
+            ).iml
+        )
+
+    def test_nothing_else_left_is_an_empty_transcript(
+        self, bridge: MavisBridge, sample_events: list[PhonemeEvent]
+    ) -> None:
+        with pytest.raises(DatasetError, match="empty transcript.*XML does not allow"):
+            bridge.phoneme_events_to_entry(sample_events, "\x1b\x07", "s1")
+
+    def test_clean_transcript_gives_no_warning(
+        self, bridge: MavisBridge, sample_events: list[PhonemeEvent]
+    ) -> None:
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            entry = bridge.phoneme_events_to_entry(
+                sample_events, "tab\tand\nnew line\u00e9\U0001F600", "s1"
+            )
+        assert entry.transcript == "tab\tand\nnew line\u00e9\U0001F600"
+
+    def test_shares_the_parsers_xml_character_pattern(self) -> None:
+        """One definition of the characters XML does not allow, not a copy."""
+        from prosody_protocol import mavis_bridge, parser
+
+        assert vars(mavis_bridge)["_XML_INVALID_CHAR_RE"] is parser._XML_INVALID_CHAR_RE
+
+    def test_emotion_label_is_a_dataset_error(
+        self, bridge: MavisBridge, sample_events: list[PhonemeEvent]
+    ) -> None:
+        """A label is not typed text: it is refused, not changed."""
+        with pytest.raises(DatasetError, match=r"emotion_label .* U\+0007, which XML does not"):
+            bridge.phoneme_events_to_entry(sample_events, "hi", "s1", emotion_label="calm\x07")
+
+    @pytest.mark.parametrize(
+        ("kwargs", "error"),
+        [
+            ({"annotator": "robot"}, "annotator must be one of"),
+            ({"emotion_label": "calm\x07"}, "emotion_label"),
+            ({"phonemes_per_word": [12, 0]}, "phonemes_per_word"),
+        ],
+        ids=["annotator", "emotion_label", "phonemes_per_word"],
+    )
+    def test_no_warning_when_the_entry_is_refused(
+        self,
+        bridge: MavisBridge,
+        sample_events: list[PhonemeEvent],
+        kwargs: dict[str, object],
+        error: str,
+    ) -> None:
+        """The warning used to come before the rest of the input was checked."""
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(DatasetError, match=error):
+                bridge.phoneme_events_to_entry(
+                    sample_events, "the \x1bSUN is RISING", "s1", **kwargs  # type: ignore[arg-type]
+                )
+
+    def test_no_warning_when_an_event_is_refused(
+        self, bridge: MavisBridge, sample_events: list[PhonemeEvent]
+    ) -> None:
+        import warnings
+
+        events = [*sample_events[:-1], PhonemeEvent("ng", 1040, 80, float("nan"), 230.0)]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(DatasetError, match="non-finite"):
+                bridge.phoneme_events_to_entry(events, "the \x1bSUN is RISING", "s1")
+
+    def test_a_word_of_only_such_characters_is_removed(
+        self, bridge: MavisBridge, sample_events: list[PhonemeEvent]
+    ) -> None:
+        """Documented: phonemes_per_word counts the words of the cleaned text."""
+        transcript = "the SUN \x1b is RISING"
+        with pytest.raises(DatasetError, match="phonemes_per_word"):
+            bridge.phoneme_events_to_entry(
+                sample_events, transcript, "s1", phonemes_per_word=[2, 3, 0, 2, 5]
+            )
+        with pytest.warns(UserWarning, match="Dropped 1 character "):
+            entry = bridge.phoneme_events_to_entry(
+                sample_events, transcript, "s1", phonemes_per_word=[2, 3, 2, 5]
+            )
+        assert entry.transcript.split() == ["the", "SUN", "is", "RISING"]
+
+    def test_export(
+        self, bridge: MavisBridge, sample_events: list[PhonemeEvent], tmp_path: Path
+    ) -> None:
+        sessions = [
+            {"events": sample_events, "transcript": "the \x1bSUN is RISING", "session_id": "s1"},
+            {"events": sample_events, "transcript": "the SUN is RISING", "session_id": "s2"},
+        ]
+        with pytest.warns(UserWarning, match="session 's1'") as caught:
+            dataset = bridge.export_dataset(sessions, tmp_path / "ds", consent=True)
+        assert len(caught) == 1
+        assert caught[0].filename == __file__
+        assert [e.transcript for e in dataset.entries] == ["the SUN is RISING"] * 2
+        assert DatasetLoader().load(tmp_path / "ds").size == 2
+
+    @pytest.mark.parametrize("failure", ["later session", "existing entries"])
+    def test_no_warning_when_the_export_fails(
+        self,
+        bridge: MavisBridge,
+        sample_events: list[PhonemeEvent],
+        tmp_path: Path,
+        failure: str,
+    ) -> None:
+        import warnings
+
+        sessions: list[dict[str, Any]] = [
+            {"events": sample_events, "transcript": "the \x1bSUN is RISING", "session_id": "s1"},
+        ]
+        if failure == "later session":
+            sessions.append({"events": [], "transcript": "hi", "session_id": "s2"})
+        else:
+            bridge.export_dataset(
+                [{"events": sample_events, "transcript": "hi", "session_id": "s0"}],
+                tmp_path / "ds", consent=True,
+            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(DatasetError):
+                bridge.export_dataset(sessions, tmp_path / "ds", consent=True)
 
 
 # ---------------------------------------------------------------------------

@@ -472,7 +472,10 @@ class TestFromAudio:
                              "--profile", profile, "--min-confidence", "0.2", "--prompt")
         assert code == 0
         assert "set utterance 1 to 'uncertain' (confidence 0.30" in err
-        assert "Delivery: sounds uncertain (estimated, 30%)." in out
+        assert (
+            "Delivery: sounds uncertain (estimated, 30%; "
+            "interpreted with the speaker's prosody profile)." in out
+        )
         assert "not reliably detected" not in out
 
     def test_profile_that_matches_nothing(self, capsys: pytest.CaptureFixture[str]) -> None:

@@ -8,8 +8,9 @@ Profile matching logic (Section 8.2 of the execution guide):
   2. Matching is categorical (exact string match on observed feature labels).
      :func:`categorize_features` turns measured :class:`SpanFeatures` into
      those labels, using the thresholds documented below.
-  3. If multiple mappings match, use the most specific (most pattern keys).
-  4. Apply ``confidence_boost`` (capped at 1.0).
+  3. If multiple mappings match, use the most specific (most pattern keys);
+     the first in the profile wins a tie (:meth:`ProfileApplier.match`).
+  4. Apply ``confidence_boost`` (capped at 1.0) (:meth:`ProfileApplier.apply`).
 
 A profile is valid when :meth:`ProfileLoader.load_json` accepts it and
 :meth:`ProfileLoader.validate` reports no errors. Together they enforce
@@ -23,7 +24,7 @@ import json
 import math
 import re
 import statistics
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -107,20 +108,24 @@ class ProfileLoader:
     """Load and validate prosody profile JSON files."""
 
     def load(self, path: str | Path) -> ProsodyProfile:
-        """Load a profile from a JSON file.
+        """Load a profile from a UTF-8 JSON file (a byte order mark is allowed).
 
         Raises :class:`~prosody_protocol.exceptions.ProfileError`
-        if the file cannot be read or the JSON structure is invalid.
+        if the file cannot be read, is not UTF-8 JSON (including JSON nested
+        too deeply to parse, and integers too long to convert), or the JSON
+        structure is invalid.
         """
         p = Path(path)
         try:
-            text = p.read_text(encoding="utf-8")
-        except OSError as exc:
+            text = p.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError as exc:  # a ValueError subclass, so it comes first
+            raise ProfileError(f"Profile file is not UTF-8 text: {exc}") from exc
+        except (OSError, ValueError) as exc:  # ValueError: e.g. a NUL in the path
             raise ProfileError(f"Cannot read profile file: {exc}") from exc
 
         try:
             data = json.loads(text, parse_constant=_reject_constant)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:  # JSONDecodeError, or nested too deeply
             raise ProfileError(f"Invalid JSON in profile file: {exc}") from exc
 
         return self.load_json(data)
@@ -298,11 +303,11 @@ class ProfileLoader:
         if (
             isinstance(confidence_boost, bool)
             or not isinstance(confidence_boost, (int, float))
-            or not math.isfinite(confidence_boost)
+            or not _finite_number(confidence_boost)
         ):
             raise ProfileError(
                 f"prosody_mappings[{index}].interpretation.confidence_boost must be a "
-                f"finite number, got {confidence_boost!r}"
+                f"finite number, got {_shown(confidence_boost)}"
             )
 
         return ProsodyMapping(
@@ -314,6 +319,23 @@ class ProfileLoader:
 
 def _reject_constant(name: str) -> float:
     raise ProfileError(f"Invalid JSON in profile file: {name} is not a JSON number")
+
+
+def _finite_number(value: float) -> bool:
+    """Whether *value* is finite, counting an int too large for a float as not."""
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _shown(value: object, limit: int = 60) -> str:
+    """``repr(value)`` for an error message, shortened to about *limit* characters."""
+    try:
+        text = repr(value)
+    except ValueError:  # an int with more digits than Python converts to text
+        return "an integer too long to show"
+    return text if len(text) <= limit else f"{text[:limit - 3]}..."
 
 
 def _reject_unknown_keys(data: dict[str, object], allowed: frozenset[str], where: str) -> None:
@@ -332,47 +354,63 @@ def _reject_unknown_keys(data: dict[str, object], allowed: frozenset[str], where
 class ProfileApplier:
     """Apply prosody profiles to adjust emotion classification.
 
-    Matching logic:
+    Matching logic (:meth:`match`):
       1. Check each mapping's pattern against observed features.
       2. A mapping matches only if *all* its pattern keys are present
          in the features dict and their values match.
       3. Among all matching mappings, select the most specific one
          (most pattern keys).  Ties are broken by order in the profile
          (first match wins).
-      4. Apply ``confidence_boost`` (capped at 1.0).
+      4. Apply ``confidence_boost`` (capped at 1.0) (:meth:`apply`).
     """
+
+    def match(
+        self, profile: ProsodyProfile, features: Mapping[str, str]
+    ) -> ProsodyMapping | None:
+        """The mapping of *profile* that applies to *features*, or ``None``.
+
+        That is the most specific mapping (most pattern keys) whose pattern
+        *features* match entirely: every key present with the same value.
+        The first in the profile wins a tie. A mapping with an empty
+        pattern, which :meth:`ProfileLoader.validate` rejects (rule P4),
+        never matches.
+
+        *features* are categorical values, as :func:`categorize_features`
+        returns them.
+        """
+        best: ProsodyMapping | None = None
+        for mapping in profile.mappings:
+            if (
+                mapping.pattern
+                and (best is None or len(mapping.pattern) > len(best.pattern))
+                and self._matches(mapping.pattern, features)
+            ):
+                best = mapping
+        return best
 
     def apply(
         self,
         profile: ProsodyProfile,
-        features: dict[str, str],
+        features: Mapping[str, str],
         base_emotion: str,
         base_confidence: float,
     ) -> tuple[str, float]:
         """Return ``(adjusted_emotion, adjusted_confidence)``.
 
+        The mapping :meth:`match` finds replaces the emotion, and its
+        ``confidence_boost`` is added to *base_confidence* (capped at 1.0).
         If no mapping matches, returns the base values unchanged.
         """
-        best_match: ProsodyMapping | None = None
-        best_specificity = 0
-
-        for mapping in profile.mappings:
-            if self._matches(mapping.pattern, features):
-                specificity = len(mapping.pattern)
-                if specificity > best_specificity:
-                    best_match = mapping
-                    best_specificity = specificity
-
-        if best_match is None:
+        mapping = self.match(profile, features)
+        if mapping is None:
             return (base_emotion, base_confidence)
-
-        adjusted_emotion = best_match.interpretation_emotion
-        adjusted_confidence = min(1.0, base_confidence + best_match.confidence_boost)
-
-        return (adjusted_emotion, adjusted_confidence)
+        return (
+            mapping.interpretation_emotion,
+            min(1.0, base_confidence + mapping.confidence_boost),
+        )
 
     @staticmethod
-    def _matches(pattern: dict[str, str], features: dict[str, str]) -> bool:
+    def _matches(pattern: Mapping[str, str], features: Mapping[str, str]) -> bool:
         """Check if all pattern entries match observed features."""
         return all(features.get(key) == expected for key, expected in pattern.items())
 

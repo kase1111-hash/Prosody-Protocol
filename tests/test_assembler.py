@@ -1206,6 +1206,35 @@ class TestProfiles:
         assert matches[0].observed["pitch_contour"] == "flat"
         assert matches[0].observed["rate"] == "fast"
 
+    def test_mapping_is_chosen_by_profile_applier_match(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The assembler uses the public matching rule, not a copy of it."""
+        from prosody_protocol.profiles import ProfileApplier
+
+        calls: list[dict[str, str]] = []
+        original = ProfileApplier.match
+
+        def spy(
+            self: ProfileApplier, profile: ProsodyProfile, features: Mapping[str, str]
+        ) -> ProsodyMapping | None:
+            calls.append(dict(features))
+            return original(self, profile, features)
+
+        monkeypatch.setattr(ProfileApplier, "match", spy)
+        doc = _assemble(
+            _spiked(), assembler=IMLAssembler(_Fixed("angry", 0.6), profile=SPIKE_PROFILE)
+        )
+        assert doc.utterances[0].emotion == "sincere"
+        assert calls and calls[0]["volume"] == "spike"
+
+        # Whatever match() decides is what the assembler applies.
+        monkeypatch.setattr(ProfileApplier, "match", lambda self, profile, features: None)
+        doc = _assemble(
+            _spiked(), assembler=IMLAssembler(_Fixed("angry", 0.6), profile=SPIKE_PROFILE)
+        )
+        assert (doc.utterances[0].emotion, doc.utterances[0].extra_attributes) == ("angry", ())
+
     def test_profile_property(self) -> None:
         assert IMLAssembler(profile=SPIKE_PROFILE).profile is SPIKE_PROFILE
         assert IMLAssembler().profile is None
@@ -1275,6 +1304,12 @@ class TestProfiles:
         with pytest.raises(TypeError, match="ProsodyProfile"):
             IMLAssembler(profile={"user_id": "x"})  # type: ignore[arg-type]
 
+    def test_shares_the_parsers_xml_character_pattern(self) -> None:
+        """One definition of the characters XML does not allow, not a copy."""
+        from prosody_protocol import assembler, parser
+
+        assert vars(assembler)["_XML_INVALID_CHAR_RE"] is parser._XML_INVALID_CHAR_RE
+
 
 # ---------------------------------------------------------------------------
 # Validation of output
@@ -1295,3 +1330,46 @@ class TestOutputValidation:
             result = validator.validate(_xml(doc))
             assert result.valid
             assert not [i for i in result.issues if i.severity == "warning"]
+
+
+# ---------------------------------------------------------------------------
+# Package root and entry point (prosody_protocol/__init__.py, __main__.py)
+# ---------------------------------------------------------------------------
+
+
+def test_profile_match_is_exported_from_the_package() -> None:
+    import prosody_protocol
+
+    assert prosody_protocol.ProfileMatch is ProfileMatch
+    assert "ProfileMatch" in prosody_protocol.__all__
+    # Core (lxml only): imported eagerly, not through the lazy loader.
+    assert "ProfileMatch" not in prosody_protocol._LAZY
+    assert "ProfileMatch" in vars(prosody_protocol)
+
+
+def test_python_dash_m_runs_the_cli() -> None:
+    import subprocess
+    import sys
+
+    from prosody_protocol import __version__
+
+    version = subprocess.run(
+        [sys.executable, "-m", "prosody_protocol", "--version"],
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+    assert (version.returncode, version.stdout.strip()) == (0, f"prosody-protocol {__version__}")
+    validate = subprocess.run(
+        [sys.executable, "-m", "prosody_protocol", "validate", "-"],
+        input='<utterance emotion="calm">Hi.</utterance>',
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+    # Exit 1: an invalid document (emotion without confidence, spec 3.1).
+    assert validate.returncode == 1
+    assert "invalid" in validate.stdout
+
+
+def test_importing_main_module_does_not_run_the_cli() -> None:
+    import importlib
+
+    module = importlib.import_module("prosody_protocol.__main__")
+    assert callable(module.main)

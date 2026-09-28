@@ -28,7 +28,11 @@ which :data:`SYSTEM_PROMPT` explains to the model:
   and its emotion. The emotion is stated only when its confidence is at
   least *min_confidence* (spec 6.2.3 treats confidence below 0.5 as low),
   and always as an estimate; otherwise the note says it was not reliably
-  detected.
+  detected. An emotion that a prosody profile set (the utterance carries
+  ``x-profile``, see :data:`~prosody_protocol.assembler.PROFILE_ATTRIBUTE`)
+  is marked ``interpreted with the speaker's prosody profile``: spec 7.2
+  asks that profile usage be reported downstream. The ``x-profile`` value
+  itself is not shown.
 
 :func:`build_messages` pairs the annotated transcript with
 :data:`SYSTEM_PROMPT` as chat messages for any chat-completion API. Like the
@@ -43,6 +47,7 @@ import math
 import re
 from collections.abc import Sequence
 
+from .assembler import PROFILE_ATTRIBUTE
 from .models import ChildNode, Emphasis, IMLDocument, Pause, Prosody, Segment, Utterance
 from .parser import IMLParser
 
@@ -73,7 +78,10 @@ uncertainty, reluctance or a change of topic.
 - A "Delivery:" line describes the utterance on the line above it as a whole: its \
 overall pitch, loudness or pace, and the speaker's apparent emotion. Emotions are \
 automatic estimates, shown with the estimator's confidence; "emotion not reliably \
-detected" means the estimate was too uncertain to report.
+detected" means the estimate was too uncertain to report. An emotion "interpreted with \
+the speaker's prosody profile" was read with a description of how this particular \
+speaker expresses themselves (for example, someone whose excited speech is flat and \
+fast), so prefer it to a general reading of the other notes on that utterance.
 
 Pitch, loudness and pace are relative to the speaker's usual voice. Words without notes \
 were not marked as unusual.
@@ -302,10 +310,23 @@ def _emotion_note(utt: Utterance, min_confidence: float, include_numbers: bool) 
         if include_numbers and confidence is not None:
             return f"emotion not reliably detected (confidence {_number(confidence)})"
         return "emotion not reliably detected"
-    estimate = f"(estimated, {round(confidence * 100)}%)"
+    estimate = f"estimated, {round(confidence * 100)}%"
+    if _uses_profile(utt):
+        estimate += "; interpreted with the speaker's prosody profile"
     if label in _CORE_EMOTIONS:
-        return f"sounds {label} {estimate}"
-    return f'emotion labelled "{label}" {estimate}'
+        return f"sounds {label} ({estimate})"
+    return f'emotion labelled "{label}" ({estimate})'
+
+
+def _uses_profile(utt: Utterance) -> bool:
+    """Whether a prosody profile set the utterance's emotion (spec 7.2).
+
+    The assembler marks such utterances with :data:`PROFILE_ATTRIBUTE`
+    holding the pattern that matched; any non-blank value counts.
+    """
+    return any(
+        name == PROFILE_ATTRIBUTE and str(value).strip() for name, value in utt.extra_attributes
+    )
 
 
 def _pause_text(duration: int, include_numbers: bool) -> str:

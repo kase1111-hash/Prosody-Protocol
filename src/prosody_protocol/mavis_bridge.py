@@ -33,6 +33,7 @@ import os
 import re
 import shutil
 import tempfile
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone
@@ -55,7 +56,7 @@ from .datasets import (
 )
 from .exceptions import DatasetError
 from .models import ChildNode, IMLDocument, Prosody, Utterance
-from .parser import IMLParser
+from .parser import _XML_INVALID_CHAR_RE, IMLParser
 
 # ---------------------------------------------------------------------------
 # Mavis data types (mirrors mavis.llm_processor.PhonemeEvent)
@@ -152,7 +153,12 @@ class MavisBridge:
         events:
             Phoneme events from a Mavis session (ordered by ``start_ms``).
         transcript:
-            Plain text transcript of the vocal typing session.
+            Plain text transcript of the vocal typing session. Characters
+            that XML does not allow (control characters other than tab and
+            line breaks, such as a terminal's escape character, and lone
+            surrogates) are dropped, with a warning once the entry has been
+            made; the entry's transcript and IML hold the cleaned text. A
+            word made only of such characters disappears with them.
         session_id:
             Unique identifier for this recording session: letters, digits,
             ``.``, ``_`` and ``-`` (it becomes part of file names).
@@ -173,7 +179,9 @@ class MavisBridge:
             How many events belong to each word of *transcript*, when known
             (Mavis knows which keystrokes form a word). Otherwise words are
             told apart by the silent gaps between events; see
-            :meth:`_group_events_by_word`.
+            :meth:`_group_events_by_word`. Count the words of the cleaned
+            transcript: a word made only of characters XML does not allow
+            has been removed and must not be counted.
 
         The events are kept in the entry's metadata as plain JSON values
         (numpy scalars become Python numbers).
@@ -183,13 +191,21 @@ class MavisBridge:
         DatasetError
             If *events* or *transcript* is empty, *session_id* is not a safe
             file name, an event's timing or prosody value is not a finite
-            number, or an argument is out of its vocabulary.
+            number, *emotion_label* contains a character XML does not allow,
+            or an argument is out of its vocabulary.
+
+        Warns
+        -----
+        UserWarning
+            Characters that XML does not allow were dropped from
+            *transcript* (given only when the entry is made).
         """
         if not events:
             raise DatasetError("Cannot create entry from empty event list")
         if not isinstance(transcript, str) or not transcript.strip():
             raise DatasetError("Cannot create entry with an empty transcript")
         _check_session_id(session_id)
+        transcript, dropped_warning = _xml_safe_transcript(transcript, session_id)
         for event in events:
             values = (
                 event.start_ms, event.duration_ms, event.volume, event.pitch_hz, event.breathiness
@@ -206,6 +222,12 @@ class MavisBridge:
             default_annotator = "hybrid"
         if not isinstance(emotion_label, str) or not emotion_label.strip():
             raise DatasetError("emotion_label must be a non-empty string")
+        bad = _XML_INVALID_CHAR_RE.search(emotion_label)
+        if bad:
+            raise DatasetError(
+                f"emotion_label {emotion_label!r} contains the character "
+                f"U+{ord(bad.group()):04X}, which XML does not allow"
+            )
         annotator = default_annotator if annotator is None else annotator
         if annotator not in _VALID_ANNOTATORS:
             raise DatasetError(
@@ -214,6 +236,8 @@ class MavisBridge:
 
         iml = self._events_to_iml(events, transcript, emotion_label, phonemes_per_word)
         features = self.extract_training_features(events)
+        if dropped_warning is not None:  # only once the input has been accepted
+            warnings.warn(dropped_warning, UserWarning, stacklevel=2)
 
         return DatasetEntry(
             id=f"mavis_{session_id}",
@@ -331,7 +355,10 @@ class MavisBridge:
             existing entries are an error.
 
         Entries of sessions without 'audio_path' reference an audio file
-        that does not exist; load them without ``check_audio``.
+        that does not exist; load them without ``check_audio``. Characters
+        that XML does not allow are dropped from transcripts as in
+        :meth:`phoneme_events_to_entry`, with one warning per session once
+        the export has been written.
 
         Raises
         ------
@@ -347,6 +374,7 @@ class MavisBridge:
         loader = DatasetLoader()
 
         prepared: list[_PreparedEntry] = []
+        dropped_warnings: list[str] = []
         seen: set[str] = set()
         for index, session in enumerate(sessions):
             missing = [k for k in ("events", "transcript", "session_id") if k not in session]
@@ -369,9 +397,16 @@ class MavisBridge:
             if audio_source is not None and not Path(audio_source).is_file():
                 raise DatasetError(f"Audio for session {session_id!r} not found: {audio_source}")
 
+            transcript = session["transcript"]
+            if isinstance(transcript, str):  # else phoneme_events_to_entry rejects it
+                # Cleaned here, so that the warning is given once and points
+                # at the caller of export_dataset.
+                transcript, dropped_warning = _xml_safe_transcript(transcript, session_id)
+                if dropped_warning is not None:
+                    dropped_warnings.append(dropped_warning)
             entry = self.phoneme_events_to_entry(
                 events=session["events"],
-                transcript=session["transcript"],
+                transcript=transcript,
                 session_id=session_id,
                 emotion_label=session.get("emotion_label"),
                 speaker_id=session.get("speaker_id"),
@@ -410,6 +445,8 @@ class MavisBridge:
             "language": self.language,
         }
         _write_export(output_path, prepared, json.dumps(meta, indent=2), existing)
+        for message in dropped_warnings:  # only for an export that succeeded
+            warnings.warn(message, UserWarning, stacklevel=2)
         return loader.load(output_path)
 
     # -- Private helpers ----------------------------------------------------
@@ -648,6 +685,39 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, (list, tuple, np.ndarray)):
         return [_json_value(item) for item in value]
     return value
+
+
+def _xml_safe_transcript(transcript: str, session_id: str) -> tuple[str, str | None]:
+    """*transcript* without the characters XML does not allow, and the
+    warning to give about them (None when nothing was dropped).
+
+    Mavis text is typed, so a stray control character (a terminal escape
+    sequence, say) is dropped with a warning rather than failing the
+    session. Those that :meth:`str.split` treats as word separators
+    (vertical tab, form feed, U+001C-U+001F) become spaces, so that the
+    words they separate stay apart; the others are removed. The caller
+    gives the warning once the rest of its input has been accepted.
+
+    Raises DatasetError if nothing but whitespace is left.
+    """
+    found = _XML_INVALID_CHAR_RE.findall(transcript)
+    if not found:
+        return transcript, None
+    cleaned = _XML_INVALID_CHAR_RE.sub(lambda m: " " if m.group().isspace() else "", transcript)
+    if not cleaned.strip():
+        raise DatasetError(
+            f"Cannot create entry with an empty transcript: the transcript of session "
+            f"{session_id!r} holds only characters that XML does not allow"
+        )
+    distinct = list(dict.fromkeys(found))
+    codes = ", ".join(f"U+{ord(char):04X}" for char in distinct[:3])
+    if len(distinct) > 3:
+        codes += ", ..."
+    count = f"{len(found)} character{'s' if len(found) > 1 else ''}"
+    return cleaned, (
+        f"Dropped {count} that XML does not allow ({codes}) from the transcript of "
+        f"session {session_id!r}"
+    )
 
 
 def _check_session_id(session_id: object) -> None:
