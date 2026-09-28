@@ -2,16 +2,20 @@
 
 Uses audio with known acoustic properties: synthetic tones, silence and
 gaps (some generated on the fly with noise floors, known jitter/shimmer or
-known syllable rates), and espeak-ng speech whose word timings and pauses
-are recorded in JSON next to the WAV (see tests/generate_audio_fixtures.py).
+known syllable rates), synthetic voices with known F0, perturbation and
+breath noise, and espeak-ng speech whose word timings and pauses are
+recorded in JSON next to the WAV (see tests/generate_audio_fixtures.py).
+Tests that synthesise speech on the fly skip without espeak-ng.
 """
 
 from __future__ import annotations
 
 import json
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 import wave
 from pathlib import Path
@@ -29,7 +33,9 @@ from prosody_protocol.prosody_analyzer import (
     ProsodyAnalyzer,
     SpanFeatures,
     WordAlignment,
+    _classify_quality,
     _remove_octave_jumps,
+    _smooth_runs,
     detect_pauses,
 )
 
@@ -77,6 +83,76 @@ def _syllables(rate: float, duration_s: float = 2.0) -> Any:
 
 def _noise(n: int, dbfs: float, seed: int = 0) -> Any:
     return 10 ** (dbfs / 20) * np.random.default_rng(seed).standard_normal(n)
+
+
+def _phonation(
+    duration_s: float,
+    f0: float,
+    *,
+    jitter: float = 0.005,
+    shimmer: float = 0.03,
+    hnr_db: float = 18.0,
+    seed: int = 0,
+    f0_end: float | None = None,
+) -> Any:
+    """A voice made of glottal cycles whose periods and amplitudes vary at
+    random by *jitter* and *shimmer* (relative standard deviations), with
+    aspiration noise *hnr_db* below the voice and 30 ms fades at both ends.
+    With *f0_end*, F0 glides evenly (in semitones) from *f0* to it."""
+    rng = np.random.default_rng(seed)
+    cycles: list[Any] = []
+    total = 0
+    while total < duration_s * SR:
+        frequency = f0 * (f0_end / f0) ** (total / (duration_s * SR)) if f0_end else f0
+        n = max(8, int(round(SR / frequency * (1 + jitter * rng.standard_normal()))))
+        t = np.arange(n) / n
+        wave_ = sum(0.7**k * np.sin(2 * np.pi * k * t) for k in range(1, 15))
+        cycles.append((1 + shimmer * rng.standard_normal()) * wave_)
+        total += n
+    y = np.concatenate(cycles)[: int(duration_s * SR)]
+    y = y / np.sqrt(np.mean(y**2)) + 10 ** (-hnr_db / 20) * rng.standard_normal(y.size)
+    i = np.arange(y.size)
+    fade = np.minimum(1.0, np.minimum(i, y.size - i) / (0.03 * SR))
+    return 0.075 * y * fade
+
+
+def _utterance(
+    tmp_path: Path, odd: dict[str, float] | None = None, words: int = 8, f0: float = 120.0
+) -> tuple[Path, list[WordAlignment]]:
+    """*words* 350 ms 'words' of an *f0* Hz voice with 250 ms pauses between
+    them; word 4 is spoken with the *odd* settings of :func:`_phonation`."""
+    parts, alignments, position = [np.zeros(SR // 5)], [], 0.2
+    for i in range(words):
+        settings: dict[str, Any] = {"f0": f0 * (1 + 0.05 * np.sin(i)), "seed": 1 + i}
+        if i == 4 and odd:
+            settings.update(odd)
+        parts += [_phonation(0.35, **settings), np.zeros(SR // 4)]
+        alignments.append(
+            WordAlignment(f"w{i}", round(position * 1000), round((position + 0.35) * 1000))
+        )
+        position += 0.6
+    signal = np.concatenate(parts)
+    path = _write(tmp_path / "utterance.wav", signal + _noise(signal.size, -80, seed=99))
+    return path, alignments
+
+
+def _espeak(text: str, *, pitch: int = 50, speed: int = 160) -> Any:
+    """*text* spoken by espeak-ng at 16 kHz, without leading or trailing silence."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "speech.wav"
+        subprocess.run(
+            ["espeak-ng", "-v", "en-us", "-s", str(speed), "-p", str(pitch), "-z",
+             "-w", str(path), text],
+            check=True,
+        )
+        samples = parselmouth.Sound(str(path)).resample(SR).values[0]
+    audible = np.flatnonzero(np.abs(samples) > 1e-3)
+    return samples[audible[0]:audible[-1] + 1]
+
+
+needs_espeak = pytest.mark.skipif(
+    shutil.which("espeak-ng") is None, reason="espeak-ng not installed"
+)
 
 
 def _truth(name: str) -> dict[str, Any]:
@@ -175,11 +251,238 @@ class TestF0Extraction:
         assert np.isnan(cleaned[4])
         assert np.count_nonzero(np.isnan(cleaned)) == 1
 
+    def test_errors_at_the_end_are_not_outvoted_by_padding(self) -> None:
+        """Three spurious 650-690 Hz frames (a released /t/) ended a 70 Hz
+        voice: repeating the last sample to fill the window made them the
+        majority, and they survived."""
+        f0 = np.array([70.0, 71, 69, 70, 72, 71, 70, 69, 659, 671, 693])
+        cleaned = _remove_octave_jumps(f0)
+        assert np.all(np.isnan(cleaned[-3:]))
+        assert np.array_equal(cleaned[:-3], f0[:-3])
+        reverse = _remove_octave_jumps(f0[::-1])
+        assert np.all(np.isnan(reverse[:3]))
+
+    def test_kept_samples_are_not_corrected(self) -> None:
+        """Excursions recovered from the first pass are left alone, however
+        short, but still count as neighbours."""
+        f0 = np.array([100.0, 101, 102, 103, 104, 210, 212, 214, 105, 106, 107, 108, 109])
+        keep = np.zeros(f0.size, dtype=bool)
+        keep[5:8] = True
+        assert np.allclose(_remove_octave_jumps(f0)[5:8], [105, 106, 107])
+        assert np.array_equal(_remove_octave_jumps(f0, keep=keep), f0)
+
+    def test_smooth_runs(self) -> None:
+        """Runs end at unvoiced samples and at jumps of 3 semitones or more."""
+        f0 = np.array([100.0, 102, np.nan, 100, 150, 152, 153, np.nan, np.nan, 90, 108, 107])
+        assert _smooth_runs(f0) == [(0, 2), (3, 4), (4, 7), (9, 10), (10, 12)]
+        assert _smooth_runs(np.array([np.nan, np.nan])) == []
+
+    def test_only_sustained_strong_excursions_are_recovered(self) -> None:
+        """First-pass frames outside the fitted range replace the second
+        pass's only in a smooth run of at least 5 frames with a median
+        voicing strength of at least 0.7. A fricative's weak "voicing" that
+        follows a vowel without a break is a run of its own."""
+        analysis = prosody_analyzer._AudioAnalysis.from_path(AUDIO_DIR / "tone_220hz.wav")
+        n = 40
+        first_times = 0.02 + 0.01 * np.arange(n)
+        first, strength = np.full(n, np.nan), np.zeros(n)
+        first[0:10], strength[0:10] = 100.0, 0.9  # a vowel ...
+        first[10:16], strength[10:16] = 400.0, 0.55  # ... and a fricative
+        first[18:22], strength[18:22] = 400.0, 0.9  # strong, but too brief
+        first[25:36], strength[25:36] = 400.0, 0.9  # a shout
+        second = np.where(first > 300, 200.0, first)  # the fitted range reads half
+        second[10:16] = np.nan
+        analysis.__dict__["_first_pass"] = (first_times, first, strength)
+        analysis.__dict__["pitch_range"] = (50.0, 290.0)
+        analysis._track_pitch = lambda floor, ceiling: (  # type: ignore[method-assign]
+            first_times, second.copy(), np.ones(n)
+        )
+        _, f0, excursion = analysis._tracked_pitch
+        assert np.flatnonzero(excursion).tolist() == list(range(25, 36))
+        assert np.all(f0[25:36] == 400.0)
+        assert np.all(np.isnan(f0[10:16])) and np.all(f0[18:22] == 200.0)
+        assert np.array_equal(f0[:10], first[:10])
+
+        # With windows of different lengths, the second pass's frames can be
+        # centred half a step later: those within the shout take its F0.
+        analysis.__dict__.pop("_tracked_pitch")
+        analysis._track_pitch = lambda floor, ceiling: (  # type: ignore[method-assign]
+            first_times + 0.005, second.copy(), np.ones(n)
+        )
+        _, f0, excursion = analysis._tracked_pitch
+        assert np.flatnonzero(excursion).tolist() == list(range(25, 35))
+        assert np.all(f0[25:35] == 400.0)
+
+    @pytest.mark.parametrize("shout", [300.0, 400.0, 480.0])
+    def test_word_far_above_the_median_is_tracked(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path, shout: float
+    ) -> None:
+        """A range fitted to a 100 Hz voice ends near 290 Hz, and read a
+        shouted word of 300-480 Hz an octave low (a fixed 75-600 Hz range
+        had measured it). Its voice measures come from a range that takes
+        it in, as when the word is analysed on its own: glottal pulses
+        found at half the rate halved its jitter."""
+        path, words = _utterance(tmp_path, {"f0": shout}, words=10, f0=100.0)
+        assert prosody_analyzer._AudioAnalysis.from_path(path).pitch_range[1] < 300
+        features = analyzer.analyze(path, words)
+        f = features[4]
+        assert f.f0_mean == pytest.approx(shout, rel=0.03)
+        assert f.f0_contour is not None
+        assert all(0.9 * shout < v < 1.1 * shout for v in f.f0_contour)
+        assert [g.quality for g in features] == ["modal"] * 10
+
+        word = parselmouth.Sound(str(path)).extract_part(
+            from_time=words[4].start_ms / 1000 - 0.1, to_time=words[4].end_ms / 1000 + 0.1
+        )
+        alone_path = _write(tmp_path / "alone.wav", word.values[0])
+        alone = analyzer.analyze(alone_path, [WordAlignment("w4", 100, 450)])[0]
+        assert f.jitter is not None and alone.jitter is not None
+        assert f.jitter == pytest.approx(alone.jitter, rel=0.2)
+        assert f.shimmer == pytest.approx(alone.shimmer, rel=0.2)
+
+    def test_rise_beyond_the_fitted_range_stays_a_rise(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path
+    ) -> None:
+        """A question rising from 110 to 330 Hz at the end of a 100 Hz voice
+        dropped an octave where it crossed the fitted ceiling, turning the
+        rise into a rise-fall."""
+        parts, words = [np.zeros(SR // 5)], []
+        for i in range(9):
+            parts += [_phonation(0.35, 100.0 * (1 + 0.05 * np.sin(i)), seed=i), np.zeros(SR // 4)]
+            words.append(WordAlignment(f"w{i}", 200 + 600 * i, 200 + 600 * i + 350))
+        parts += [_phonation(0.5, 110.0, f0_end=330.0, seed=9), np.zeros(SR // 4)]
+        words.append(WordAlignment("w9", 5600, 6100))
+        path = _write(tmp_path / "question.wav", np.concatenate(parts))
+        contour = analyzer.analyze(path, words)[-1].f0_contour
+        assert contour is not None
+        steps = np.diff(np.log2(contour)) * 12
+        assert np.all(steps > -0.5), "the contour must keep rising"
+        assert contour[-1] > 290
+
+    def test_creak_below_a_high_voice(self, analyzer: ProsodyAnalyzer, tmp_path: Path) -> None:
+        """A range fitted to a 210 Hz voice starts near 105 Hz: a creaky word
+        at 75 Hz had no F0, and so could not be labelled creaky."""
+        odd = {"f0": 75.0, "jitter": 0.04, "shimmer": 0.08}
+        path, words = _utterance(tmp_path, odd, words=10, f0=210.0)
+        features = analyzer.analyze(path, words)
+        assert features[4].f0_mean == pytest.approx(76.0, rel=0.05)
+        assert [f.quality for f in features] == ["modal"] * 4 + ["creaky"] + ["modal"] * 5
+
+    def test_a_brief_second_voice(self, analyzer: ProsodyAnalyzer, tmp_path: Path) -> None:
+        """A 230 Hz voice says one word in twelve of a 70 Hz voice's: too
+        little voicing to widen the fitted range, which read it an octave low."""
+        f0s = [70.0] * 6 + [230.0] + [70.0] * 6
+        parts, words = [np.zeros(SR // 5)], []
+        for i, f0 in enumerate(f0s):
+            parts += [_phonation(0.35, f0, seed=i), np.zeros(SR // 4)]
+            words.append(WordAlignment(f"w{i}", 200 + i * 600, 200 + i * 600 + 350))
+        path = _write(tmp_path / "two.wav", np.concatenate(parts))
+        assert prosody_analyzer._AudioAnalysis.from_path(path).pitch_range[1] < 230
+        for f, f0 in zip(analyzer.analyze(path, words), f0s, strict=True):
+            assert f.f0_mean == pytest.approx(f0, rel=0.1), f.text
+
     def test_unvoiced_span_has_no_f0(self, analyzer: ProsodyAnalyzer) -> None:
         f = analyzer.analyze(
             str(AUDIO_DIR / "tone_gap_tone.wav"), [WordAlignment("gap", 700, 1100)]
         )[0]
         assert f.f0_mean is None and f.f0_range is None and f.f0_contour is None
+
+    @pytest.mark.parametrize("f0", [55.0, 62.0, 70.0])
+    def test_voice_below_75_hz_is_tracked(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path, f0: float
+    ) -> None:
+        """A fixed 75-600 Hz search range found no voicing at all in these voices."""
+        path, words = _utterance(tmp_path, f0=f0)
+        for f in analyzer.analyze(path, words):
+            assert f.f0_mean is not None and f.f0_contour is not None
+            assert f.f0_mean == pytest.approx(f0, rel=0.1)
+            assert all(0.8 * f0 < v < 1.25 * f0 for v in f.f0_contour)
+
+    @pytest.mark.parametrize(
+        ("path", "floor", "ceiling"),
+        [
+            # A 220 Hz tone: one octave below to 1.5 octaves above.
+            (AUDIO_DIR / "tone_220hz.wav", 110.0, 622.3),
+            # Silence has no voicing to fit the range to: Praat's default.
+            (AUDIO_DIR / "silence_1s.wav", 75.0, 600.0),
+        ],
+    )
+    def test_pitch_range_follows_the_voice(self, path: Path, floor: float, ceiling: float) -> None:
+        analysis = prosody_analyzer._AudioAnalysis.from_path(path)
+        assert analysis.pitch_range == pytest.approx((floor, ceiling), rel=0.01)
+
+    def test_two_voices_an_octave_and_a_half_apart(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path
+    ) -> None:
+        """A low voice (70 Hz) says most of the words and a high one (230 Hz)
+        the rest. A range fitted to the median alone ends below 230 Hz,
+        which then reads an octave low."""
+        f0s = [70.0] * 6 + [230.0] * 3
+        parts, words = [np.zeros(SR // 5)], []
+        for i, f0 in enumerate(f0s):
+            parts += [_phonation(0.35, f0, seed=i), np.zeros(SR // 4)]
+            words.append(WordAlignment(f"w{i}", 200 + i * 600, 200 + i * 600 + 350))
+        path = _write(tmp_path / "two.wav", np.concatenate(parts))
+        for f, f0 in zip(analyzer.analyze(path, words), f0s, strict=True):
+            assert f.f0_mean == pytest.approx(f0, rel=0.1), f.text
+
+    def test_pitch_range_of_a_low_voice(self, tmp_path: Path) -> None:
+        path, _ = _utterance(tmp_path, f0=62.0)
+        floor, ceiling = prosody_analyzer._AudioAnalysis.from_path(path).pitch_range
+        assert floor == 40.0  # half the median, but not below 40 Hz
+        assert 150 < ceiling < 200
+
+    @needs_espeak
+    def test_low_quiet_words_have_no_octave_errors(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path
+    ) -> None:
+        """A normal espeak-ng sentence, then short words spoken quietly in a
+        voice of about 70 Hz. Tracked from 75 Hz up, 'miss' read 242 Hz and
+        'old' 383 Hz; the samples of each word must stay near its median."""
+        plan = [("I went to the store this morning", {"pitch": 50}, 1.0),
+                ("I miss my old friends", {"pitch": 20, "speed": 115}, 0.4)]
+        parts, words, position = [np.zeros(SR // 5)], [], SR // 5
+        for sentence, settings, gain in plan:
+            for word in sentence.split():
+                clip = gain * _espeak(word, **settings)
+                words.append(WordAlignment(
+                    word, round(position / SR * 1000), round((position + clip.size) / SR * 1000)
+                ))
+                parts += [clip, np.zeros(SR // 25)]
+                position += clip.size + SR // 25
+            parts.append(np.zeros(SR // 2))
+            position += SR // 2
+        signal = np.concatenate(parts)
+        signal = 0.3 * signal / np.abs(signal).max() + _noise(signal.size, -60)
+        features = analyzer.analyze(_write(tmp_path / "story.wav", signal), words)
+        for f in features[-5:]:
+            assert f.f0_mean is not None and f.f0_contour is not None, f.text
+            assert 55 < f.f0_mean < 95, f"{f.text}: {f.f0_mean:.0f} Hz"
+            median = float(np.median(f.f0_contour))
+            assert all(median / 1.4 < v < median * 1.4 for v in f.f0_contour), f.text
+
+    @needs_espeak
+    def test_fricatives_of_a_very_low_voice_are_not_voiced(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path
+    ) -> None:
+        """In a voice of about 60 Hz the tracker finds 'voicing' near 400 Hz in
+        the /s/ of 'miss', a few percent of all frames. The search range
+        must not stretch up to take it in."""
+        parts, words, position = [np.zeros(SR // 5)], [], SR // 5
+        for word in ["I", "really", "miss", "my", "old", "friends", "from", "school"]:
+            clip = _espeak(word, pitch=0)
+            words.append(WordAlignment(
+                word, round(position / SR * 1000), round((position + clip.size) / SR * 1000)
+            ))
+            parts += [clip, np.zeros(SR // 25)]
+            position += clip.size + SR // 25
+        signal = np.concatenate([*parts, np.zeros(SR // 5)])
+        signal = 0.3 * signal / np.abs(signal).max() + _noise(signal.size, -60)
+        path = _write(tmp_path / "low.wav", signal)
+        assert prosody_analyzer._AudioAnalysis.from_path(path).pitch_range[1] < 250
+        for f in analyzer.analyze(path, words):
+            assert f.f0_contour is not None, f.text
+            assert max(f.f0_contour) < 120, f"{f.text}: {max(f.f0_contour):.0f} Hz"
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +573,7 @@ class TestVoiceQuality:
 
         A Hanning taper used to fabricate 14.8% ('tense') at 150 ms.
         """
-        path = _write(tmp_path / "voice.wav", _voice(1.5))
+        path = _write(tmp_path / "voice.wav", _voice(3.0))
         f = analyzer.analyze(str(path), [WordAlignment("w", 300, 300 + span_ms)])[0]
         assert f.shimmer is not None and f.shimmer < 1.0
         assert f.jitter is not None and f.jitter < 0.5
@@ -305,6 +608,98 @@ class TestVoiceQuality:
         path = _write(tmp_path / "noise.wav", _noise(SR, -40))
         f = analyzer.analyze(str(path), [WordAlignment("n", 0, 1000)])[0]
         assert (f.jitter, f.shimmer, f.hnr, f.quality) == (None, None, None, None)
+
+
+class TestQualityLabels:
+    """Voice quality labels compare a span with the rest of the recording."""
+
+    def test_espeak_words_are_not_all_tense(self, analyzer: ProsodyAnalyzer) -> None:
+        """Every word of the espeak-ng fixtures used to be labelled 'tense': an
+        absolute 12 % shimmer threshold, where 13-17 % is ordinary for
+        running speech."""
+        labels = []
+        for name in ("speech_pauses", "speech_calibration", "speech_raised"):
+            truth = _truth(name)
+            features = analyzer.analyze(AUDIO_DIR / f"{name}.wav", _words(truth))
+            labels += [f.quality for f in features]
+        assert set(labels) <= {"modal", None}
+        assert labels.count("modal") >= 0.75 * len(labels)
+
+    @pytest.mark.parametrize(
+        ("label", "odd"),
+        [
+            ("breathy", {"hnr_db": 6.0}),
+            ("creaky", {"f0": 60.0, "jitter": 0.04}),
+            # Irregular but not noisy (much noise would make it breathy or harsh).
+            ("harsh", {"jitter": 0.02, "shimmer": 0.2, "hnr_db": 30.0}),
+        ],
+    )
+    def test_the_odd_word_out_is_labelled(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path, label: str, odd: dict[str, float]
+    ) -> None:
+        path, words = _utterance(tmp_path, odd)
+        labels = [f.quality for f in analyzer.analyze(path, words)]
+        assert labels[4] == label
+        assert labels[:4] + labels[5:] == ["modal"] * 7
+
+    def test_a_breathy_speaker_is_modal_for_herself(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path
+    ) -> None:
+        """Labels are relative: a voice that is equally noisy throughout has no
+        breathier words (spec 6.1: attributes at the speaker's baseline are
+        omitted)."""
+        parts = [_phonation(0.35, 120.0, hnr_db=6.0, seed=i) for i in range(8)]
+        signal = np.concatenate([np.concatenate([p, np.zeros(SR // 4)]) for p in parts])
+        path = _write(tmp_path / "breathy.wav", signal)
+        words = [WordAlignment(f"w{i}", i * 600, i * 600 + 350) for i in range(8)]
+        assert [f.quality for f in analyzer.analyze(path, words)] == ["modal"] * 8
+
+    def test_whole_recording_has_no_reference(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path
+    ) -> None:
+        """A span covering the whole recording leaves nothing to compare it with."""
+        path, _ = _utterance(tmp_path)
+        f = analyzer.analyze(path, [WordAlignment("all", 0, 2**31 - 1)])[0]
+        assert f.jitter is not None and f.shimmer is not None and f.hnr is not None
+        assert f.quality is None
+
+    def test_short_voicing_is_unlabelled(self, analyzer: ProsodyAnalyzer, tmp_path: Path) -> None:
+        """Under 100 ms of voicing gives too few glottal periods to judge."""
+        path, words = _utterance(tmp_path)
+        start = words[4].start_ms
+        short, whole = analyzer.analyze(
+            path, [WordAlignment("x", start, start + 70), words[4]]
+        )
+        assert short.f0_mean is not None and short.quality is None
+        assert whole.quality == "modal"
+
+    USUAL = (1.0, 10.0, 15.0, 120.0)  # jitter %, shimmer %, HNR dB, F0 Hz
+
+    @pytest.mark.parametrize(
+        ("span", "snr_db", "label"),
+        [
+            ((1.1, 11.0, 14.0, 118.0), 40.0, "modal"),
+            ((2.5, 11.0, 14.0, 90.0), 40.0, "creaky"),  # irregular, 4.9 st lower
+            ((2.5, 11.0, 14.0, 110.0), 40.0, None),  # irregular only: unsure
+            ((2.5, 25.0, 12.0, 120.0), 40.0, "harsh"),
+            ((2.5, 25.0, 8.0, 120.0), 40.0, None),  # harsh or breathy
+            ((1.0, 25.0, 14.0, 120.0), 40.0, None),  # shimmer only: unsure
+            ((1.5, 15.0, 8.0, 120.0), 40.0, "breathy"),
+            ((1.5, 15.0, 8.0, 120.0), 20.0, None),  # noise may explain the HNR
+        ],
+    )
+    def test_rules(
+        self, span: tuple[float, float, float, float], snr_db: float, label: str | None
+    ) -> None:
+        assert _classify_quality(span, self.USUAL, snr_db) == label
+
+    def test_measurement_noise_is_not_a_deviation(self) -> None:
+        """Against a synthetic voice (jitter near 0 %, HNR near 70 dB), tiny
+        perturbations and an HNR of 40 dB are still modal."""
+        usual = (0.001, 0.01, 70.0, 150.0)
+        assert _classify_quality((0.3, 1.5, 40.0, 150.0), usual, 60.0) == "modal"
+        assert _classify_quality((1.2, 1.5, 40.0, 150.0), usual, 60.0) is None
+        assert _classify_quality((0.3, 1.5, 12.0, 150.0), usual, 60.0) == "breathy"
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +860,45 @@ class TestSpeechRate:
         )[0]
         assert silence.speech_rate is None
 
+    @needs_espeak
+    @pytest.mark.parametrize("speed", [110, 160, 230])
+    def test_rate_follows_tempo_not_pitch(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path, speed: int
+    ) -> None:
+        """One espeak-ng sentence at three voice pitches. A syllable used to
+        count only if the pitch track was voiced in the frame of its
+        intensity peak, so the low voice (-p 10, about 73 Hz) lost voicing
+        and read at 0.45-0.57 of the true rate."""
+        sentence, syllables = "I told you to call me yesterday about the meeting", 14
+        rates = []
+        for pitch in (10, 50, 90):
+            clip = _espeak(sentence, pitch=pitch, speed=speed)
+            signal = np.concatenate([np.zeros(SR // 4), clip, np.zeros(SR // 4)])
+            signal = 0.5 * signal / np.abs(signal).max() + _noise(signal.size, -60)
+            path = _write(tmp_path / f"p{pitch}.wav", signal)
+            rate = analyzer.analyze(path, [WordAlignment("all", 0, 2**31 - 1)])[0].speech_rate
+            assert rate == pytest.approx(syllables / (clip.size / SR), rel=0.15), pitch
+            rates.append(rate)
+        assert min(rates) / max(rates) > 0.85
+
+    def test_quiet_word_is_not_split_into_syllables(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path
+    ) -> None:
+        """A word more than 25 dB below the loudest speech flickers between
+        silent and sounding; masking the silent frames out of the intensity
+        contour turned each flicker into a dip, and so into a syllable."""
+        loud = [_phonation(0.35, 120.0, seed=i) for i in range(6)]
+        quiet = 0.07 * _phonation(0.6, 120.0, seed=9)  # 23 dB down
+        signal = np.concatenate(
+            [np.concatenate([w, np.zeros(SR // 10)]) for w in loud]
+            + [np.zeros(SR // 5), quiet, np.zeros(SR // 5)]
+        )
+        path = _write(tmp_path / "quiet.wav", signal + _noise(signal.size, -80))
+        analysis = prosody_analyzer._AudioAnalysis.from_path(path)
+        start = 6 * 0.45 + 0.2
+        assert analysis._silent[round(start * 100):].any()  # the flicker
+        assert np.count_nonzero(analysis._nuclei >= start) == 1
+
 
 # ---------------------------------------------------------------------------
 # Speech with ground truth
@@ -492,6 +926,67 @@ class TestEspeakSpeech:
             assert f.f0_contour is not None and len(f.f0_contour) >= 5
             assert f.intensity_mean is not None and 55 < f.intensity_mean < 90
             assert f.jitter is not None and f.shimmer is not None and f.hnr is not None
+
+
+# ---------------------------------------------------------------------------
+# The whole recording as one span
+# ---------------------------------------------------------------------------
+
+
+_MEASURES = (
+    "f0_mean", "f0_range", "f0_contour", "intensity_mean", "intensity_range",
+    "speech_rate", "jitter", "shimmer", "hnr", "quality",
+)
+
+
+class TestWholeRecording:
+    """training.features.recording_features measures a recording as the span
+    WordAlignment(text, 0, 2**31 - 1), which the analyzer clips to the audio."""
+
+    def test_open_ended_span_is_clipped_to_the_audio(self, analyzer: ProsodyAnalyzer) -> None:
+        truth = _truth("speech_pauses")
+        path = AUDIO_DIR / "speech_pauses.wav"
+        whole, exact = analyzer.analyze(path, [
+            WordAlignment("all", 0, 2**31 - 1), WordAlignment("all", 0, truth["duration_ms"]),
+        ])
+        assert (whole.start_ms, whole.end_ms, whole.text) == (0, 2**31 - 1, "all")
+        for name in _MEASURES:
+            assert getattr(whole, name) == getattr(exact, name), name
+
+    def test_whole_recording_summarises_the_words(self, analyzer: ProsodyAnalyzer) -> None:
+        truth = _truth("speech_pauses")
+        path = AUDIO_DIR / "speech_pauses.wav"
+        whole = analyzer.analyze(path, [WordAlignment("", 0, 2**31 - 1)])[0]
+        words = analyzer.analyze(path, _words(truth))
+        # Every voiced frame lies in a word: the mean F0 is theirs.
+        assert whole.f0_contour is not None and whole.f0_mean is not None
+        assert len(whole.f0_contour) == sum(len(w.f0_contour or ()) for w in words)
+        voiced = [v for w in words for v in w.f0_contour or ()]
+        assert whole.f0_mean == pytest.approx(float(np.mean(voiced)), rel=0.01)
+        speaking_ms = truth["duration_ms"] - sum(
+            p["end_ms"] - p["start_ms"] for p in truth["pauses"]
+        )
+        assert whole.speech_rate == pytest.approx(
+            truth["syllables"] / (speaking_ms / 1000), rel=0.1
+        )
+        assert whole.jitter is not None and whole.shimmer is not None and whole.hnr is not None
+        assert whole.quality is None  # nothing left to compare it with
+
+    def test_analyze_recording(self, analyzer: ProsodyAnalyzer) -> None:
+        truth = _truth("speech_pauses")
+        path = AUDIO_DIR / "speech_pauses.wav"
+        recording = analyzer.analyze_recording(path, "I told you")
+        open_ended = analyzer.analyze(path, [WordAlignment("", 0, 2**31 - 1)])[0]
+        assert (recording.start_ms, recording.end_ms) == (0, truth["duration_ms"])
+        assert recording.text == "I told you"
+        for name in _MEASURES:
+            assert getattr(recording, name) == getattr(open_ended, name), name
+
+    def test_analyze_recording_of_unreadable_audio_raises(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path
+    ) -> None:
+        with pytest.raises(AudioProcessingError, match="not found"):
+            analyzer.analyze_recording(tmp_path / "missing.wav")
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +1197,97 @@ class TestReadingAudio:
         f = analyzer.analyze(path, [WordAlignment("tone", 100, 400)])[0]
         assert f.f0_mean is not None and 215 < f.f0_mean < 225
 
+    @pytest.mark.parametrize(("rate", "frames"), [(1, 100), (8, 100), (100, 1000), (500, 1000)])
+    def test_too_low_sample_rate_raises(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path, rate: int, frames: int
+    ) -> None:
+        """A 1 Hz WAV of 100 frames raised IndexError from numpy (add.reduceat),
+        and 500 Hz audio was analysed into nonsense (noise read as a rising
+        120 Hz voice)."""
+        path = _write(tmp_path / "low.wav", _noise(frames, -20), sr=rate)
+        with pytest.raises(AudioProcessingError, match=f"sampled at {rate} Hz"):
+            analyzer.analyze(path, [WordAlignment("w", 0, 1000)])
+        with pytest.raises(AudioProcessingError, match="cannot be analysed"):
+            analyzer.detect_pauses(path)
+        with pytest.raises(AudioProcessingError, match="cannot be analysed"):
+            detect_pauses(parselmouth.Sound(_noise(frames, -20), rate))
+
+    def test_too_low_sample_rate_through_the_converter(self, tmp_path: Path) -> None:
+        from prosody_protocol import AudioToIML
+
+        path = _write(tmp_path / "low.wav", _noise(100, -20), sr=1)
+        with pytest.raises(AudioProcessingError, match="cannot be analysed"):
+            AudioToIML(stt="none").convert_detailed(path)
+
+    def test_telephone_audio_is_analysed(self, analyzer: ProsodyAnalyzer, tmp_path: Path) -> None:
+        t = np.arange(8000) / 8000
+        path = _write(tmp_path / "phone.wav", 0.3 * np.sin(2 * np.pi * 150 * t), sr=8000)
+        f = analyzer.analyze(path, [WordAlignment("w", 100, 900)])[0]
+        assert f.f0_mean == pytest.approx(150, rel=0.01)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_non_finite_samples_raise(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path, bad: float
+    ) -> None:
+        """A damaged float WAV with NaN or infinite samples was analysed as if
+        the samples were silence (F0 None, intensity 80 dB)."""
+        samples = _tone(1.0).astype("<f4")
+        samples[100:200] = bad
+        data = samples.tobytes()
+        header = (
+            b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt "
+            + struct.pack("<IHHIIHH", 16, 3, 1, SR, SR * 4, 4, 32)
+            + b"data" + struct.pack("<I", len(data))
+        )
+        path = tmp_path / "float.wav"
+        path.write_bytes(header + data)
+        with pytest.raises(AudioProcessingError, match="not finite"):
+            analyzer.analyze(path, [WordAlignment("w", 0, 1000)])
+
+    @staticmethod
+    def _float_wav(path: Path, samples: Any) -> Path:
+        """*samples* as a mono float WAV (64-bit when they are float64)."""
+        data = samples.tobytes()
+        width = samples.dtype.itemsize
+        header = (
+            b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt "
+            + struct.pack("<IHHIIHH", 16, 3, 1, SR, SR * width, width, 8 * width)
+            + b"data" + struct.pack("<I", len(data))
+        )
+        path.write_bytes(header + data)
+        return path
+
+    @pytest.mark.parametrize(
+        ("scale", "dtype"), [(1e300, "<f8"), (1e150, "<f8"), (3e38, "<f4"), (2.0**31, "<f4")]
+    )
+    def test_samples_beyond_any_sound_raise(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path, scale: float, dtype: str
+    ) -> None:
+        """Samples of 1e300 overflowed the frame power into NaN, and the
+        converter returned an empty <utterance></utterance>; 3e38 read as
+        an intensity of 860 dB."""
+        from prosody_protocol import AudioToIML
+
+        path = self._float_wav(tmp_path / "loud.wav", (scale * _voice(1.0) / 0.3).astype(dtype))
+        with pytest.raises(AudioProcessingError, match="far beyond full scale"):
+            analyzer.analyze(path, [WordAlignment("w", 0, 1000)])
+        with pytest.raises(AudioProcessingError, match="far beyond full scale"):
+            AudioToIML(stt="none").convert_detailed(path)
+
+    def test_samples_on_an_integer_scale_are_analysed(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path
+    ) -> None:
+        """Float data scaled like 16-bit integers is still sound, only 90 dB
+        louder: every measure but the intensity is unchanged."""
+        signal = _voice(1.0, f0=150.0)
+        scaled = self._float_wav(tmp_path / "scaled.wav", (32767 * signal).astype("<f4"))
+        plain = self._float_wav(tmp_path / "plain.wav", signal.astype("<f4"))
+        word = [WordAlignment("w", 100, 900)]
+        big, small = analyzer.analyze(scaled, word)[0], analyzer.analyze(plain, word)[0]
+        assert big.f0_mean == pytest.approx(small.f0_mean, rel=1e-3)
+        assert big.intensity_mean is not None and small.intensity_mean is not None
+        assert big.intensity_mean - small.intensity_mean == pytest.approx(90.3, abs=0.1)
+
 
 # ---------------------------------------------------------------------------
 # Length limit
@@ -803,10 +1389,11 @@ class TestAlignments:
         ]
         assert results[3].f0_mean is None and results[4].f0_mean is None
 
-    def test_pitch_is_tracked_once_per_file(
+    def test_pitch_is_tracked_twice_per_file(
         self, analyzer: ProsodyAnalyzer, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Per-word re-analysis of the whole file made runtime quadratic."""
+        """Per-word re-analysis of the whole file made runtime quadratic. The
+        file is tracked twice: once to find the speaker's range, once in it."""
         calls: list[int] = []
         original = parselmouth.Sound.to_pitch_ac
 
@@ -817,7 +1404,7 @@ class TestAlignments:
         monkeypatch.setattr(parselmouth.Sound, "to_pitch_ac", counting)
         words = [WordAlignment(f"w{i}", i * 10, i * 10 + 60) for i in range(90)]
         analyzer.analyze(str(AUDIO_DIR / "tone_220hz.wav"), words)
-        assert len(calls) == 1
+        assert len(calls) == 2
 
     def test_minute_of_speech_is_fast(self, analyzer: ProsodyAnalyzer, tmp_path: Path) -> None:
         """60 s of audio with 150 words took ~10 s before the fix."""

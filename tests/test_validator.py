@@ -1,6 +1,6 @@
 """Tests for prosody_protocol.validator.
 
-One test per validation rule (V1-V32), plus tests for:
+One test per validation rule (V1-V33), plus tests for:
 - Valid documents passing cleanly
 - Documents with multiple errors returning all of them
 - File-based validation, including non-UTF-8 files
@@ -1071,6 +1071,158 @@ class TestEncoding:
     def test_lone_surrogate_is_error_not_exception(self, validator: IMLValidator) -> None:
         result = validator.validate("<utterance>\ud800</utterance>")
         assert [i.rule for i in result.issues] == ["V30"]
+
+
+# ---------------------------------------------------------------------------
+# V33: plausible values (spec 6.4)
+# ---------------------------------------------------------------------------
+
+
+def _v33(result: ValidationResult) -> list[ValidationIssue]:
+    return [i for i in result.issues if i.rule == "V33"]
+
+
+class TestV33Plausibility:
+    @pytest.mark.parametrize(
+        ("markup", "attr"),
+        [
+            ('<prosody pitch="+24.5st">x</prosody>', "pitch"),
+            ('<prosody pitch="-30st">x</prosody>', "pitch"),
+            ('<prosody pitch="+301%">x</prosody>', "pitch"),
+            ('<prosody pitch="-76%">x</prosody>', "pitch"),
+            ('<prosody pitch="-150%">x</prosody>', "pitch"),  # a negative frequency
+            ('<prosody pitch="39Hz">x</prosody>', "pitch"),
+            ('<prosody pitch="0Hz">x</prosody>', "pitch"),
+            ('<prosody pitch="1500Hz">x</prosody>', "pitch"),
+            ('<prosody volume="+41dB">x</prosody>', "volume"),
+            ('<prosody volume="-80dB">x</prosody>', "volume"),
+            ('<prosody rate="1000%">x</prosody>', "rate"),
+            ('<prosody rate="10%">x</prosody>', "rate"),
+            ('a<pause duration="60001"/>b', "duration"),
+            ('<prosody f0_mean="0">x</prosody>', "f0_mean"),
+            ('<prosody f0_mean="2400">x</prosody>', "f0_mean"),
+            ('<prosody f0_range="20-240">x</prosody>', "f0_range"),
+            ('<prosody f0_range="240-120">x</prosody>', "f0_range"),
+            ('<prosody f0_contour="150,165,3000">x</prosody>', "f0_contour"),
+            ('<prosody speech_rate="25">x</prosody>', "speech_rate"),
+            ('<prosody duration_ms="3600001">x</prosody>', "duration_ms"),
+        ],
+    )
+    def test_implausible_value_warns(
+        self, validator: IMLValidator, markup: str, attr: str
+    ) -> None:
+        result = validator.validate(f"<utterance>{markup}</utterance>")
+        assert result.valid is True
+        assert result.errors == []
+        (issue,) = _v33(result)
+        assert issue.severity == "warning"
+        assert issue.message.startswith(f"{attr}=")
+        assert "spec 6.4" in issue.message and issue.line == 1
+
+    @pytest.mark.parametrize(
+        "markup",
+        [
+            '<prosody pitch="+24st">x</prosody>',
+            '<prosody pitch="-24st">x</prosody>',
+            '<prosody pitch="+300%">x</prosody>',
+            '<prosody pitch="-75%">x</prosody>',
+            '<prosody pitch="40Hz">x</prosody>',
+            '<prosody pitch="1200Hz">x</prosody>',
+            '<prosody volume="+40dB">x</prosody>',
+            '<prosody volume="-40dB">x</prosody>',
+            '<prosody rate="25%">x</prosody>',
+            '<prosody rate="400%">x</prosody>',
+            'a<pause duration="60000"/>b',
+            '<prosody f0_mean="40" f0_range="40-1200" f0_contour="40,1200">x</prosody>',
+            '<prosody f0_range="120-120">x</prosody>',
+            '<prosody speech_rate="20" duration_ms="3600000">x</prosody>',
+            '<prosody speech_rate="0">x</prosody>',
+        ],
+    )
+    def test_limits_are_inclusive(self, validator: IMLValidator, markup: str) -> None:
+        assert validator.validate(f"<utterance>{markup}</utterance>").issues == []
+
+    def test_each_implausible_attribute_is_reported(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance><prosody pitch="+30st" volume="+50dB" speech_rate="30">x'
+            '<pause duration="90000"/></prosody></utterance>'
+        )
+        assert result.valid is True
+        assert sorted(i.message.split("=")[0] for i in _v33(result)) == [
+            "duration", "pitch", "speech_rate", "volume",
+        ]
+
+    @pytest.mark.parametrize(
+        ("markup", "rule"),
+        [
+            ('<prosody pitch="+300">x</prosody>', "V13"),
+            ('<prosody volume="+99">x</prosody>', "V14"),
+            ('<prosody rate="-900%">x</prosody>', "V22"),
+            ('<prosody f0_mean="-9000">x</prosody>', "V27"),
+            ('a<pause duration="99999999999"/>b', "V6"),
+        ],
+    )
+    def test_invalid_values_are_errors_not_warnings(
+        self, validator: IMLValidator, markup: str, rule: str
+    ) -> None:
+        """A value that breaks its type is left to its error rule."""
+        result = validator.validate(f"<utterance>{markup}</utterance>")
+        assert [i.rule for i in result.issues] == [rule]
+
+    @pytest.mark.parametrize(
+        ("markup", "attr"),
+        [
+            (f'<prosody f0_range="{"9" * 400}-240">x</prosody>', "f0_range"),
+            (f'<prosody f0_range="120-{"9" * 400}">x</prosody>', "f0_range"),
+            (f'<prosody f0_contour="120,{"9" * 400}">x</prosody>', "f0_contour"),
+            (f'<prosody f0_contour="{"9" * 400}">x</prosody>', "f0_contour"),
+            (f'<prosody pitch="{"9" * 400}Hz">x</prosody>', "pitch"),
+            (f'<prosody pitch="+{"9" * 400}st">x</prosody>', "pitch"),
+            (f'<prosody pitch="-{"9" * 400}%">x</prosody>', "pitch"),
+            (f'<prosody volume="+{"9" * 400}dB">x</prosody>', "volume"),
+            (f'<prosody rate="{"9" * 400}%">x</prosody>', "rate"),
+        ],
+        ids=["range-low", "range-high", "contour", "contour-one", "hz", "st", "percent",
+             "volume", "rate"],
+    )
+    def test_numbers_too_long_for_a_float_warn(
+        self, validator: IMLValidator, markup: str, attr: str
+    ) -> None:
+        """A value of 309 or more digits is an infinite float; formatting
+        it for the f0_range message raised OverflowError (HTTP 500 from
+        /v1/validate) where the document used to validate cleanly."""
+        result = validator.validate(f"<utterance>{markup}</utterance>")
+        assert result.valid is True
+        issues = _v33(result)  # f0_range="999...-240" also has its low value above its high
+        assert issues and all(i.message.startswith(f"{attr}=") for i in issues)
+
+    def test_long_value_is_quoted_as_written(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            f'<utterance><prosody f0_contour="120,{"9" * 400}">x</prosody></utterance>'
+        )
+        (issue,) = _v33(result)
+        assert f"has {'9' * 17}... Hz, outside 40-1200 Hz" in issue.message
+        assert "inf" not in issue.message
+
+    def test_long_pause_is_not_called_an_error(self, validator: IMLValidator) -> None:
+        """A minute of silence is real (a voicemail, an interview), not a
+        measurement error; the warning says what to write instead."""
+        result = validator.validate('<utterance>a<pause duration="62000"/>b</utterance>')
+        (issue,) = _v33(result)
+        assert "should end the utterance, or be written as a pause of at most 60000 ms" in (
+            issue.message
+        )
+        assert "error" not in issue.message
+
+    def test_realistic_research_annotation_is_silent(self, validator: IMLValidator) -> None:
+        result = validator.validate(
+            '<utterance emotion="frustrated" confidence="0.92"><prosody f0_mean="220"'
+            ' f0_range="180-310" f0_contour="190,240,310,260" intensity_mean="72"'
+            ' speech_rate="5.1" duration_ms="1800" jitter="2.1" shimmer="4.5" hnr="12">I'
+            ' <prosody pitch="+18%" volume="+8dB" rate="120%">again</prosody>'
+            '<pause duration="2500"/></prosody></utterance>'
+        )
+        assert result.issues == []
 
 
 # ---------------------------------------------------------------------------

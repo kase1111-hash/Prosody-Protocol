@@ -27,6 +27,7 @@ Spec reference: Sections 2-3, 6.2.
 
 from __future__ import annotations
 
+import functools
 import math
 import re
 from collections.abc import Callable, Iterator
@@ -35,7 +36,7 @@ from typing import TypeVar, cast
 
 from lxml import etree
 
-from .exceptions import IMLParseError
+from .exceptions import ConversionError, IMLParseError
 from .models import (
     ChildNode,
     Emphasis,
@@ -82,6 +83,23 @@ _UTF8_NAMES = frozenset({"utf-8", "utf8"})
 # Plain-text extraction drops XML indentation between an element's last word
 # and closing punctuation that follows the element ("GREAT\n  </prosody>.").
 _CLOSING_PUNCTUATION = frozenset(".,;:!?)]}\u2026")
+
+# Characters outside the XML 1.0 Char production (C0 controls other than tab,
+# LF and CR, lone surrogates, U+FFFE and U+FFFF). No escape can carry them:
+# "&#27;" is not well-formed either.
+_XML_INVALID_CHAR_RE = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+
+# XML names without colons (NCName, XML 1.0 fifth edition), for the names of
+# extra attributes.
+_NAME_START_CHARS = (
+    "A-Z_a-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u02ff\u0370-\u037d\u037f-\u1fff"
+    "\u200c-\u200d\u2070-\u218f\u2c00-\u2fef\u3001-\ud7ff\uf900-\ufdcf\ufdf0-\ufffd"
+    "\U00010000-\U000effff"
+)
+_NCNAME_RE = re.compile(
+    f"[{_NAME_START_CHARS}][{_NAME_START_CHARS}\\-.0-9\u00b7\u0300-\u036f\u203f-\u2040]*"
+)
+_XMLNS_NAMESPACE = "http://www.w3.org/2000/xmlns/"
 
 _T = TypeVar("_T")
 
@@ -498,7 +516,21 @@ def _serialize_children(children: tuple[ChildNode, ...]) -> str:
     return "".join(parts)
 
 
-def _escape_xml(text: str) -> str:
+def _check_chars(what: str, text: str) -> None:
+    """Raise :class:`ConversionError` if *text* (part of *what*) holds a
+    character XML cannot carry."""
+    bad = _XML_INVALID_CHAR_RE.search(text)
+    if bad is not None:
+        raise ConversionError(
+            f"Cannot write IML: {what} contains the character U+{ord(bad.group()):04X}, "
+            "which XML does not allow (not even as a character reference), so the output "
+            "would not be well-formed XML (spec 6.1). Remove or replace it (TextToIML, "
+            "for example, replaces such characters with spaces)."
+        )
+
+
+def _escape_xml(text: str, what: str = "text") -> str:
+    _check_chars(what, text)
     return (
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -509,9 +541,58 @@ def _escape_xml(text: str) -> str:
     )
 
 
-def _escape_attr(value: str) -> str:
+def _escape_attr(value: str, name: str) -> str:
     # Attribute-value normalization turns literal tabs and newlines into spaces.
-    return _escape_xml(value).replace("\t", "&#9;").replace("\n", "&#10;")
+    return (
+        _escape_xml(value, f"the value of attribute {name!r}")
+        .replace("\t", "&#9;")
+        .replace("\n", "&#10;")
+    )
+
+
+def _check_attribute_name(name: str) -> tuple[str | None, str]:
+    """Split an extra attribute's *name* into (namespace URI, local name).
+
+    Accepts an XML name without a colon, or a Clark name ``{uri}local``.
+    Raises :class:`ConversionError` for anything that cannot be written as
+    an attribute of a well-formed, namespace-well-formed document: other
+    names, ``xmlns`` (a namespace declaration, not an attribute), and names
+    in the ``xmlns`` namespace or in an empty one.
+    """
+    uri: str | None = None
+    local = name
+    if name.startswith("{") and "}" in name:
+        uri, local = name[1:].split("}", 1)
+    if (
+        not _NCNAME_RE.fullmatch(local)
+        or (uri is None and local == "xmlns")
+        or uri in ("", _XMLNS_NAMESPACE)
+    ):
+        raise ConversionError(
+            f"Cannot write IML: {name!r} is not a valid attribute name. Extra attributes "
+            "are named by an XML name without a colon (such as 'x-note') or, when "
+            "namespaced, in Clark notation ('{uri}name'); xmlns declarations are not "
+            "attributes."
+        )
+    if uri is not None and uri != _XML_NAMESPACE:
+        _check_chars(f"the namespace of attribute {name!r}", uri)
+        if not _is_namespace_name(uri):
+            raise ConversionError(
+                f"Cannot write IML: the namespace of attribute {name!r} is not a URI "
+                "reference that XML parsers accept"
+            )
+    return uri, local
+
+
+@functools.lru_cache(maxsize=64)
+def _is_namespace_name(uri: str) -> bool:
+    """Whether the XML parser accepts *uri* as a namespace name (no spaces, ...)."""
+    probe = f'<p xmlns:n="{_escape_attr(uri, "xmlns:n")}"/>'.encode()
+    try:
+        etree.fromstring(probe, parser=_SECURE_PARSER)  # noqa: S320
+    except etree.XMLSyntaxError:
+        return False
+    return True
 
 
 def _attrs(
@@ -522,24 +603,23 @@ def _attrs(
     written: set[str] = set()
     for name, value in typed:
         if value is not None:
-            parts.append(f' {name}="{_escape_attr(str(value))}"')
+            parts.append(f' {name}="{_escape_attr(str(value), name)}"')
             written.add(name)
     prefixes: dict[str, str] = {}
     for name, value in extra:
         if name in written:
             continue
-        qname = name
-        if name.startswith("{"):
-            uri, local = name[1:].split("}", 1)
-            if uri == _XML_NAMESPACE:
-                qname = f"xml:{local}"
-            else:
-                prefix = prefixes.get(uri)
-                if prefix is None:
-                    prefix = prefixes[uri] = f"ns{len(prefixes)}"
-                    parts.append(f' xmlns:{prefix}="{_escape_attr(uri)}"')
-                qname = f"{prefix}:{local}"
-        parts.append(f' {qname}="{_escape_attr(value)}"')
+        uri, local = _check_attribute_name(name)
+        qname = local
+        if uri == _XML_NAMESPACE:
+            qname = f"xml:{local}"
+        elif uri is not None:
+            prefix = prefixes.get(uri)
+            if prefix is None:
+                prefix = prefixes[uri] = f"ns{len(prefixes)}"
+                parts.append(f' xmlns:{prefix}="{_escape_attr(uri, name)}"')
+            qname = f"{prefix}:{local}"
+        parts.append(f' {qname}="{_escape_attr(value, name)}"')
         written.add(name)
     return "".join(parts)
 
@@ -656,6 +736,17 @@ class IMLParser:
         a non-UTF-8 encoding declaration, V30, is not carried over). All
         attributes are kept, including ``extra_attributes``, so a document
         with invalid attribute values stays invalid.
+
+        The output is always well-formed XML (spec 6.1), which
+        :meth:`parse` reads back. A document that cannot be written as
+        such -- one built in code, never one that was parsed -- raises
+        :class:`~prosody_protocol.exceptions.ConversionError` rather than
+        losing content silently: text or an attribute value holding a
+        character XML does not allow at all (control characters other than
+        tab, line feed and carriage return, such as ``"\\x1b"``; lone
+        surrogates; U+FFFE and U+FFFF), or an extra attribute whose name is
+        not an XML name without a colon or a Clark name ``{uri}name``
+        (``xmlns`` and the ``xmlns`` namespace are not attributes).
         """
         doc_attrs = _attrs(
             [

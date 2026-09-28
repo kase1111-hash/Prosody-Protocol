@@ -20,6 +20,9 @@
   XSD 1.0 cannot express these rules, so this schema does not check them:
     - confidence is REQUIRED when emotion is present (V3)
     - prosody/emphasis nesting depth SHOULD NOT exceed 2 (V12, a warning)
+    - attribute values SHOULD lie in the plausible ranges for human speech
+      (V33, a warning; Section 6.4): the schema accepts any value of the
+      right type, such as volume="+80dB"
     - the document is UTF-8 and has no DOCTYPE (V30, V31; Sections 2.2, 2.5)
     - unknown elements are transparent (Section 6.2). The schema accepts an
       unknown element only when it is namespace-qualified (in a namespace

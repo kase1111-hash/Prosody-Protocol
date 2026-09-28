@@ -338,7 +338,7 @@ Groups a stretch of speech sharing overall prosodic characteristics. Useful for 
 
 ## 4. Extended Attributes
 
-These attributes provide detailed acoustic measurements for research and advanced analysis. They appear on `<prosody>`. Producers are NOT required to include them; consumers MUST NOT depend on their presence. When present, their values MUST have the types below (Section 2.6); frequencies, ranges, rates and perturbation percentages MUST NOT be negative.
+These attributes provide detailed acoustic measurements for research and advanced analysis. They appear on `<prosody>`. Producers are NOT required to include them; consumers MUST NOT depend on their presence. When present, their values MUST have the types below (Section 2.6); frequencies, ranges, rates and perturbation percentages MUST NOT be negative. Section 6.4 gives the plausible ranges that producers SHOULD keep them within.
 
 ### 4.1 Fundamental Frequency (F0)
 
@@ -458,6 +458,25 @@ A valid IML document:
 Unknown elements and attributes do not make a document invalid, except that a `<pause>` MUST NOT contain any element (Section 3.3). Validators SHOULD report violations of MUST-level requirements as errors, which make a document invalid, and SHOULD-level recommendations (such as the nesting depth in Section 5.2) as warnings, which do not.
 
 *Non-normative:* the reference validator (`prosody_protocol.IMLValidator`) implements these rules, and `schemas/iml-1.0.xsd` expresses the subset that XML Schema 1.0 can.
+
+### 6.4 Plausible Values
+
+Some attribute values are valid syntax but lie far outside anything a human voice produces. They almost always come from a measurement or conversion error: a pitch tracker's octave jump, a level in dBFS written as an offset, seconds written as milliseconds. Producers SHOULD NOT emit values outside the ranges below. Such values do not make a document invalid: validators SHOULD report them as warnings (Section 6.3), and consumers MAY treat them as unreliable.
+
+| Attribute | Element | Plausible values |
+|-----------|---------|------------------|
+| `pitch` (relative) | `<prosody>` | Within two octaves of the baseline: `-24st` to `+24st`, `-75%` to `+300%` |
+| `pitch` (absolute) | `<prosody>` | `40Hz` to `1200Hz` |
+| `volume` | `<prosody>` | `-40dB` to `+40dB` |
+| `rate` (percentage) | `<prosody>` | `25%` to `400%` |
+| `duration` | `<pause>` | At most 60000 ms (one minute) |
+| `f0_mean`, `f0_range`, `f0_contour` | `<prosody>` | Every value 40 to 1200 Hz; the low value of `f0_range` not above its high value |
+| `speech_rate` | `<prosody>` | At most 20 syllables/second |
+| `duration_ms` | `<prosody>` | At most 3600000 ms (one hour) |
+
+The limits are inclusive. The pitch limits are the same in every unit: +24 semitones is four times the baseline frequency (+300%), and -24 semitones a quarter of it (-75%). 40-1200 Hz covers the speaking voice from a deep bass to a scream (only the lowest vocal fry goes below it), and 20 syllables per second is far faster than anyone speaks.
+
+The length of a pause is the exception: a silence of more than a minute is usually real (a voicemail, a recorded interview), not an error. It means no more than a pause of two seconds (Section 3.3), so producers SHOULD end the utterance at such a silence, or write it as a `<pause>` of at most 60000 ms.
 
 ---
 
@@ -749,6 +768,7 @@ This specification uses the key words MUST, MUST NOT, SHOULD, SHOULD NOT, MAY, R
 | S14 | Validators SHOULD report MUST violations as errors and SHOULD violations as warnings. | 6.3 |
 | S15 | Producers SHOULD write `<pause>` as a self-closing tag. | 3.3, 5.2 |
 | S16 | Producers SHOULD NOT put attributes in the IML namespace. | 2.3 |
+| S17 | Producers SHOULD NOT emit attribute values outside the plausible ranges for human speech. | 6.4 |
 
 ### D.3 MAY / OPTIONAL
 

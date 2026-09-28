@@ -9,6 +9,7 @@ Covers:
 - Extended attributes on <prosody>
 - File-based parsing and UTF-8 enforcement
 - Plain text extraction and whitespace normalization
+- Serialization always gives well-formed XML, or raises ConversionError
 - Comments, processing instructions, CDATA, unknown elements, namespaces
 - XML security: DOCTYPE, external entities (file and network), billion laughs
 """
@@ -26,7 +27,7 @@ from lxml import etree
 
 from prosody_protocol import parser as parser_module
 from prosody_protocol import validator as validator_module
-from prosody_protocol.exceptions import IMLParseError
+from prosody_protocol.exceptions import ConversionError, IMLParseError
 from prosody_protocol.models import (
     Emphasis,
     IMLDocument,
@@ -815,6 +816,121 @@ class TestLosslessRoundTrip:
             )
         )
         assert parser.to_iml_string(doc) == '<utterance confidence="0.5">x</utterance>'
+
+
+# ---------------------------------------------------------------------------
+# Serialization is always well-formed (spec 6.1)
+# ---------------------------------------------------------------------------
+
+# Characters XML 1.0 does not allow at all, not even as character references.
+FORBIDDEN_CHARS = ["\x00", "\x08", "\x0b", "\x0c", "\x1b", "\x1f", "\ud800", "\udfff",
+                   "\ufffe", "\uffff"]
+# Unusual characters XML does allow.
+ALLOWED_CHARS = ["\t", "\n", "\r", "\x7f", "\x85", "\x9f", "\u2028", "\ue000", "\ufffd",
+                 "\U00010000", "\U0010ffff"]
+
+
+def _with_text(text: str) -> IMLDocument:
+    return IMLDocument(utterances=(Utterance(children=(f"a{text}b",)),))
+
+
+def _with_attributes(value: str) -> list[IMLDocument]:
+    """Documents with *value* in each kind of attribute the serializer writes."""
+    extra = (("x-note", value),)
+    return [
+        IMLDocument(utterances=(Utterance(children=("x",), emotion=value, confidence=0.5),)),
+        IMLDocument(utterances=(Utterance(children=("x",), speaker_id=value),)),
+        IMLDocument(utterances=(Utterance(children=("x",), extra_attributes=extra),)),
+        IMLDocument(utterances=(Utterance(children=("x",)),), language=value),
+        IMLDocument(utterances=(Utterance(children=("x",)),), extra_attributes=extra),
+        IMLDocument(utterances=(Utterance(children=(
+            Prosody(children=("x",), pitch=value, f0_contour=value, extra_attributes=extra),
+            Pause(duration=300, extra_attributes=extra),
+            Emphasis(level=value, children=("y",)),
+            Segment(children=("z",), tempo=value),
+        )),)),
+    ]
+
+
+class TestWellFormedOutput:
+    @pytest.mark.parametrize("char", FORBIDDEN_CHARS, ids=lambda c: f"U+{ord(c):04X}")
+    def test_forbidden_character_in_text_raises(self, parser: IMLParser, char: str) -> None:
+        """'a\\x1bb' used to be written as is: IML that parse() rejects."""
+        message = f"text contains the character U\\+{ord(char):04X}"
+        with pytest.raises(ConversionError, match=message):
+            parser.to_iml_string(_with_text(char))
+
+    @pytest.mark.parametrize("char", FORBIDDEN_CHARS, ids=lambda c: f"U+{ord(c):04X}")
+    def test_forbidden_character_in_attributes_raises(self, parser: IMLParser, char: str) -> None:
+        for doc in _with_attributes(f"v{char}"):
+            with pytest.raises(ConversionError, match="the value of attribute"):
+                parser.to_iml_string(doc)
+
+    @pytest.mark.parametrize("char", ALLOWED_CHARS, ids=lambda c: f"U+{ord(c):04X}")
+    def test_allowed_characters_round_trip(self, parser: IMLParser, char: str) -> None:
+        for doc in [_with_text(char), *_with_attributes(f"v{char}")]:
+            assert parser.parse(parser.to_iml_string(doc)) == doc
+
+    def test_docstrings_hold_no_control_characters(self) -> None:
+        """The to_iml_string docstring gave its example as ``"\\x1b"`` in a
+        non-raw string, which put a real ESC into help() and the API docs."""
+        docs = {"module": parser_module.__doc__ or ""}
+        for owner in (parser_module, IMLParser):
+            for name, member in vars(owner).items():
+                docs[name] = getattr(member, "__doc__", None) or ""
+        for name, doc in docs.items():
+            assert all(c in "\t\n" or " " <= c != "\x7f" for c in doc), name
+
+    def test_error_names_the_problem(self, parser: IMLParser) -> None:
+        with pytest.raises(ConversionError) as info:
+            parser.to_iml_string(_with_attributes("v\x1b")[1])
+        assert "'speaker_id'" in str(info.value) and "U+001B" in str(info.value)
+
+    @pytest.mark.parametrize("name", [
+        "a b", "", "1a", "-a", "a:b", "xml:lang", "xmlns", "xmlns:a", "a\x1b", "{}a",
+        "{urn:x}", "{urn:x}a:b", "{http://www.w3.org/2000/xmlns/}a", "{a b}c", "{urn:\x1b}c",
+    ])
+    def test_invalid_extra_attribute_name_raises(self, parser: IMLParser, name: str) -> None:
+        """'a b' was written as <utterance a b="v">; 'xmlns' as a namespace
+        declaration that moved the utterance out of IML."""
+        doc = IMLDocument(utterances=(Utterance(children=("x",), extra_attributes=((name, "v"),)),))
+        with pytest.raises(ConversionError, match="attribute"):
+            parser.to_iml_string(doc)
+
+    @pytest.mark.parametrize("name", [
+        "x-note", "caf\u00e9", "a\u00b7b", "_a.b-c", "{urn:x}a",
+        "{http://www.w3.org/XML/1998/namespace}lang", "{http://example.com/?a=1&b=2}c",
+    ])
+    def test_unusual_valid_attribute_names_round_trip(self, parser: IMLParser, name: str) -> None:
+        doc = IMLDocument(utterances=(Utterance(children=("x",), extra_attributes=((name, "v"),)),))
+        assert parser.parse(parser.to_iml_string(doc)) == doc
+
+    def test_random_documents_serialize_to_parseable_iml_or_raise(
+        self, parser: IMLParser
+    ) -> None:
+        """Whatever the text and attribute values hold, the output parses back
+        to the same document, or serialization raises ConversionError."""
+        import random
+
+        rng = random.Random(1234)
+        alphabet = [*FORBIDDEN_CHARS, *ALLOWED_CHARS, "a", " ", "<", "&", '"', "'", ">", "]]>"]
+        raised = parsed = 0
+        for _ in range(400):
+            text = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 6)))
+            value = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 4)))
+            doc = IMLDocument(utterances=(Utterance(
+                children=(text, Prosody(children=(text,), pitch=value)),
+                speaker_id=value,
+                extra_attributes=(("x-v", value),),
+            ),))
+            try:
+                out = parser.to_iml_string(doc)
+            except ConversionError:
+                raised += 1
+                continue
+            assert parser.parse(out) == doc
+            parsed += 1
+        assert raised > 50 and parsed > 50
 
 
 # ---------------------------------------------------------------------------

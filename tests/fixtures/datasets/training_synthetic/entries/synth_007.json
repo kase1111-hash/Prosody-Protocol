@@ -4,13 +4,19 @@
   "source": "synthetic",
   "language": "en-US",
   "audio_file": "audio/synth_007.wav",
-  "transcript": "Let us take a moment to breathe.",
-  "iml": "<utterance emotion=\"calm\" confidence=\"0.9\">Let us take a moment to breathe.</utterance>",
+  "transcript": "Take a moment to breathe.",
+  "iml": "<utterance emotion=\"calm\" confidence=\"0.9\">Take a moment to breathe.</utterance>",
   "speaker_id": "synth_speaker",
   "emotion_label": "calm",
   "annotator": "model",
   "consent": true,
   "metadata": {
-    "synthetic": true
+    "synthetic": true,
+    "generator": "tests/generate_training_fixture.py",
+    "tts": "espeak-ng, voice en-us",
+    "speed_wpm": 140,
+    "pitch": 40,
+    "amplitude": 45,
+    "pitch_range": "low"
   }
 }

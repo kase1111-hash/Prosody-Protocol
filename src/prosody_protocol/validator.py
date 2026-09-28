@@ -1,6 +1,6 @@
 """IML validator -- checks IML documents against the spec rules.
 
-Implements validation rules V1-V32. Violations of a spec MUST (including
+Implements validation rules V1-V33. Violations of a spec MUST (including
 6.3's "valid attribute types") are errors and make a document invalid;
 SHOULD violations are warnings; info issues are notes that never affect
 validity.
@@ -38,6 +38,12 @@ validity.
   V31 document has no DOCTYPE declaration                      ERROR
   V32 attributes are IML-defined, x- prefixed or in a foreign  WARNING
       namespace (not unprefixed-unknown, not in the IML namespace)
+  V33 attribute values are plausible for human speech (6.4):   WARNING
+      pitch within 24 st of the baseline (-75% to +300%) or
+      40-1200 Hz; volume within 40 dB; rate 25-400%; pause at
+      most 60000 ms; f0_mean/f0_range/f0_contour 40-1200 Hz
+      (range low not above high); speech_rate at most 20
+      syllables/s; duration_ms at most 3600000
 
 Unknown elements are transparent (spec 6.2): the rules apply to their
 content as if their tags were absent. The exception is <pause>, which
@@ -143,6 +149,23 @@ _KNOWN_ATTRIBUTES: dict[str, frozenset[str]] = {
 # Attributes in the IML namespace are not IML attributes (spec 2.3).
 _IML_ATTRIBUTE_PREFIX = f"{{{IML_NAMESPACE}}}"
 
+# V33: plausible values for human speech (spec 6.4). Values beyond these are
+# valid syntax but almost always measurement or conversion errors.
+MAX_PITCH_SEMITONES = 24.0  # two octaves either way ...
+MAX_PITCH_PERCENT = 300.0  # ... which is +300 % ...
+MIN_PITCH_PERCENT = -75.0  # ... and -75 %
+MIN_F0_HZ = 40.0  # absolute pitch and the F0 extended attributes
+MAX_F0_HZ = 1200.0
+MAX_VOLUME_DB = 40.0
+MIN_RATE_PERCENT = 25.0
+MAX_RATE_PERCENT = 400.0
+MAX_PAUSE_MS = 60_000
+MAX_SPEECH_RATE = 20.0  # syllables per second
+MAX_DURATION_MS = 3_600_000
+
+# What an implausible value most likely means, for V33 messages.
+_LIKELY_ERROR = "such a value is almost always a measurement or conversion error"
+
 
 def _is_number(raw: str) -> bool:
     return _parse_float(raw) is not None
@@ -151,6 +174,18 @@ def _is_number(raw: str) -> bool:
 def _is_non_negative_number(raw: str) -> bool:
     value = _parse_float(raw)
     return value is not None and value >= 0.0
+
+
+def _matching(el: etree._Element, attr: str, pattern: re.Pattern[str]) -> str | None:
+    """The value of *attr* if it has the format *pattern* describes, else ``None``."""
+    value = el.get(attr)
+    return value if value is not None and pattern.fullmatch(value) else None
+
+
+def _number(value: float) -> str:
+    """One of this module's limits for a message: without a fraction when
+    it is whole."""
+    return f"{value:.0f}" if value.is_integer() else f"{value:g}"
 
 
 # Extended attribute checks (Section 4): predicate and expected-value text.
@@ -445,6 +480,9 @@ class _Walker:
                     f'{attr}="{_snippet(raw)}" is not valid (expected {expected})', el,
                 )
 
+        # V33: plausible values (Section 6.4)
+        self._check_plausible_prosody(el)
+
         # V12: nesting depth
         if depth > 2:
             self._add(
@@ -454,6 +492,88 @@ class _Walker:
             )
 
         self._walk_children(el, parent_tag="prosody", depth=depth, in_segment=in_segment)
+
+    def _implausible(
+        self, el: etree._Element, attr: str, why: str, advice: str = _LIKELY_ERROR
+    ) -> None:
+        self._add(
+            "warning", "V33",
+            f'{attr}="{_snippet(el.get(attr, ""))}" {why}; {advice} (spec 6.4)',
+            el,
+        )
+
+    def _check_f0(self, el: etree._Element, attr: str, values: list[str]) -> None:
+        """V33 for Hz values: *values* are the attribute's numbers as written
+        (ASCII decimals, which may be too long for a float to hold)."""
+        outside = [v for v in values if not MIN_F0_HZ <= float(v) <= MAX_F0_HZ]
+        if outside:
+            # Quote the value as written: a float of 400 digits is infinite.
+            where = "is" if len(values) == 1 else f"has {_snippet(outside[0], 20)} Hz,"
+            self._implausible(
+                el, attr,
+                f"{where} outside {_number(MIN_F0_HZ)}-{_number(MAX_F0_HZ)} Hz "
+                "(the range of the human voice)",
+            )
+
+    def _check_plausible_prosody(self, el: etree._Element) -> None:
+        """V33 for the attributes of a <prosody>; values with an invalid
+        format are left to V13, V14, V22 and V27."""
+        pitch = _matching(el, "pitch", _PITCH_RE)
+        if pitch is not None and pitch.endswith("st"):
+            if abs(float(pitch[:-2])) > MAX_PITCH_SEMITONES:
+                self._implausible(
+                    el, "pitch",
+                    f"is more than {_number(MAX_PITCH_SEMITONES)} semitones (two octaves) "
+                    "from the baseline",
+                )
+        elif pitch is not None and pitch.endswith("%"):
+            if not MIN_PITCH_PERCENT <= float(pitch[:-1]) <= MAX_PITCH_PERCENT:
+                self._implausible(
+                    el, "pitch",
+                    "is more than two octaves from the baseline (outside "
+                    f"{_number(MIN_PITCH_PERCENT)}% to +{_number(MAX_PITCH_PERCENT)}%)",
+                )
+        elif pitch is not None:
+            self._check_f0(el, "pitch", [pitch[:-2]])
+
+        volume = _matching(el, "volume", _VOLUME_RE)
+        if volume is not None and abs(float(volume[:-2])) > MAX_VOLUME_DB:
+            self._implausible(
+                el, "volume", f"is more than {_number(MAX_VOLUME_DB)} dB from the baseline"
+            )
+
+        rate = _matching(el, "rate", _RATE_PERCENT_RE)
+        if rate is not None and not MIN_RATE_PERCENT <= float(rate[:-1]) <= MAX_RATE_PERCENT:
+            self._implausible(
+                el, "rate",
+                f"is outside {_number(MIN_RATE_PERCENT)}-{_number(MAX_RATE_PERCENT)}% of "
+                "the baseline (more than four times slower or faster)",
+            )
+
+        f0_mean = el.get("f0_mean", "")
+        if _is_non_negative_number(f0_mean):
+            self._check_f0(el, "f0_mean", [f0_mean])
+
+        f0_range = _matching(el, "f0_range", _F0_RANGE_RE)
+        if f0_range is not None:
+            low, high = f0_range.split("-")
+            self._check_f0(el, "f0_range", [low, high])
+            if float(low) > float(high):
+                self._implausible(el, "f0_range", "has its low value above its high value")
+
+        f0_contour = _matching(el, "f0_contour", _F0_CONTOUR_RE)
+        if f0_contour is not None:
+            self._check_f0(el, "f0_contour", f0_contour.split(","))
+
+        speech_rate = _parse_float(el.get("speech_rate", ""))
+        if speech_rate is not None and speech_rate > MAX_SPEECH_RATE:
+            self._implausible(
+                el, "speech_rate", f"is more than {_number(MAX_SPEECH_RATE)} syllables per second"
+            )
+
+        duration = _parse_positive_int(el.get("duration_ms", ""))
+        if duration is not None and duration > MAX_DURATION_MS:
+            self._implausible(el, "duration_ms", f"is longer than {MAX_DURATION_MS} ms (one hour)")
 
     def check_emphasis(
         self, el: etree._Element, parent_tag: str, depth: int, in_segment: bool
@@ -495,14 +615,23 @@ class _Walker:
         # V5: duration attribute required
         if duration_raw is None:
             self._add("error", "V5", "<pause> is missing required attribute 'duration'", el)
-        elif _parse_positive_int(duration_raw) is None:
-            # V6: positive integer
-            self._add(
-                "error", "V6",
-                f'<pause> duration="{_snippet(duration_raw)}" must be a positive integer '
-                f"of ms, at most {MAX_INTEGER}",
-                el,
-            )
+        else:
+            duration = _parse_positive_int(duration_raw)
+            if duration is None:
+                # V6: positive integer
+                self._add(
+                    "error", "V6",
+                    f'<pause> duration="{_snippet(duration_raw)}" must be a positive integer '
+                    f"of ms, at most {MAX_INTEGER}",
+                    el,
+                )
+            elif duration > MAX_PAUSE_MS:
+                # V33: plausible pause length (Section 6.4)
+                self._implausible(
+                    el, "duration", f"is longer than {MAX_PAUSE_MS} ms (one minute)",
+                    "a silence this long should end the utterance, or be written as a pause "
+                    f"of at most {MAX_PAUSE_MS} ms",
+                )
 
         # V7: no content. Text inside unknown elements counts as text, and
         # unlike elsewhere an unknown element is itself content (spec 3.3).

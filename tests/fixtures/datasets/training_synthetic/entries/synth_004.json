@@ -4,13 +4,19 @@
   "source": "synthetic",
   "language": "en-US",
   "audio_file": "audio/synth_004.wav",
-  "transcript": "I miss the old days so much.",
-  "iml": "<utterance emotion=\"sad\" confidence=\"0.9\">I miss the old days so much.</utterance>",
+  "transcript": "I miss the old days.",
+  "iml": "<utterance emotion=\"sad\" confidence=\"0.9\">I miss the old days.</utterance>",
   "speaker_id": "synth_speaker",
   "emotion_label": "sad",
   "annotator": "model",
   "consent": true,
   "metadata": {
-    "synthetic": true
+    "synthetic": true,
+    "generator": "tests/generate_training_fixture.py",
+    "tts": "espeak-ng, voice en-us",
+    "speed_wpm": 130,
+    "pitch": 25,
+    "amplitude": 30,
+    "pitch_range": "x-low"
   }
 }

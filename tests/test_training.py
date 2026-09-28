@@ -8,12 +8,14 @@ Covers acceptance criteria:
 
 and that the pipeline is honest: features come from the audio and text
 (never from the labels), so a model only learns what the recordings show.
-Most tests use small datasets generated here, whose clips differ by class
-(the 10 clips of the ``training_synthetic`` fixture are identical).
+Most tests use small datasets generated here, whose clips differ by class.
+The ``training_synthetic`` fixture holds 10 short espeak-ng clips whose
+delivery follows their label (tests/generate_training_fixture.py).
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -42,11 +44,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
-from prosody_protocol import SpanFeatures
+from prosody_protocol import IMLParser, SpanFeatures
 from prosody_protocol.exceptions import DatasetError, TrainingError
 from training.config import load_config
 from training.features import (
     feature_vector,
+    recording_features,
     token_prosody_labels,
     utterance_contour_label,
     utterance_features,
@@ -875,6 +878,57 @@ class TestFeatures:
         assert utterance_contour_label(whole) == "rise"
         assert utterance_contour_label(part) is None
         assert utterance_contour_label("<utterance>Really.</utterance>") is None
+
+
+# ---------------------------------------------------------------------------
+# The training_synthetic fixture
+# ---------------------------------------------------------------------------
+
+
+class TestSyntheticFixture:
+    """The fixture's clips were 10 identical 440 Hz tones behind 8 labels, so
+    nothing could be learnt from it. They are now espeak-ng speech whose
+    speed, pitch, pitch range and loudness follow the label."""
+
+    def test_clips_are_distinct_short_speech_clips(self):
+        digests = set()
+        for path in sorted((SYNTHETIC_DATASET / "audio").glob("*.wav")):
+            with wave.open(str(path)) as w:
+                assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (16_000, 1, 2)
+                assert w.getnframes() <= 2 * 16_000
+            digests.add(hashlib.sha256(path.read_bytes()).hexdigest())
+        assert len(digests) == 10
+
+    def test_iml_holds_the_spoken_words(self):
+        parser = IMLParser()
+        for path in sorted((SYNTHETIC_DATASET / "entries").glob("*.json")):
+            entry = json.loads(path.read_text(encoding="utf-8"))
+            doc = parser.parse(entry["iml"])
+            assert parser.to_plain_text(doc) == entry["transcript"]
+            assert doc.utterances[0].emotion == entry["emotion_label"]
+
+    @needs_audio
+    def test_measured_delivery_follows_the_labels(self):
+        by_label: dict[str, list[SpanFeatures]] = {}
+        for path in sorted((SYNTHETIC_DATASET / "entries").glob("*.json")):
+            entry = json.loads(path.read_text(encoding="utf-8"))
+            features = recording_features(SYNTHETIC_DATASET / entry["audio_file"])
+            by_label.setdefault(entry["emotion_label"], []).append(features)
+
+        def mean(label: str, name: str) -> float:
+            return float(np.mean([getattr(f, name) for f in by_label[label]]))
+
+        def f0_span(label: str) -> float:
+            return float(np.mean([f.f0_range[1] - f.f0_range[0] for f in by_label[label]]))
+
+        assert mean("angry", "f0_mean") > 1.5 * mean("sad", "f0_mean")
+        assert mean("angry", "intensity_mean") > mean("sad", "intensity_mean") + 10
+        assert min(f.speech_rate for f in by_label["angry"]) > by_label["sad"][0].speech_rate
+        assert f0_span("joyful") > 1.5 * f0_span("neutral")
+        for label in ("calm", "sad"):
+            assert mean(label, "intensity_mean") < mean("neutral", "intensity_mean") - 3
+            assert mean(label, "f0_mean") < mean("neutral", "f0_mean")
+        assert max(by_label, key=lambda label: mean(label, "intensity_mean")) == "angry"
 
 
 # ---------------------------------------------------------------------------

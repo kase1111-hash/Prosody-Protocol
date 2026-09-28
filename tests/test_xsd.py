@@ -8,7 +8,9 @@ Covers:
   cannot drift) passes the schema and the validator, and round-trips
 - The spec's value vocabularies equal the schema's and the validator's
 - Appendix A's content models match what the schema and validator accept
-- The validator and the schema agree on a corpus of edge cases
+- The validator and the schema agree on a corpus of edge cases, including
+  implausible values, which only draw validator warnings (V33, spec 6.4)
+- Spec 6.4's plausible ranges are the limits the validator warns at
 """
 
 from __future__ import annotations
@@ -219,6 +221,49 @@ def test_named_rates_agree() -> None:
     assert set(validator_module._VALID_NAMED_RATES) == spec_values
 
 
+def _spec_section(heading: str) -> str:
+    text = SPEC_PATH.read_text(encoding="utf-8")
+    return text.split(f"### {heading}", 1)[1].split("\n---", 1)[0]
+
+
+def test_plausible_ranges_agree() -> None:
+    """Spec 6.4's table states the limits the validator warns at (V33)."""
+    table = _spec_section("6.4 Plausible Values")
+    v = validator_module
+    rows = {
+        "`pitch` (relative)": f"`-{v.MAX_PITCH_SEMITONES:g}st` to `+{v.MAX_PITCH_SEMITONES:g}st`,"
+        f" `{v.MIN_PITCH_PERCENT:g}%` to `+{v.MAX_PITCH_PERCENT:g}%`",
+        "`pitch` (absolute)": f"`{v.MIN_F0_HZ:g}Hz` to `{v.MAX_F0_HZ:g}Hz`",
+        "`volume`": f"`-{v.MAX_VOLUME_DB:g}dB` to `+{v.MAX_VOLUME_DB:g}dB`",
+        "`rate` (percentage)": f"`{v.MIN_RATE_PERCENT:g}%` to `{v.MAX_RATE_PERCENT:g}%`",
+        "`duration`": f"At most {v.MAX_PAUSE_MS} ms",
+        "`f0_mean`, `f0_range`, `f0_contour`": f"Every value {v.MIN_F0_HZ:g} to {v.MAX_F0_HZ:g} Hz",
+        "`speech_rate`": f"At most {v.MAX_SPEECH_RATE:g} syllables/second",
+        "`duration_ms`": f"At most {v.MAX_DURATION_MS} ms",
+    }
+    for attribute, limits in rows.items():
+        row = re.search(rf"^\| {re.escape(attribute)} \|[^|]*\|([^|]*)\|$", table, re.M)
+        assert row is not None, attribute
+        assert limits in row.group(1), attribute
+    # Two octaves, whichever the unit.
+    highest, lowest = (1 + v.MAX_PITCH_PERCENT / 100, 1 + v.MIN_PITCH_PERCENT / 100)
+    assert highest == pytest.approx(2 ** (v.MAX_PITCH_SEMITONES / 12))
+    assert lowest == pytest.approx(2 ** (-v.MAX_PITCH_SEMITONES / 12))
+
+
+def test_plausibility_is_a_should() -> None:
+    table = _spec_section("6.4 Plausible Values")
+    assert "Producers SHOULD NOT emit values outside the ranges below" in table
+    assert "validators SHOULD report them as warnings" in table
+    appendix = SPEC_PATH.read_text(encoding="utf-8").split("### D.2", 1)[1].split("### D.3")[0]
+    assert re.search(r"^\| S17 \| .*plausible ranges.* \| 6\.4 \|$", appendix, re.M)
+    # A long silence is real; the validator's advice for it is the spec's.
+    assert (
+        "producers SHOULD end the utterance at such a silence, or write it as a `<pause>` of "
+        f"at most {validator_module.MAX_PAUSE_MS} ms" in table
+    )
+
+
 # ---------------------------------------------------------------------------
 # Content models: spec Appendix A == XSD == validator
 # ---------------------------------------------------------------------------
@@ -318,6 +363,12 @@ AGREEMENT_CORPUS = [
     '<utterance><prosody x-formant-shift="+200Hz" x-nasality="0.7">x</prosody></utterance>',
     '<utterance foo="bar">x</utterance>',
     '<utterance xmlns:a="urn:a" a:note="n">x</utterance>',
+    # implausible but valid values (V33 warnings, spec 6.4)
+    '<utterance><prosody volume="+80dB" pitch="+40st" rate="1000%">x</prosody></utterance>',
+    '<utterance><prosody pitch="-150%">x</prosody><prosody pitch="0Hz">y</prosody></utterance>',
+    '<utterance>a<pause duration="600000"/>b</utterance>',
+    '<utterance><prosody f0_mean="0" f0_range="900-20" f0_contour="5,5000" speech_rate="50"'
+    ' duration_ms="999999999">x</prosody></utterance>',
     # structure
     "<iml><utterance>Hello</utterance><prosody>IMPORTANT</prosody></iml>",
     "<iml>stray text<utterance>x</utterance></iml>",
