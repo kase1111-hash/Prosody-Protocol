@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A customer on a support call. The second utterance is sarcastic: the
+     words are positive, but the drawn-out, falling-rising "wonderful" and
+     the pause before "Really" say the opposite. -->
+<iml version="0.1.0" language="en-US">
+  <utterance emotion="frustrated" confidence="0.82" speaker_id="customer">
+    I've been on hold for <prosody pitch="+8%" volume="+4dB">forty minutes</prosody>.
+  </utterance>
+  <utterance emotion="sarcastic" confidence="0.74" speaker_id="customer">
+    Oh, that's just
+    <prosody pitch="+15%" rate="80%" pitch_contour="fall-rise">wonderful</prosody>.
+    <pause duration="600"/>
+    Really <emphasis level="strong">great</emphasis> service.
+  </utterance>
+</iml>

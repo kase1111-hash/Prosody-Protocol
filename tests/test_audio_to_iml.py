@@ -10,6 +10,7 @@ Integration tests that:
 - IMLValidator accepts the output
 - Extended attributes appear only when include_extended=True
 - Every failure to read audio raises AudioProcessingError
+- A prosody profile sets matching utterances' emotion and is reported
 """
 
 from __future__ import annotations
@@ -33,9 +34,10 @@ parselmouth = pytest.importorskip("parselmouth")
 from prosody_protocol import audio_to_iml
 from prosody_protocol.assembler import DEFAULT_MIN_EMOTION_CONFIDENCE
 from prosody_protocol.audio_to_iml import PLACEHOLDER_TOKEN, AudioToIML, ConversionResult
-from prosody_protocol.exceptions import AudioProcessingError
+from prosody_protocol.exceptions import AudioProcessingError, ProfileError
 from prosody_protocol.models import Emphasis, IMLDocument, Pause, Prosody, Segment, Utterance
 from prosody_protocol.parser import IMLParser
+from prosody_protocol.profiles import ProfileLoader, ProsodyMapping, ProsodyProfile
 from prosody_protocol.prosody_analyzer import WordAlignment
 from prosody_protocol.validator import IMLValidator
 
@@ -153,6 +155,23 @@ class TestAudioToIMLInterface:
     def test_unknown_stt_mode_rejected(self) -> None:
         with pytest.raises(ValueError, match="stt"):
             AudioToIML(stt="deepgram")  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("bad", ["english (US)", "en_", "", 42])
+    def test_invalid_language_rejected(self, bad: Any) -> None:
+        """A tag the output could not carry (V29) is refused up front."""
+        with pytest.raises(ValueError, match="BCP 47"):
+            AudioToIML(language=bad)
+
+    def test_posix_language_is_normalised(self) -> None:
+        """"en_US" (as in $LANG) names en-US; it used to raise ValueError."""
+        converter = AudioToIML(language="en_US", stt="none")
+        assert converter.language == "en-US"
+        doc = converter.convert_to_doc(SPEECH, words=_words("speech_pauses"))
+        assert doc.language == "en-US"
+
+    @pytest.mark.parametrize("good", ["en", "en-US", "zh-Hant-TW", None])
+    def test_valid_languages(self, good: str | None) -> None:
+        assert AudioToIML(language=good).language == good
 
     @pytest.mark.parametrize("bad", [0, -5.0, float("nan")])
     def test_invalid_max_duration_rejected(self, bad: float) -> None:
@@ -279,6 +298,60 @@ class TestWords:
         """Control characters used to produce IML that does not parse."""
         with pytest.raises(ValueError, match="XML does not allow"):
             converter.convert(SPEECH, words=[WordAlignment(text, 250, 564)])
+
+    def test_overlapping_words_rejected_before_analysis(self, converter: AudioToIML) -> None:
+        """Words that each span the recording would have it analysed once per
+        word: a few kilobytes of timings used to cost minutes and gigabytes."""
+        words = [WordAlignment("x", i, 596_000) for i in range(200)]
+        with pytest.raises(ValueError, match=(
+            r"words\[1\] \('x', 1-596000 ms\) starts 595999 ms before words\[0\] "
+            r"\('x', 0-596000 ms\) ends; word timings may overlap by at most 500 ms"
+        )):
+            # Rejected before the audio is read: this file does not exist.
+            converter.convert(Path("/nonexistent/long.wav"), words=words)
+
+    def test_overlap_is_measured_from_the_latest_end(self, converter: AudioToIML) -> None:
+        """A long word followed by short ones overlaps them all."""
+        words = [
+            WordAlignment("long", 0, 3000),
+            WordAlignment("a", 2600, 2700),  # 400 ms before "long" ends: jitter
+            WordAlignment("b", 2400, 2450),  # sorted before "a"; 600 ms: too much
+        ]
+        with pytest.raises(ValueError, match=r"words\[2\] \('b'.*before words\[0\]"):
+            converter.convert(SPEECH, words=words)
+
+    def test_small_overlaps_are_accepted(
+        self, converter: AudioToIML, parser: IMLParser
+    ) -> None:
+        """Recognisers' word edges may overlap a little (up to 500 ms)."""
+        words = _words("speech_pauses")
+        words[0] = dataclasses.replace(words[0], end_ms=words[1].start_ms + 500)
+        assert audio_to_iml.MAX_WORD_OVERLAP_MS == 500
+        doc = converter.convert_to_doc(SPEECH, words=words)
+        assert parser.to_plain_text(doc) == "I told you to call me yesterday."
+        words[0] = dataclasses.replace(words[0], end_ms=words[1].start_ms + 501)
+        with pytest.raises(ValueError, match="overlap by at most 500 ms"):
+            converter.convert_to_doc(SPEECH, words=words)
+
+    def test_silence_over_a_minute_is_reported(
+        self, converter: AudioToIML, tmp_path: Path
+    ) -> None:
+        """Spec 6.4: a pause over 60000 ms is written as 60000 ms, with a warning."""
+        t = np.arange(int(0.5 * SR)) / SR
+        tone = 0.3 * np.sin(2 * np.pi * 150 * t)
+        audio = _write(tmp_path / "hold.wav", np.concatenate(
+            [tone, np.zeros(int(0.1 * SR)), tone, np.zeros(int(61.4 * SR)), tone]
+        ))
+        words = [WordAlignment("Please", 0, 500), WordAlignment("hold.", 600, 1100),
+                 WordAlignment("Thanks.", 62_500, 63_000)]
+        result = converter.convert_detailed(audio, words=words)
+        assert 60_000 in _pause_durations(result.document)
+        assert max(_pause_durations(result.document)) == 60_000
+        [note] = [w for w in result.warnings if "spec 6.4" in w]
+        assert note.startswith("The silence of ") and '<pause duration="60000"/>' in note
+        assert not [i for i in IMLValidator().validate(result.iml).issues if i.rule == "V33"]
+        with pytest.warns(UserWarning, match="spec 6.4"):
+            converter.convert(audio, words=words)
 
     def test_words_and_transcript_together_rejected(self, converter: AudioToIML) -> None:
         with pytest.raises(ValueError, match="not both"):
@@ -580,6 +653,101 @@ class TestCalibration:
         converter = AudioToIML(stt="none", calibration_audio="/nonexistent/me.wav")
         with pytest.raises(AudioProcessingError, match="not found"):
             converter.convert(SPEECH, words=_words("speech_pauses"))
+
+
+# ---------------------------------------------------------------------------
+# Prosody profiles (spec Section 7)
+# ---------------------------------------------------------------------------
+
+
+def _pause_profile(boost: float) -> ProsodyProfile:
+    """speech_pauses.wav pauses at 2 of its 6 word boundaries: pause_frequency high."""
+    return ProsodyProfile(
+        profile_version="0.1.0",
+        user_id="user_42",
+        description=None,
+        mappings=(ProsodyMapping({"pause_frequency": "high"}, "uncertain", boost),),
+    )
+
+
+class TestProfile:
+    def test_profile_sets_the_emotion_of_real_speech(self, parser: IMLParser) -> None:
+        words = _words("speech_pauses")
+        plain = AudioToIML(stt="none").convert_detailed(SPEECH, words=words)
+        assert plain.document.utterances[0].emotion is None
+        assert plain.profile_matches == ()
+
+        result = AudioToIML(stt="none", profile=_pause_profile(0.6)).convert_detailed(
+            SPEECH, words=words
+        )
+        utterance = result.document.utterances[0]
+        # One utterance and no calibration audio: the classifier has no
+        # baseline (confidence 0), so the boost alone is the confidence.
+        assert (utterance.emotion, utterance.confidence) == ("uncertain", 0.6)
+        # Profile use is shown by the pattern that matched, not the user_id.
+        assert 'x-profile="pause_frequency=high"' in result.iml
+        assert "user_42" not in result.iml
+        [match] = result.profile_matches
+        assert (match.utterance, match.pattern, match.applied) == (
+            0, {"pause_frequency": "high"}, True
+        )
+        assert match.observed["pause_frequency"] == "high"
+        # The markup itself does not change.
+        assert result.document.utterances[0].children == plain.document.utterances[0].children
+        assert IMLValidator().validate(result.iml).valid
+
+    def test_calibrated_confidence_is_boosted(self) -> None:
+        """With calibration the classifier has a baseline; its confidence plus
+        the boost (spec 7.2) is the utterance's confidence."""
+        kwargs: dict[str, Any] = {
+            "stt": "none",
+            "calibration_audio": AUDIO_DIR / "speech_calibration.wav",
+            "min_emotion_confidence": 0.0,
+        }
+        words = _words("speech_pauses")
+        base = AudioToIML(**kwargs).convert_to_doc(SPEECH, words=words).utterances[0]
+        assert base.confidence is not None
+        boosted = AudioToIML(**kwargs, profile=_pause_profile(0.2)).convert_detailed(
+            SPEECH, words=words
+        )
+        utterance = boosted.document.utterances[0]
+        assert utterance.emotion == "uncertain"
+        assert utterance.confidence == round(min(1.0, base.confidence + 0.2), 4)
+        assert f'confidence="{utterance.confidence}"' in boosted.iml
+
+    def test_abstention_applies_after_the_profile(self) -> None:
+        result = AudioToIML(stt="none", profile=_pause_profile(0.3)).convert_detailed(
+            SPEECH, words=_words("speech_pauses")
+        )
+        assert result.document.utterances[0].emotion is None
+        assert "x-profile" not in result.iml
+        [match] = result.profile_matches
+        assert (match.emotion, match.confidence, match.applied) == ("uncertain", 0.3, False)
+
+    def test_silence_gets_no_emotion_from_a_profile(self) -> None:
+        """Words over silence still match pause_frequency=high, but silence is
+        never given an emotion."""
+        words = [WordAlignment(w, i * 300, i * 300 + 100) for i, w in enumerate("abcd")]
+        result = AudioToIML(stt="none", profile=_pause_profile(0.9)).convert_detailed(
+            AUDIO_DIR / "silence_1s.wav", words=words
+        )
+        assert result.document.utterances[0].emotion is None
+        assert "x-profile" not in result.iml
+        assert result.profile_matches == ()
+
+    def test_fixture_profile_loads(self) -> None:
+        fixture = Path(__file__).parent / "fixtures" / "profiles" / "autism_spectrum.json"
+        profile = ProfileLoader().load(fixture)
+        converter = AudioToIML(stt="none", profile=profile)
+        assert converter.profile is profile
+        assert AudioToIML().profile is None
+        result = converter.convert_detailed(SPEECH, words=_words("speech_pauses"))
+        assert IMLValidator().validate(result.iml).valid
+
+    def test_invalid_profile_rejected(self) -> None:
+        bad = dataclasses.replace(_pause_profile(0.1), profile_version="one")
+        with pytest.raises(ProfileError, match="P1"):
+            AudioToIML(profile=bad)
 
 
 # ---------------------------------------------------------------------------

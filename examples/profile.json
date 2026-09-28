@@ -1,0 +1,28 @@
+{
+  "profile_version": "0.1.0",
+  "user_id": "example_user",
+  "description": "Monotone speech: a flat voice is this speaker's calm, excitement shows as fast speech rather than pitch movement, and sudden loud words are emphasis, not anger. Written together with the speaker, for example an autistic adult whose flat delivery is often misread as boredom or annoyance.",
+  "prosody_mappings": [
+    {
+      "pattern": {"pitch_contour": "flat", "rate": "fast"},
+      "interpretation": {"emotion": "joyful", "confidence_boost": 0.3}
+    },
+    {
+      "pattern": {"pitch_contour": "flat", "pause_frequency": "high"},
+      "interpretation": {"emotion": "uncertain", "confidence_boost": 0.1}
+    },
+    {
+      "pattern": {"volume": "spike"},
+      "interpretation": {"emotion": "sincere", "confidence_boost": 0.2}
+    },
+    {
+      "pattern": {"pitch_contour": "flat"},
+      "interpretation": {"emotion": "calm", "confidence_boost": 0.15}
+    }
+  ],
+  "metadata": {
+    "created_at": "2026-09-01T12:00:00Z",
+    "author": "Prosody Protocol examples",
+    "clinical_context": "Illustrative only; a real profile is written with, and reviewed by, its speaker."
+  }
+}

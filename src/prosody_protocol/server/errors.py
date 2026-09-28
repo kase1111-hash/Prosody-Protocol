@@ -3,7 +3,11 @@
 Errors the API reports itself are JSON objects ``{"error": <code>,
 "detail": <message>}``; IML validation failures add the offending
 ``issues``. Request bodies that do not match the endpoint's schema are
-FastAPI's standard 422 response (``{"detail": [...]}``).
+FastAPI's standard 422 response (``{"detail": [...]}``), as are unusable
+``words`` or ``transcript`` fields of audio-to-iml (``loc`` names the field).
+A rejected ``NaN`` or ``Infinity`` in a JSON body (which Python's JSON
+parser accepts) is echoed as the string ``"nan"`` or ``"inf"``, since JSON
+cannot hold it.
 
 ========  ============================  ==========================================
 Status    ``error``                     Cause
@@ -15,9 +19,12 @@ Status    ``error``                     Cause
                                         audio longer than PP_MAX_SYNTH_SECONDS).
 400       ``audio_processing_error``    The upload cannot be read or analysed,
                                         or is longer than PP_MAX_AUDIO_SECONDS.
-400       ``profile_error``             A prosody profile cannot be applied.
+400       ``profile_error``             The ``profile`` of audio-to-iml is not
+                                        valid JSON or not a valid prosody profile.
 413       ``payload_too_large``         The body exceeds PP_MAX_UPLOAD_MB.
-413       ``text_too_large``            A text field exceeds PP_MAX_TEXT_CHARS.
+413       ``text_too_large``            A text field exceeds PP_MAX_TEXT_CHARS, or
+                                        the ``words`` of audio-to-iml exceed
+                                        PP_MAX_WORDS_CHARS.
 415       ``unsupported_media_type``    audio-to-iml was not sent as
                                         multipart/form-data.
 429       ``rate_limited``              Over PP_RATE_LIMIT (see ``Retry-After``).
@@ -30,9 +37,12 @@ Status    ``error``                     Cause
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -159,8 +169,29 @@ _SDK_ERRORS: tuple[tuple[type[ProsodyProtocolError], str], ...] = (
 )
 
 
+def _json_safe(value: Any) -> Any:
+    """*value* with the non-finite floats JSON cannot hold as strings (``"nan"``)."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def install_error_handlers(app: FastAPI) -> None:
     """Register the handlers that turn exceptions into :class:`ErrorResponse` bodies."""
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # FastAPI's own handler, except that a rejected NaN or Infinity (which
+        # the error echoes as its input) no longer makes the response a 500.
+        return JSONResponse(
+            status_code=422, content={"detail": _json_safe(jsonable_encoder(exc.errors()))}
+        )
 
     @app.exception_handler(APIError)
     async def api_error(request: Request, exc: APIError) -> JSONResponse:

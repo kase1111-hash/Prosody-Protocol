@@ -10,9 +10,11 @@ import multiprocessing.connection
 import os
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
+from prosody_protocol._types import WordAlignment
 from prosody_protocol.audio_to_iml import AudioToIML, ConversionResult
 from prosody_protocol.exceptions import (
     AudioProcessingError,
@@ -25,6 +27,7 @@ from prosody_protocol.exceptions import (
     TrainingError,
 )
 from prosody_protocol.iml_to_audio import IMLToAudio
+from prosody_protocol.profiles import ProsodyProfile
 from prosody_protocol.validator import ValidationIssue
 
 T = TypeVar("T")
@@ -100,7 +103,21 @@ def call(func: Callable[..., T], *args: object) -> T:
         raise JobError.from_exception(exc) from None
 
 
-def _converter(language: str | None, max_duration_s: float) -> AudioToIML:
+@dataclass(frozen=True)
+class ConvertOptions:
+    """What an audio-to-iml request asks for, checked by the route.
+
+    Everything here is picklable: it is sent to a worker process.
+    """
+
+    max_duration_s: float
+    language: str | None = None
+    words: tuple[WordAlignment, ...] | None = None
+    transcript: str | None = None
+    profile: ProsodyProfile | None = None
+
+
+def _converter(options: ConvertOptions) -> AudioToIML:
     """A converter for one request, sharing this worker's Whisper models.
 
     AudioToIML keeps the models it loads in its private ``_whisper_models``
@@ -108,21 +125,25 @@ def _converter(language: str | None, max_duration_s: float) -> AudioToIML:
     language. Replacing the dict is checked by
     ``test_whisper_model_is_loaded_once_per_worker``.
     """
-    converter = AudioToIML(language=language, max_duration_s=max_duration_s)
+    converter = AudioToIML(
+        language=options.language,
+        max_duration_s=options.max_duration_s,
+        profile=options.profile,
+    )
     converter._whisper_models = _whisper_models
     return converter
 
 
-def convert_audio(
-    path: str, language: str | None, display_name: str, max_duration_s: float
-) -> ConversionResult:
+def convert_audio(path: str, display_name: str, options: ConvertOptions) -> ConversionResult:
     """Convert the audio file at *path*; errors name *display_name* instead.
 
-    Audio longer than *max_duration_s* seconds is rejected before it is
-    decoded in full.
+    Audio longer than ``options.max_duration_s`` seconds is rejected before
+    it is decoded in full.
     """
     try:
-        return _converter(language, max_duration_s).convert_detailed(path)
+        return _converter(options).convert_detailed(
+            path, words=options.words, transcript=options.transcript
+        )
     except AudioProcessingError as exc:
         # Name the client's file, not the server's temporary copy.
         message = str(exc).replace(str(Path(path).resolve()), display_name)

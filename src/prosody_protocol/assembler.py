@@ -12,13 +12,15 @@ Steps:
   3. Measure the speaker baseline: from calibration speech if given, else
      from the recording's utterances, each counting once
   4. Classify emotion per utterance relative to that baseline -- when there
-     is one to compare with (see :meth:`IMLAssembler.assemble`)
+     is one to compare with (see :meth:`IMLAssembler.assemble`). With a
+     prosody profile, a mapping that matches the utterance takes precedence
+     (spec 7.2); low-confidence results are then left out
   5. Wrap an utterance that is higher, louder, faster or slower as a whole
      (or has an unusual voice quality throughout) in one <prosody>
   6. Mark words that stand out: <emphasis> for words louder or higher than
      their neighbours, <prosody> for other offsets, pitch contours and
      unusual voice quality
-  7. Insert <pause> elements
+  7. Insert <pause> elements (at most :data:`MAX_PAUSE_MS`, one minute, long)
 
 Pitch and volume offsets are relative to the speaker baseline; inside an
 utterance-level ``<prosody>`` they are relative to the utterance's level,
@@ -38,7 +40,7 @@ from bisect import bisect_right
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, fields, replace
 from itertools import accumulate, groupby, pairwise
-from typing import Any
+from typing import Any, NamedTuple
 
 from ._types import PauseInterval, SpanFeatures, WordAlignment
 from .emotion_classifier import (
@@ -55,6 +57,7 @@ from .emotion_classifier import (
     _span_intensity,
     _span_rate,
 )
+from .exceptions import ProfileError
 from .models import (
     ChildNode,
     Emphasis,
@@ -62,6 +65,13 @@ from .models import (
     Pause,
     Prosody,
     Utterance,
+)
+from .profiles import (
+    ProfileApplier,
+    ProfileLoader,
+    ProsodyMapping,
+    ProsodyProfile,
+    categorize_features,
 )
 
 # ---------------------------------------------------------------------------
@@ -73,9 +83,24 @@ from .models import (
 #: below 0.5 as low).
 DEFAULT_MIN_EMOTION_CONFIDENCE = 0.5
 
+#: Extension attribute (spec 9.2) on each ``<utterance>`` whose emotion a
+#: prosody profile mapping set. This is how the output indicates profile
+#: usage (spec 7.2). Its value is the pattern of the mapping that matched,
+#: as ``key=value`` pairs sorted by key (``pitch_contour=flat rate=fast``):
+#: it explains the emotion without identifying the speaker (the profile's
+#: ``user_id`` is not written, since IML travels to logs, datasets and
+#: language models, and emotion data is personal data, spec 8.1).
+PROFILE_ATTRIBUTE = "x-profile"
+
 # Silences at least this long (ms) become <pause> elements; shorter ones are
 # ordinary speech rhythm (spec 3.3).
 MIN_PAUSE_MS = 200
+
+#: Longer silences are written as pauses of this length (ms), the longest
+#: that spec 6.4 recommends. A pause of a minute or more means the same as
+#: one of 2 s or more (spec 3.3), so nothing that matters is lost; the
+#: assembler reports each silence it shortened.
+MAX_PAUSE_MS = 60_000
 
 # In text without sentence punctuation, pauses at least this long (ms) also
 # end an utterance. Punctuated text is split at sentence ends only.
@@ -761,20 +786,23 @@ class _UtteranceBuilder:
         return Emphasis(level=emphasis, children=(inner,)), False
 
 
-def _baseline_is_established(
+def _typical_utterances(
     utterances: list[list[SpanFeatures]], baseline: SpeakerBaseline
-) -> bool:
-    """Whether a recording shows its speaker's typical prosody.
+) -> list[int] | None:
+    """The utterances that show a recording's typical prosody, if it has one.
 
-    That takes at least :data:`MIN_BASELINE_UTTERANCES` measured utterances,
-    most of which lie within :data:`UTTERANCE_PITCH_ST` and
-    :data:`UTTERANCE_VOLUME_DB` of the baseline -- a level that the other
-    utterances can be said to deviate from. Two utterances that differ, or
-    a recording that swings between levels, do not show which level is the
-    speaker's usual one.
+    A recording shows its speaker's typical prosody when it has at least
+    :data:`MIN_BASELINE_UTTERANCES` measured utterances, most of which lie
+    within :data:`UTTERANCE_PITCH_ST` and :data:`UTTERANCE_VOLUME_DB` of the
+    baseline -- a level that the other utterances can be said to deviate
+    from. Returns the indices of those typical utterances, or ``None`` when
+    there are too few of them: two utterances that differ, or a recording
+    that swings between levels, do not show which level is the speaker's
+    usual one.
     """
-    measured = typical = 0
-    for spans in utterances:
+    measured = 0
+    typical: list[int] = []
+    for index, spans in enumerate(utterances):
         f0 = _median(_span_f0(f) for f in spans)
         intensity = _median(_span_intensity(f) for f in spans)
         if f0 is None and intensity is None:
@@ -790,13 +818,123 @@ def _baseline_is_established(
             or baseline.intensity_mean is None
             or abs(intensity - baseline.intensity_mean) < UTTERANCE_VOLUME_DB
         )
-        typical += pitch_typical and volume_typical
-    return measured >= MIN_BASELINE_UTTERANCES and 2 * typical > measured
+        if pitch_typical and volume_typical:
+            typical.append(index)
+    if measured >= MIN_BASELINE_UTTERANCES and 2 * len(typical) > measured:
+        return typical
+    return None
+
+
+def _best_mapping(profile: ProsodyProfile, observed: dict[str, str]) -> ProsodyMapping | None:
+    """The mapping :class:`ProfileApplier` applies to *observed*, if any.
+
+    That is the most specific one (most pattern keys) whose pattern
+    *observed* matches entirely; the first in the profile wins a tie.
+    """
+    best: ProsodyMapping | None = None
+    for mapping in profile.mappings:
+        if all(observed.get(key) == value for key, value in mapping.pattern.items()) and (
+            best is None or len(mapping.pattern) > len(best.pattern)
+        ):
+            best = mapping
+    return best
+
+
+# Characters outside the XML 1.0 ``Char`` production cannot appear in IML.
+_XML_INVALID_CHARS = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+
+
+def _checked_profile(profile: object) -> ProsodyProfile:
+    """Check that *profile* is a valid :class:`ProsodyProfile` whose emotions IML can hold."""
+    if not isinstance(profile, ProsodyProfile):
+        raise TypeError(f"profile must be a ProsodyProfile, not {type(profile).__name__}")
+    result = ProfileLoader().validate(profile)
+    if not result.valid:
+        problems = "; ".join(f"{i.rule}: {i.message}" for i in result.errors)
+        raise ProfileError(f"Prosody profile {profile.user_id!r} is invalid: {problems}")
+    for index, mapping in enumerate(profile.mappings):
+        # Checked now, not when a mapping first applies after a long analysis.
+        if _XML_INVALID_CHARS.search(mapping.interpretation_emotion):
+            raise ProfileError(
+                f"Prosody profile {profile.user_id!r} is invalid: prosody_mappings[{index}]"
+                f".interpretation.emotion {mapping.interpretation_emotion!r} contains "
+                "characters that XML does not allow"
+            )
+    return profile
+
+
+def _profile_marker(pattern: dict[str, str]) -> str:
+    """The :data:`PROFILE_ATTRIBUTE` value for a mapping's *pattern*."""
+    return " ".join(f"{key}={pattern[key]}" for key in sorted(pattern))
+
+
+def _cap_pauses(words: list[_Word], boundary_pauses: list[int]) -> list[str]:
+    """Shorten pauses longer than :data:`MAX_PAUSE_MS` in place; returns a note if any were."""
+    long = [(i, d) for i, d in enumerate(boundary_pauses) if d > MAX_PAUSE_MS]
+    if not long:
+        return []
+    for boundary, _ in long:
+        boundary_pauses[boundary] = MAX_PAUSE_MS
+    boundary, longest = max(long, key=lambda item: item[1])
+    if len(long) == 1:
+        what = f"The silence of {longest / 1000:.1f} s after {words[boundary].text!r} is"
+    else:
+        what = (
+            f"{len(long)} silences longer than {MAX_PAUSE_MS // 1000} s (the longest "
+            f"{longest / 1000:.1f} s, after {words[boundary].text!r}) are"
+        )
+    return [
+        f'{what} written as <pause duration="{MAX_PAUSE_MS}"/>, the longest pause spec 6.4 '
+        "recommends."
+    ]
+
+
+class _Assembly(NamedTuple):
+    """What :meth:`IMLAssembler._assemble` returns."""
+
+    document: IMLDocument
+    #: The profile mappings that matched, in utterance order.
+    matches: list[ProfileMatch]
+    #: Human-readable notes on output that was changed to fit the spec.
+    notes: list[str]
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProfileMatch:
+    """A prosody profile mapping that matched an utterance (spec Section 7).
+
+    Attributes
+    ----------
+    utterance:
+        Index of the utterance in the document's ``utterances``.
+    observed:
+        The utterance's prosody in the profile vocabulary, as
+        :func:`~prosody_protocol.profiles.categorize_features` described it.
+    pattern:
+        The pattern of the mapping that matched (the most specific one).
+    emotion:
+        The mapping's interpretation.
+    confidence:
+        The classifier's confidence plus the mapping's ``confidence_boost``,
+        capped at 1.0 (spec 7.2).
+    applied:
+        Whether the utterance carries this emotion. It does not when
+        *confidence* is below the assembler's ``min_emotion_confidence``:
+        a profile adjusts the classifier's estimate, and cannot make it
+        confident where the classifier had little evidence.
+    """
+
+    utterance: int
+    observed: dict[str, str]
+    pattern: dict[str, str]
+    emotion: str
+    confidence: float
+    applied: bool
 
 
 class IMLAssembler:
@@ -821,6 +959,26 @@ class IMLAssembler:
     min_emotion_confidence:
         Utterances whose emotion is classified with lower confidence carry no
         ``emotion`` or ``confidence`` attribute. ``0.0`` keeps every label.
+        It applies after a prosody profile has adjusted the classification.
+    profile:
+        Optional prosody profile of the speaker (spec Section 7). Each
+        utterance is described in the profile vocabulary with
+        :func:`~prosody_protocol.profiles.categorize_features`, measured
+        against the speaker baseline (see :meth:`assemble`). When a mapping
+        matches, it takes precedence over the default classification (spec
+        7.2): the utterance's emotion is the mapping's interpretation and its
+        confidence the classifier's confidence plus ``confidence_boost``,
+        capped at 1.0. Utterances whose emotion a mapping set carry
+        :data:`PROFILE_ATTRIBUTE` (an extension attribute per spec 9.2), such
+        as ``x-profile="pitch_contour=flat rate=fast"``: the pattern that
+        matched, which indicates profile usage to downstream consumers
+        without naming the speaker. An invalid profile, or one whose
+        emotions hold characters XML does not allow, raises
+        :class:`~prosody_protocol.exceptions.ProfileError`.
+
+    Silences longer than :data:`MAX_PAUSE_MS` (one minute) are written as
+    pauses of that length, the longest spec 6.4 recommends; :meth:`assemble`
+    warns when it shortens one.
     """
 
     def __init__(
@@ -828,6 +986,8 @@ class IMLAssembler:
         emotion_classifier: EmotionClassifier | None = None,
         include_extended: bool = False,
         min_emotion_confidence: float = DEFAULT_MIN_EMOTION_CONFIDENCE,
+        *,
+        profile: ProsodyProfile | None = None,
     ) -> None:
         if not 0.0 <= min_emotion_confidence <= 1.0:
             raise ValueError(
@@ -838,6 +998,12 @@ class IMLAssembler:
         )
         self._include_extended = include_extended
         self._min_emotion_confidence = min_emotion_confidence
+        self._profile = None if profile is None else _checked_profile(profile)
+
+    @property
+    def profile(self) -> ProsodyProfile | None:
+        """The speaker's prosody profile, if one is applied."""
+        return self._profile
 
     def assemble(
         self,
@@ -881,12 +1047,38 @@ class IMLAssembler:
             ``("neutral", 0.0)``). A recording that is a single utterance
             thus gets no utterance-level offsets and no emotion, and two
             utterances that differ are each marked relative to the midpoint
-            between them, with no emotion.
+            between them, with no emotion. A prosody profile is matched
+            against the same baseline: the reference features, or the
+            recording's typical utterances, or none.
 
         Returns
         -------
         IMLDocument
+
+        Warns
+        -----
+        UserWarning
+            A silence longer than :data:`MAX_PAUSE_MS` was written as a
+            pause of that length.
         """
+        assembly = self._assemble(
+            alignments, features, pauses, language, reference_features=reference_features
+        )
+        for note in assembly.notes:
+            warnings.warn(note, UserWarning, stacklevel=2)
+        return assembly.document
+
+    def _assemble(
+        self,
+        alignments: Sequence[WordAlignment],
+        features: Sequence[SpanFeatures],
+        pauses: Sequence[PauseInterval],
+        language: str | None = None,
+        *,
+        reference_features: Sequence[SpanFeatures] | None = None,
+    ) -> _Assembly:
+        """:meth:`assemble`, also returning the profile mappings that matched
+        and notes on what was changed to fit the spec."""
         paired = _pair_features(alignments, features)
         words = [
             _Word(text=a.word.strip(), alignment=a, features=f)
@@ -894,24 +1086,34 @@ class IMLAssembler:
             if a.word.strip()
         ]
         if not words:
-            return IMLDocument(utterances=(Utterance(),), version="0.1.0", language=language)
+            empty = IMLDocument(utterances=(Utterance(),), version="0.1.0", language=language)
+            return _Assembly(empty, [], [])
 
         _mark_spacing(words)
         boundary_pauses = _resolve_pauses(words, pauses)
+        notes = _cap_pauses(words, boundary_pauses)
         groups = _group_into_utterances(words, boundary_pauses)
         group_spans = [
             [f for i in indices if (f := words[i].features) is not None] for _, indices in groups
         ]
+        profile_baseline: list[SpanFeatures] | None
         if reference_features:
             baseline = SpeakerBaseline.from_features(reference_features)
             emotion_baseline = baseline
+            profile_baseline = list(reference_features)
         else:
             baseline = SpeakerBaseline.from_utterances(group_spans)
-            established = _baseline_is_established(group_spans, baseline)
-            emotion_baseline = baseline if established else SpeakerBaseline()
+            typical = _typical_utterances(group_spans, baseline)
+            emotion_baseline = baseline if typical is not None else SpeakerBaseline()
+            profile_baseline = (
+                None if typical is None else [f for i in typical for f in group_spans[i]]
+            )
 
         utterances: list[Utterance] = []
-        for (leading_pause, indices), spans in zip(groups, group_spans, strict=True):
+        matches: list[ProfileMatch] = []
+        for index, ((leading_pause, indices), spans) in enumerate(
+            zip(groups, group_spans, strict=True)
+        ):
             builder = _UtteranceBuilder(
                 [words[i] for i in indices],
                 boundary_pauses[indices[0]: indices[-1]],
@@ -919,27 +1121,54 @@ class IMLAssembler:
                 self._include_extended,
             )
             emotion, confidence = self._classify(spans, emotion_baseline)
+            extra: tuple[tuple[str, str], ...] = ()
+            if self._profile is not None:
+                observed = categorize_features(spans, pauses, baseline=profile_baseline)
+                mapping = _best_mapping(self._profile, observed)
+                if mapping is not None:
+                    emotion, confidence = ProfileApplier().apply(
+                        self._profile, observed, emotion, confidence or 0.0
+                    )
+                    # Rounded, so 0.38 + 0.2 is written as 0.58.
+                    confidence = round(min(1.0, max(0.0, confidence)), 4)
+                    applied = confidence >= self._min_emotion_confidence
+                    matches.append(ProfileMatch(
+                        utterance=index,
+                        observed=observed,
+                        pattern=dict(mapping.pattern),
+                        emotion=emotion,
+                        confidence=confidence,
+                        applied=applied,
+                    ))
+                    if applied:
+                        extra = ((PROFILE_ATTRIBUTE, _profile_marker(mapping.pattern)),)
+            confident = confidence is not None and confidence >= self._min_emotion_confidence
             utterances.append(Utterance(
                 children=builder.build(leading_pause),
-                emotion=emotion,
-                confidence=confidence,
+                emotion=emotion if confident else None,
+                confidence=confidence if confident else None,
+                extra_attributes=extra,
             ))
 
-        return IMLDocument(
+        document = IMLDocument(
             utterances=tuple(utterances),
             version="0.1.0",
             language=language,
         )
+        return _Assembly(document, matches, notes)
 
     def _classify(
         self, spans: list[SpanFeatures], baseline: SpeakerBaseline
-    ) -> tuple[str | None, float | None]:
-        """The utterance's emotion and confidence, or ``(None, None)`` when not confident."""
+    ) -> tuple[str, float | None]:
+        """The classifier's emotion and confidence (clamped to [0, 1]) for an utterance.
+
+        A non-finite confidence is ``None``: the utterance gets no emotion
+        unless a profile mapping supplies one (from a confidence of 0).
+        """
         if isinstance(self._classifier, BaselineAwareEmotionClassifier):
             emotion, confidence = self._classifier.classify_relative(spans, baseline)
         else:
             emotion, confidence = self._classifier.classify(spans)
-        if not math.isfinite(confidence) or confidence < self._min_emotion_confidence:
-            return None, None
+        if not math.isfinite(confidence):
+            return emotion, None
         return emotion, min(1.0, max(0.0, confidence))
-

@@ -1,0 +1,141 @@
+{
+  "metadata": {
+    "channels": 1,
+    "models": [
+      "example"
+    ]
+  },
+  "results": {
+    "channels": [
+      {
+        "alternatives": [
+          {
+            "transcript": "I read the list. The room is booked. I have the slides. And we got the grant!",
+            "confidence": 1.0,
+            "words": [
+              {
+                "word": "i",
+                "start": 0.15,
+                "end": 0.431,
+                "confidence": 1.0,
+                "punctuated_word": "I"
+              },
+              {
+                "word": "read",
+                "start": 0.461,
+                "end": 0.839,
+                "confidence": 1.0,
+                "punctuated_word": "read"
+              },
+              {
+                "word": "the",
+                "start": 0.869,
+                "end": 1.124,
+                "confidence": 1.0,
+                "punctuated_word": "the"
+              },
+              {
+                "word": "list",
+                "start": 1.154,
+                "end": 1.518,
+                "confidence": 1.0,
+                "punctuated_word": "list."
+              },
+              {
+                "word": "the",
+                "start": 1.818,
+                "end": 2.073,
+                "confidence": 1.0,
+                "punctuated_word": "The"
+              },
+              {
+                "word": "room",
+                "start": 2.103,
+                "end": 2.515,
+                "confidence": 1.0,
+                "punctuated_word": "room"
+              },
+              {
+                "word": "is",
+                "start": 2.545,
+                "end": 2.854,
+                "confidence": 1.0,
+                "punctuated_word": "is"
+              },
+              {
+                "word": "booked",
+                "start": 2.884,
+                "end": 3.243,
+                "confidence": 1.0,
+                "punctuated_word": "booked."
+              },
+              {
+                "word": "i",
+                "start": 3.543,
+                "end": 3.824,
+                "confidence": 1.0,
+                "punctuated_word": "I"
+              },
+              {
+                "word": "have",
+                "start": 3.854,
+                "end": 4.264,
+                "confidence": 1.0,
+                "punctuated_word": "have"
+              },
+              {
+                "word": "the",
+                "start": 4.294,
+                "end": 4.548,
+                "confidence": 1.0,
+                "punctuated_word": "the"
+              },
+              {
+                "word": "slides",
+                "start": 4.578,
+                "end": 5.116,
+                "confidence": 1.0,
+                "punctuated_word": "slides."
+              },
+              {
+                "word": "and",
+                "start": 5.416,
+                "end": 5.613,
+                "confidence": 1.0,
+                "punctuated_word": "And"
+              },
+              {
+                "word": "we",
+                "start": 5.623,
+                "end": 5.756,
+                "confidence": 1.0,
+                "punctuated_word": "we"
+              },
+              {
+                "word": "got",
+                "start": 5.766,
+                "end": 5.933,
+                "confidence": 1.0,
+                "punctuated_word": "got"
+              },
+              {
+                "word": "the",
+                "start": 5.943,
+                "end": 6.043,
+                "confidence": 1.0,
+                "punctuated_word": "the"
+              },
+              {
+                "word": "grant",
+                "start": 6.053,
+                "end": 6.297,
+                "confidence": 1.0,
+                "punctuated_word": "grant!"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

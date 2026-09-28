@@ -4,6 +4,7 @@ Endpoints:
   POST /v1/convert/audio-to-iml
   POST /v1/convert/text-to-iml
   POST /v1/convert/iml-to-ssml
+  POST /v1/convert/iml-to-prompt
   POST /v1/synthesize
   POST /v1/validate
   GET  /v1/health
@@ -66,6 +67,7 @@ class Limits(BaseModel):
 
     max_upload_bytes: int
     max_text_chars: int
+    max_words_chars: int
     max_synth_seconds: float
     max_audio_seconds: float
     rate_limit_per_minute: int = Field(description="0 means unlimited.")
@@ -104,6 +106,7 @@ async def health(settings: SettingsDep) -> HealthResponse:
         limits=Limits(
             max_upload_bytes=settings.max_upload_bytes,
             max_text_chars=settings.max_text_chars,
+            max_words_chars=settings.max_words_chars,
             max_synth_seconds=settings.max_synth_seconds,
             max_audio_seconds=settings.max_audio_seconds,
             rate_limit_per_minute=settings.rate_limit_per_minute,

@@ -1,7 +1,8 @@
-"""Conversion endpoints: audio-to-iml, text-to-iml, iml-to-ssml."""
+"""Conversion endpoints: audio-to-iml, text-to-iml, iml-to-ssml, iml-to-prompt."""
 
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 from pathlib import Path, PurePath
@@ -12,9 +13,22 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 
-from prosody_protocol import IMLParser, IMLToSSML, TextToIML
+from prosody_protocol import IMLParser, IMLToSSML, IMLValidator, TextToIML
+from prosody_protocol._types import WordAlignment
+from prosody_protocol.alignment import parse_word_timings
+from prosody_protocol.assembler import _checked_profile
+from prosody_protocol.audio_to_iml import MAX_WORD_OVERLAP_MS, _checked_text, _checked_words
+from prosody_protocol.exceptions import ConversionError, ProfileError
+from prosody_protocol.llm import (
+    DEFAULT_MIN_CONFIDENCE,
+    SYSTEM_PROMPT,
+    build_messages,
+    to_llm_context,
+)
+from prosody_protocol.profiles import ProfileLoader, ProsodyProfile
 
 from .. import _worker
+from ..config import Settings
 from ..deps import JobsDep, SettingsDep, check_text_length
 from ..errors import BUSY_RESPONSES, ERROR_RESPONSES, APIError, ErrorResponse
 
@@ -58,27 +72,111 @@ class IMLToSSMLRequest(BaseModel):
     )
 
 
+class IMLToPromptRequest(BaseModel):
+    iml: str
+    min_confidence: float = Field(
+        default=DEFAULT_MIN_CONFIDENCE,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Emotions with lower confidence are described as \"emotion not reliably "
+            'detected" instead of being named (spec 6.2 treats confidence below 0.5 as low).'
+        ),
+    )
+    include_numbers: bool = Field(
+        default=False,
+        description=(
+            "Also give measured values: pitch and volume offsets, rate percentages, "
+            "extended attributes, exact pause lengths."
+        ),
+    )
+    instruction: str | None = Field(
+        default=None,
+        description=(
+            'Optional task for the model, appended to the user message after the '
+            'transcript (e.g. "Summarize the caller\'s problem."). Without it the model '
+            "answers the speaker."
+        ),
+    )
+    strict: bool = Field(
+        default=False,
+        description=(
+            "Reject documents with validation errors (400 validation_error, listing the "
+            "issues). By default the document is described as spec section 6.2 asks of "
+            "consumers: invalid attribute values are ignored."
+        ),
+    )
+
+
 class ConvertResponse(BaseModel):
     iml: str
     plain_text: str | None = None
 
 
+class ProfileMatchResponse(BaseModel):
+    """A prosody profile mapping that matched an utterance (spec Section 7)."""
+
+    utterance: int = Field(description="Index of the utterance in the document (0-based).")
+    observed: dict[str, str] = Field(
+        description="The utterance's prosody in the profile vocabulary (pitch, rate, ...)."
+    )
+    pattern: dict[str, str] = Field(description="The pattern of the mapping that matched.")
+    emotion: str = Field(description="The mapping's interpretation.")
+    confidence: float = Field(
+        description="The classifier's confidence plus the mapping's confidence_boost (<= 1)."
+    )
+    applied: bool = Field(
+        description=(
+            "Whether the utterance carries this emotion (with x-profile). False when the "
+            "confidence is below 0.5: the classifier had too little evidence."
+        )
+    )
+
+
 class AudioToIMLResponse(ConvertResponse):
     transcript_source: Literal["words", "transcript", "whisper", "none"] = Field(
         description=(
-            'Where the words came from: "whisper" (built-in speech recognition) or '
-            '"none" (no speech recognition on this server: each stretch of speech is a '
-            '"[speech]" placeholder).'
+            'Where the words came from: "words" (the words field), "transcript" (the '
+            'transcript field: prosody is described for the whole utterance only), '
+            '"whisper" (built-in speech recognition) or "none" (no speech recognition on '
+            'this server: each stretch of speech is a "[speech]" placeholder).'
         ),
     )
     warnings: list[str] = Field(
         default_factory=list,
         description="Anything that degraded the output, such as placeholder text.",
     )
+    profile_matches: list[ProfileMatchResponse] = Field(
+        default_factory=list,
+        description=(
+            "With a profile: the utterances one of its mappings matched (spec 7.2 asks "
+            "that profile usage be reported). Utterances whose emotion a mapping set "
+            'also carry x-profile in the IML, with the pattern that matched (e.g. '
+            'x-profile="pitch_contour=flat rate=fast"); the user_id is not written.'
+        ),
+    )
 
 
 class SSMLResponse(BaseModel):
     ssml: str
+
+
+class PromptResponse(BaseModel):
+    context: str = Field(
+        description=(
+            "The document as an annotated transcript: *stressed* words, prosody notes in "
+            "parentheses, [pause 0.8s] markers and a Delivery: line per utterance."
+        )
+    )
+    system_prompt: str = Field(
+        description="Explains the notation, and the limits of prosodic cues, to the model."
+    )
+    messages: list[dict[str, str]] = Field(
+        description=(
+            "Chat messages for any chat-completion API: the system prompt, then a user "
+            "message with the transcript in <transcript> tags (and the instruction)."
+        )
+    )
 
 
 _UNSUPPORTED_MEDIA: dict[int | str, dict[str, Any]] = {
@@ -118,6 +216,104 @@ def _upload_suffix(filename: str | None) -> str:
     return suffix.lower() if _SUFFIX_RE.fullmatch(suffix) else ""
 
 
+def _field_error(name: str, message: str) -> RequestValidationError:
+    """A 422 response naming the form field *name*."""
+    return RequestValidationError(
+        [{"type": "value_error", "loc": ("body", name), "msg": message}]
+    )
+
+
+def _too_large(name: str, size: str, limit: int, setting: str) -> APIError:
+    return APIError(
+        413,
+        "text_too_large",
+        f"Field {name!r} has {size}; the maximum is {limit} ({setting}).",
+    )
+
+
+async def _field_bytes(value: UploadFile, name: str, limit: int, setting: str) -> bytes:
+    """The contents of a form field sent as a file, refusing more than *limit* bytes."""
+    data = await value.read(limit + 1)
+    await value.close()
+    if len(data) > limit:
+        raise _too_large(name, f"more than {limit} bytes", limit, setting)
+    return data
+
+
+async def _field_text(
+    value: UploadFile | str | None, name: str, limit: int, setting: str
+) -> str | None:
+    """A text form field, sent as a field or as a file (UTF-8), within *limit*."""
+    if value is None or isinstance(value, str):
+        if value is not None and len(value) > limit:
+            raise _too_large(name, f"{len(value)} characters", limit, setting)
+        return value
+    data = await _field_bytes(value, name, limit, setting)
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise _field_error(name, f"{name} must be UTF-8 text: {exc.reason}") from None
+
+
+async def _words_field(
+    value: UploadFile | str | None, settings: Settings
+) -> tuple[WordAlignment, ...] | None:
+    """The ``words`` field parsed as word timings (never read as a file name)."""
+    if value is None:
+        return None
+    limit, setting = settings.max_words_chars, "PP_MAX_WORDS_CHARS"
+    if isinstance(value, str):
+        if len(value) > limit:
+            raise _too_large("words", f"{len(value)} characters", limit, setting)
+        raw: str | bytes = value
+    else:
+        # parse_word_timings detects UTF-8, UTF-16 and UTF-32 in bytes.
+        raw = await _field_bytes(value, "words", limit, setting)
+    try:
+        # Up to PP_MAX_WORDS_CHARS of JSON: parsed off the event loop.
+        return await run_in_threadpool(_parse_words, raw)
+    except (ConversionError, ValueError, TypeError) as exc:
+        raise _field_error("words", f"Invalid word timings: {exc}") from None
+
+
+def _parse_words(raw: str | bytes) -> tuple[WordAlignment, ...]:
+    return tuple(_checked_words(parse_word_timings(raw)))
+
+
+def _reject_constant(name: str) -> float:
+    raise ProfileError(f"Invalid JSON in profile: {name} is not a JSON number")
+
+
+def _profile_field(text: str | None) -> ProsodyProfile | None:
+    """The ``profile`` field loaded and validated; errors are ProfileError (400)."""
+    if text is None:
+        return None
+    try:
+        data = json.loads(text, parse_constant=_reject_constant)
+    except (ValueError, RecursionError) as exc:  # JSONDecodeError, or nested too deeply
+        raise ProfileError(f"Invalid JSON in profile: {exc}") from None
+    return _checked_profile(ProfileLoader().load_json(data))
+
+
+_WORDS_DESCRIPTION = (
+    "Optional word timings from any speech recogniser, as JSON text or a JSON file: "
+    "openai-whisper, faster-whisper or WhisperX output, the OpenAI transcription API's "
+    "verbose_json, Deepgram, AssemblyAI, Google Cloud Speech-to-Text, or a list of "
+    '{"word", "start_ms", "end_ms"} records. The words become the transcript and no '
+    "speech recognition runs. Invalid timings, including words that overlap by more "
+    f"than {MAX_WORD_OVERLAP_MS} ms, are a 422."
+)
+_TRANSCRIPT_DESCRIPTION = (
+    "Optional plain text of the speech, without timings (not together with words). "
+    "No speech recognition runs; prosody is described for the utterance as a whole."
+)
+_PROFILE_DESCRIPTION = (
+    "Optional prosody profile of the speaker (spec Section 7), as JSON text or a JSON "
+    "file. A mapping that matches an utterance sets its emotion (see profile_matches). "
+    "An invalid profile is a 400 profile_error."
+)
+
+
 @router.post(
     "/audio-to-iml",
     response_model=AudioToIMLResponse,
@@ -140,6 +336,11 @@ async def audio_to_iml(
         str | None,
         Form(pattern=_LANGUAGE_PATTERN, max_length=35, description=_LANGUAGE_DESCRIPTION),
     ] = None,
+    words: Annotated[UploadFile | str | None, Form(description=_WORDS_DESCRIPTION)] = None,
+    transcript: Annotated[
+        UploadFile | str | None, Form(description=_TRANSCRIPT_DESCRIPTION)
+    ] = None,
+    profile: Annotated[UploadFile | str | None, Form(description=_PROFILE_DESCRIPTION)] = None,
     language_query: Annotated[
         str | None,
         Query(
@@ -152,9 +353,12 @@ async def audio_to_iml(
 ) -> AudioToIMLResponse:
     """Convert an uploaded audio file to IML.
 
-    Send multipart/form-data with the file in ``audio`` and, optionally, a
-    ``language`` field. Unreadable audio, or audio longer than the server's
-    PP_MAX_AUDIO_SECONDS, is a 400 audio_processing_error.
+    Send multipart/form-data with the file in ``audio`` and, optionally,
+    ``language``, ``words`` (word timings from any speech recogniser) or
+    ``transcript``, and a prosody ``profile``. ``words``, ``transcript`` and
+    ``profile`` may be sent as text fields or as files. Unreadable audio, or
+    audio longer than the server's PP_MAX_AUDIO_SECONDS, is a 400
+    audio_processing_error.
     """
     # BCP 47 tags are case-insensitive: "FR-fr" and "fr-FR" agree.
     if language and language_query and language.lower() != language_query.lower():
@@ -174,19 +378,51 @@ async def audio_to_iml(
     language = language or language_query or None
     display_name = repr(PurePath(audio.filename).name) if audio.filename else "upload"
 
+    # Check the other fields before taking a worker's place.
+    transcript_text = await _field_text(
+        transcript, "transcript", settings.max_text_chars, "PP_MAX_TEXT_CHARS"
+    )
+    profile_text = await _field_text(
+        profile, "profile", settings.max_text_chars, "PP_MAX_TEXT_CHARS"
+    )
+    alignments = await _words_field(words, settings)
+    if alignments is not None and transcript_text is not None:
+        raise _field_error("transcript", "Send either words or transcript, not both.")
+    if transcript_text is not None:
+        try:
+            _checked_text(transcript_text, "transcript")
+        except ValueError as exc:
+            raise _field_error("transcript", str(exc)) from None
+    options = _worker.ConvertOptions(
+        max_duration_s=settings.max_audio_seconds,
+        language=language,
+        words=alignments,
+        transcript=transcript_text,
+        profile=_profile_field(profile_text),
+    )
+
     with jobs.admit(), tempfile.TemporaryDirectory(prefix="prosody-protocol-upload-") as tmp:
         path = Path(tmp) / f"upload{_upload_suffix(audio.filename)}"
         await run_in_threadpool(_save_upload, audio.file, path, settings.max_upload_bytes)
         # Drop the server's first copy of the upload while the job waits for a worker.
         await audio.close()
-        result = await jobs.run(
-            _worker.convert_audio, str(path), language, display_name, settings.max_audio_seconds
-        )
+        result = await jobs.run(_worker.convert_audio, str(path), display_name, options)
     return AudioToIMLResponse(
         iml=result.iml,
         plain_text=IMLParser().to_plain_text(result.document),
         transcript_source=result.transcript_source,
         warnings=list(result.warnings),
+        profile_matches=[
+            ProfileMatchResponse(
+                utterance=m.utterance,
+                observed=m.observed,
+                pattern=m.pattern,
+                emotion=m.emotion,
+                confidence=m.confidence,
+                applied=m.applied,
+            )
+            for m in result.profile_matches
+        ],
     )
 
 
@@ -209,3 +445,28 @@ def iml_to_ssml(request: IMLToSSMLRequest, settings: SettingsDep) -> SSMLRespons
     check_text_length(settings, iml=request.iml)
     converter = IMLToSSML(strict=request.strict)
     return SSMLResponse(ssml=converter.convert(request.iml))
+
+
+@router.post("/iml-to-prompt", response_model=PromptResponse, responses=ERROR_RESPONSES)
+def iml_to_prompt(request: IMLToPromptRequest, settings: SettingsDep) -> PromptResponse:
+    """Describe IML for a large language model.
+
+    Returns the document as an annotated transcript (``context``), the
+    system prompt that explains its notation, and both as chat
+    ``messages`` for any chat-completion API. Malformed IML is a 400
+    iml_parse_error; with ``strict``, a document with validation errors is a
+    400 validation_error.
+    """
+    check_text_length(settings, iml=request.iml, instruction=request.instruction)
+    doc = IMLParser().parse(request.iml)
+    if request.strict:
+        IMLValidator().validate(request.iml).raise_for_errors()
+    options: dict[str, Any] = {
+        "min_confidence": request.min_confidence,
+        "include_numbers": request.include_numbers,
+    }
+    return PromptResponse(
+        context=to_llm_context(doc, **options),
+        system_prompt=SYSTEM_PROMPT,
+        messages=build_messages(doc, request.instruction, **options),
+    )

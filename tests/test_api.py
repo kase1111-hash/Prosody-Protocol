@@ -7,7 +7,9 @@ Covers:
 - Text-to-IML endpoint
 - IML-to-SSML endpoint
 - Synthesize endpoint: WAV audio response, duration cap, engine/voice
-- Audio-to-IML endpoint: file upload, language field, unreadable audio
+- Audio-to-IML endpoint: file upload, language field, unreadable audio,
+  word timings, transcript and prosody profile fields
+- IML-to-prompt endpoint: annotated transcript and chat messages for LLMs
 - Error handling: malformed input returns 400 not 500
 - Request limits: body size (including chunked bodies), text length, rate limit
 - Worker processes: the event loop stays free during long conversions
@@ -54,6 +56,42 @@ from prosody_protocol.server.routes.convert import _save_upload
 
 AUDIO_FIXTURES = Path(__file__).parent / "fixtures" / "audio"
 SPEECH_WAV = AUDIO_FIXTURES / "speech_pauses.wav"
+PROFILE_FIXTURES = Path(__file__).parent / "fixtures" / "profiles"
+EXAMPLES = Path(__file__).parent.parent / "examples"
+
+
+def speech_words_json(shape: str = "records") -> str:
+    """The exact word timings of SPEECH_WAV as JSON text, in the given *shape*."""
+    words = json.loads((AUDIO_FIXTURES / "speech_pauses.json").read_text())["words"]
+    if shape == "records":
+        return json.dumps(words)
+    assert shape == "whisper"
+    return json.dumps({"segments": [{"words": [
+        {"word": " " + w["word"], "start": w["start_ms"] / 1000, "end": w["end_ms"] / 1000}
+        for w in words
+    ]}]})
+
+
+def pause_profile(boost: float) -> str:
+    """A profile whose only mapping matches SPEECH_WAV (2 pauses in 6 word boundaries)."""
+    return json.dumps({
+        "profile_version": "0.1.0",
+        "user_id": "caller_7",
+        "prosody_mappings": [
+            {
+                "pattern": {"pause_frequency": "high"},
+                "interpretation": {"emotion": "uncertain", "confidence_boost": boost},
+            }
+        ],
+    })
+
+
+def post_speech(http: TestClient, **data: Any) -> httpx.Response:
+    """POST SPEECH_WAV to audio-to-iml with the form fields *data*."""
+    files: dict[str, Any] = {"audio": ("speech.wav", SPEECH_WAV.read_bytes(), "audio/wav")}
+    for name in [k for k, v in data.items() if isinstance(v, tuple)]:
+        files[name] = data.pop(name)
+    return http.post("/v1/convert/audio-to-iml", files=files, data=data)
 
 needs_espeak = pytest.mark.skipif(shutil.which("espeak-ng") is None, reason="needs espeak-ng")
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
@@ -135,11 +173,13 @@ class TestHealth:
 
     def test_health_reports_limits(self) -> None:
         limits = make_client(
-            max_upload_size_mb=3, max_text_chars=1234, max_synth_seconds=45.0
+            max_upload_size_mb=3, max_text_chars=1234, max_synth_seconds=45.0,
+            max_words_chars=5678,
         ).get("/v1/health").json()["limits"]
         assert limits == {
             "max_upload_bytes": 3 * 1024 * 1024,
             "max_text_chars": 1234,
+            "max_words_chars": 5678,
             "max_synth_seconds": 45.0,
             "max_audio_seconds": 600.0,
             "rate_limit_per_minute": 0,
@@ -603,6 +643,308 @@ class TestAudioToIMLEndpoint:
         assert (tmp_path / "upload").stat().st_size == 100
 
 
+class TestAudioToIMLFields:
+    """The words, transcript and profile form fields."""
+
+    @pytest.mark.parametrize("shape", ["records", "whisper"])
+    def test_words_become_the_transcript(self, client: TestClient, shape: str) -> None:
+        resp = post_speech(client, words=speech_words_json(shape), language="en-US")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["transcript_source"] == "words"
+        assert data["plain_text"] == "I told you to call me yesterday."
+        assert data["warnings"] == []
+        assert data["profile_matches"] == []
+        # The emphasised word and the 600 ms pause are marked.
+        assert "<emphasis" in data["iml"] and "told" in data["iml"]
+        assert '<pause duration="6' in data["iml"]
+
+    def test_words_as_a_file(self, client: TestClient) -> None:
+        """curl -F words=@speech.whisper.json sends the words as a file part."""
+        whisper = speech_words_json("whisper").encode("utf-16")
+        resp = post_speech(client, words=("speech.whisper.json", whisper, "application/json"))
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["plain_text"] == "I told you to call me yesterday."
+
+    @pytest.mark.parametrize(
+        "words",
+        [
+            str(AUDIO_FIXTURES / "speech_pauses.json"),  # a path is not JSON text
+            json.dumps(str(AUDIO_FIXTURES / "speech_pauses.json")),
+            "not json",
+            '[{"word": "hi", "start": 2.0, "end": 1.0}]',
+            '{"unknown": []}',
+            '[{"word": "a\\u0001b", "start_ms": 0, "end_ms": 100}]',
+            "[" * 50_000,
+            # Words that overlap: each would have the audio analysed again.
+            '[{"word": "a", "start_ms": 0, "end_ms": 4000}, '
+            '{"word": "b", "start_ms": 1, "end_ms": 4000}]',
+        ],
+    )
+    def test_invalid_words_return_422(self, client: TestClient, words: str) -> None:
+        resp = post_speech(client, words=words)
+        assert resp.status_code == 422, resp.text
+        [error] = resp.json()["detail"]
+        assert error["loc"] == ["body", "words"]
+        assert "Invalid word timings" in error["msg"]
+
+    def test_transcript(self, client: TestClient) -> None:
+        resp = post_speech(client, transcript="I told you to call me yesterday.")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["transcript_source"] == "transcript"
+        assert data["plain_text"] == "I told you to call me yesterday."
+
+    def test_transcript_as_a_file(self, client: TestClient) -> None:
+        text = "Café au lait.\n".encode()
+        resp = post_speech(client, transcript=("speech.txt", text, "text/plain"))
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["plain_text"] == "Café au lait."
+
+    def test_words_and_transcript_together_return_422(self, client: TestClient) -> None:
+        resp = post_speech(client, words=speech_words_json(), transcript="I told you.")
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "transcript"]
+
+    @pytest.mark.parametrize(
+        "transcript", ["bad \x01 control", ("t.txt", b"\xff\xfe not utf-8", "text/plain")]
+    )
+    def test_unusable_transcript_returns_422(
+        self, client: TestClient, transcript: str | tuple[str, bytes, str]
+    ) -> None:
+        resp = post_speech(client, transcript=transcript)
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "transcript"]
+
+    @pytest.mark.parametrize(("boost", "applied"), [(0.3, False), (0.6, True)])
+    def test_profile_is_applied_and_reported(
+        self, client: TestClient, boost: float, applied: bool
+    ) -> None:
+        resp = post_speech(client, words=speech_words_json(), profile=pause_profile(boost))
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        [match] = data["profile_matches"]
+        assert match["utterance"] == 0
+        assert match["pattern"] == {"pause_frequency": "high"}
+        assert match["observed"]["pause_frequency"] == "high"
+        assert match["emotion"] == "uncertain"
+        # One utterance and no calibration: the classifier has no baseline
+        # (confidence 0), so the boost alone is the confidence.
+        assert match["confidence"] == pytest.approx(boost)
+        assert match["applied"] is applied
+        # Profile use is shown by the matched pattern; the user_id is never written.
+        assert ('x-profile="pause_frequency=high"' in data["iml"]) is applied
+        assert "caller_7" not in data["iml"]
+        assert ('emotion="uncertain"' in data["iml"]) is applied
+
+    def test_profile_as_a_file(self, client: TestClient) -> None:
+        profile = (PROFILE_FIXTURES / "autism_spectrum.json").read_bytes()
+        resp = post_speech(client, profile=("profile.json", profile, "application/json"))
+        assert resp.status_code == 200, resp.text
+
+    @pytest.mark.parametrize(
+        ("profile", "message"),
+        [
+            ("{not json", "Invalid JSON"),
+            ('{"profile_version": "0.1.0", "user_id": "u", "prosody_mappings": [], '
+             '"extra": 1}', "unknown key"),
+            (pause_profile(0.3).replace('"high"', '"often"'), "P6"),
+            (pause_profile(0.3).replace("0.3", "NaN"), "not a JSON number"),
+            ((PROFILE_FIXTURES / "invalid_empty_mappings.json").read_text(), "P3"),
+            ("[" * 50_000, "Invalid JSON"),  # nested too deeply for the JSON parser
+        ],
+    )
+    def test_invalid_profile_returns_400(
+        self, client: TestClient, profile: str, message: str
+    ) -> None:
+        resp = post_speech(client, profile=profile)
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["error"] == "profile_error"
+        assert message in resp.json()["detail"]
+
+    @pytest.mark.parametrize(
+        ("field", "value", "setting"),
+        [
+            ("transcript", "a" * 101, "PP_MAX_TEXT_CHARS"),
+            ("transcript", ("t.txt", b"a" * 101, "text/plain"), "PP_MAX_TEXT_CHARS"),
+            ("profile", " " * 101, "PP_MAX_TEXT_CHARS"),
+            ("words", "[" + " " * 200 + "]", "PP_MAX_WORDS_CHARS"),
+            ("words", ("w.json", b"[" + b" " * 200 + b"]", "application/json"),
+             "PP_MAX_WORDS_CHARS"),
+        ],
+    )
+    def test_fields_over_their_limit_return_413(
+        self, field: str, value: str | tuple[str, bytes, str], setting: str
+    ) -> None:
+        http = make_client(max_text_chars=100, max_words_chars=200)
+        resp = post_speech(http, **{field: value})
+        assert resp.status_code == 413, resp.text
+        assert resp.json()["error"] == "text_too_large"
+        assert setting in resp.json()["detail"]
+
+    def test_fields_within_their_limits_are_accepted(self) -> None:
+        http = make_client(max_text_chars=100, max_words_chars=len(speech_words_json()))
+        resp = post_speech(http, words=speech_words_json())
+        assert resp.status_code == 200, resp.text
+        resp = post_speech(http, transcript="a" * 100)
+        assert resp.status_code == 200, resp.text
+
+    def test_invalid_fields_do_not_take_a_worker(self) -> None:
+        """Fields are checked before the job is admitted, so no worker starts."""
+        http = make_client()
+        resp = post_speech(http, words="not json")
+        assert resp.status_code == 422
+        assert http.app.state.jobs._pool is None  # type: ignore[attr-defined]
+
+    def test_overlapping_words_are_rejected_before_analysis(self) -> None:
+        """A few KB of words that each span the whole recording used to take a
+        worker for minutes and gigabytes; now they are a 422 up front."""
+        http = make_client()
+        words = json.dumps([
+            {"word": "x", "start_ms": i, "end_ms": 596_000 if i % 5 < 2 else i + 300}
+            for i in range(2000)
+        ])
+        resp = post_speech(http, words=words)
+        assert resp.status_code == 422, resp.text
+        [error] = resp.json()["detail"]
+        assert error["loc"] == ["body", "words"]
+        assert "may overlap by at most 500 ms" in error["msg"]
+        assert http.app.state.jobs._pool is None  # type: ignore[attr-defined]
+
+    def test_profile_emotion_xml_cannot_hold_is_rejected_up_front(self) -> None:
+        """It used to fail only when the mapping applied, after the analysis,
+        as a 400 conversion_error."""
+        http = make_client()
+        profile = pause_profile(0.6).replace('"uncertain"', '"calm\\u0001"')
+        resp = post_speech(http, words=speech_words_json(), profile=profile)
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["error"] == "profile_error"
+        assert "XML does not allow" in resp.json()["detail"]
+        assert http.app.state.jobs._pool is None  # type: ignore[attr-defined]
+
+    def test_example_files(self, client: TestClient) -> None:
+        """The examples/README.md curl command."""
+        resp = client.post(
+            "/v1/convert/audio-to-iml",
+            files={
+                "audio": ("speech.wav", (EXAMPLES / "speech.wav").read_bytes(), "audio/wav"),
+                "words": ("speech.whisper.json", (EXAMPLES / "speech.whisper.json").read_bytes()),
+            },
+            data={"language": "en-US"},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["transcript_source"] == "words"
+        assert data["plain_text"] == (EXAMPLES / "speech.txt").read_text().strip()
+
+    def test_example_profile(self, client: TestClient) -> None:
+        """The examples/README.md curl command with a profile."""
+        resp = client.post(
+            "/v1/convert/audio-to-iml",
+            files={
+                "audio": ("m.wav", (EXAMPLES / "monotone.wav").read_bytes(), "audio/wav"),
+                "words": ("m.json", (EXAMPLES / "monotone.deepgram.json").read_bytes()),
+                "profile": ("p.json", (EXAMPLES / "profile.json").read_bytes()),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert [(m["emotion"], m["applied"]) for m in data["profile_matches"]] == [
+            ("calm", True), ("calm", True), ("calm", True), ("joyful", True)
+        ]
+        assert 'x-profile="pitch_contour=flat rate=fast"' in data["iml"]
+        assert "example_user" not in data["iml"]
+
+
+# ---------------------------------------------------------------------------
+# IML to LLM prompt
+# ---------------------------------------------------------------------------
+
+
+SARCASM = (
+    '<utterance emotion="sarcastic" confidence="0.87">Oh, that\'s '
+    '<prosody pitch="+15%" volume="+6dB" pitch_contour="fall-sharp">GREAT</prosody>.'
+    '<pause duration="800"/> Really.</utterance>'
+)
+
+
+class TestIMLToPromptEndpoint:
+    def test_context_system_prompt_and_messages(self, client: TestClient) -> None:
+        from prosody_protocol.llm import SYSTEM_PROMPT, build_messages, to_llm_context
+
+        resp = client.post("/v1/convert/iml-to-prompt", json={"iml": SARCASM})
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["context"] == to_llm_context(SARCASM)
+        assert "GREAT (higher pitch, louder, sharply falling)" in data["context"]
+        assert "[pause 0.8s]" in data["context"]
+        assert "sarcastic" in data["context"]
+        assert data["system_prompt"] == SYSTEM_PROMPT
+        assert data["messages"] == build_messages(SARCASM)
+
+    def test_options(self, client: TestClient) -> None:
+        from prosody_protocol.llm import build_messages, to_llm_context
+
+        body = {
+            "iml": SARCASM,
+            "min_confidence": 0.9,
+            "include_numbers": True,
+            "instruction": "Summarize.",
+        }
+        data = client.post("/v1/convert/iml-to-prompt", json=body).json()
+        options = {"min_confidence": 0.9, "include_numbers": True}
+        assert data["context"] == to_llm_context(SARCASM, **options)
+        assert "not reliably detected" in data["context"]
+        assert "+15%" in data["context"]
+        assert data["messages"] == build_messages(SARCASM, "Summarize.", **options)
+        assert data["messages"][1]["content"].endswith("Summarize.")
+
+    def test_malformed_iml_returns_400(self, client: TestClient) -> None:
+        resp = client.post("/v1/convert/iml-to-prompt", json={"iml": "<utterance>oops"})
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "iml_parse_error"
+
+    def test_strict_rejects_invalid_iml(self, client: TestClient) -> None:
+        invalid = '<utterance emotion="angry">No confidence.</utterance>'
+        lenient = client.post("/v1/convert/iml-to-prompt", json={"iml": invalid})
+        assert lenient.status_code == 200
+        strict = client.post("/v1/convert/iml-to-prompt", json={"iml": invalid, "strict": True})
+        assert strict.status_code == 400
+        assert strict.json()["error"] == "validation_error"
+        assert [i["rule"] for i in strict.json()["issues"]] == ["V3"]
+
+    @pytest.mark.parametrize("min_confidence", [-0.1, 1.5])
+    def test_invalid_min_confidence_returns_422(
+        self, client: TestClient, min_confidence: float
+    ) -> None:
+        resp = client.post(
+            "/v1/convert/iml-to-prompt", json={"iml": SARCASM, "min_confidence": min_confidence}
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.parametrize(
+        ("path", "body", "echoed"),
+        [
+            ("/v1/convert/iml-to-prompt", '{"iml": "<utterance>hi</utterance>", '
+             '"min_confidence": NaN}', "nan"),
+            ("/v1/convert/iml-to-prompt", '{"iml": "<utterance>hi</utterance>", '
+             '"min_confidence": -Infinity}', "-inf"),
+            ("/v1/validate", '{"iml": NaN}', "nan"),
+            ("/v1/convert/iml-to-ssml", '{"iml": Infinity}', "inf"),
+            ("/v1/convert/text-to-iml", '{"text": NaN}', "nan"),
+        ],
+    )
+    def test_non_finite_json_numbers_return_422(
+        self, client: TestClient, path: str, body: str, echoed: str
+    ) -> None:
+        """Python's JSON parser accepts NaN and Infinity; echoing them back in
+        the 422 used to fail with a 500 internal_error."""
+        resp = client.post(path, content=body, headers={"Content-Type": "application/json"})
+        assert resp.status_code == 422, resp.text
+        [error] = resp.json()["detail"]
+        assert error["input"] == echoed
+
+
 # ---------------------------------------------------------------------------
 # OpenAPI spec
 # ---------------------------------------------------------------------------
@@ -627,6 +969,7 @@ class TestOpenAPISpec:
             "/v1/convert/audio-to-iml",
             "/v1/convert/text-to-iml",
             "/v1/convert/iml-to-ssml",
+            "/v1/convert/iml-to-prompt",
         ]
         for path in expected:
             assert path in paths, f"Missing path: {path}"
@@ -668,7 +1011,16 @@ class TestOpenAPISpec:
             "multipart/form-data"
         ]["schema"]["$ref"]
         body = spec["components"]["schemas"][body_ref.rsplit("/", 1)[1]]
-        assert set(body["properties"]) == {"audio", "language"}
+        assert set(body["properties"]) == {"audio", "language", "words", "transcript", "profile"}
+
+    def test_audio_response_declares_profile_matches(self, client: TestClient) -> None:
+        schemas = client.get("/openapi.json").json()["components"]["schemas"]
+        assert {"transcript_source", "warnings", "profile_matches"} <= set(
+            schemas["AudioToIMLResponse"]["properties"]
+        )
+        assert set(schemas["PromptResponse"]["properties"]) == {
+            "context", "system_prompt", "messages"
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -802,6 +1154,8 @@ class TestTextLimit:
             ("/v1/synthesize", {"iml": "<utterance>" + "a" * 100 + "</utterance>"}),
             ("/v1/convert/text-to-iml", {"text": "a" * 101}),
             ("/v1/convert/text-to-iml", {"text": "Hi.", "context": "a" * 101}),
+            ("/v1/convert/iml-to-prompt", {"iml": "<utterance>" + "a" * 100 + "</utterance>"}),
+            ("/v1/convert/iml-to-prompt", {"iml": "<utterance/>", "instruction": "a" * 101}),
         ],
     )
     def test_text_over_limit_returns_413(self, path: str, body: dict[str, str]) -> None:
@@ -944,6 +1298,7 @@ class TestRateLimit:
 class TestSettings:
     def test_environment_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PP_MAX_TEXT_CHARS", "500")
+        monkeypatch.setenv("PP_MAX_WORDS_CHARS", "2000")
         monkeypatch.setenv("PP_MAX_SYNTH_SECONDS", "30.5")
         monkeypatch.setenv("PP_MAX_AUDIO_SECONDS", "90")
         monkeypatch.setenv("PP_MAX_CONCURRENT_JOBS", "3")
@@ -951,6 +1306,7 @@ class TestSettings:
         monkeypatch.setenv("PP_TRUSTED_PROXIES", "10.0.0.1, 172.16.0.0/12")
         settings = Settings()
         assert settings.max_text_chars == 500
+        assert settings.max_words_chars == 2000
         assert settings.max_synth_seconds == 30.5
         assert settings.max_audio_seconds == 90.0
         assert settings.max_concurrent_jobs == 3
@@ -963,6 +1319,8 @@ class TestSettings:
             ("PP_MAX_UPLOAD_MB", "lots"),
             ("PP_MAX_UPLOAD_MB", "0"),
             ("PP_RATE_LIMIT", "-1"),
+            ("PP_MAX_WORDS_CHARS", "0"),
+            ("PP_PORT", "70000"),
             ("PP_MAX_SYNTH_SECONDS", "0"),
             ("PP_MAX_SYNTH_SECONDS", "inf"),
             ("PP_MAX_SYNTH_SECONDS", "nan"),
@@ -982,10 +1340,12 @@ class TestSettings:
         ("field", "value"),
         [
             ("port", 0),
+            ("port", 65_536),
             ("max_upload_size_mb", -1),
             ("max_upload_size_mb", 1.5),
             ("rate_limit_per_minute", -1),
             ("max_text_chars", 0),
+            ("max_words_chars", -1),
             ("max_synth_seconds", 0.0),
             ("max_synth_seconds", float("nan")),
             ("max_audio_seconds", float("inf")),
@@ -1012,12 +1372,19 @@ class TestSettings:
 
         run()
         run(host="127.0.0.2", port=9000)
+        run(port=0)  # any free port; used to become PP_PORT
         assert calls == [
             {"app": "prosody_protocol.server.app:app", "host": "0.0.0.0", "port": 9123,
              "log_level": "debug"},
             {"app": "prosody_protocol.server.app:app", "host": "127.0.0.2", "port": 9000,
              "log_level": "debug"},
+            {"app": "prosody_protocol.server.app:app", "host": "0.0.0.0", "port": 0,
+             "log_level": "debug"},
         ]
+        for bad in (-5, 99_999):
+            with pytest.raises(ValueError, match="port must be between 0 and 65535"):
+                run(port=bad)
+        assert len(calls) == 3
 
 
 # ---------------------------------------------------------------------------

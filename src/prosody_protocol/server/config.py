@@ -9,6 +9,9 @@ from dataclasses import dataclass, field
 
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
+#: The highest TCP port number.
+MAX_PORT = 65_535
+
 
 @dataclass
 class Settings:
@@ -16,7 +19,7 @@ class Settings:
 
     Environment variables:
         PP_HOST: Server bind address (default "127.0.0.1")
-        PP_PORT: Server port (default 8000)
+        PP_PORT: Server port, 1-65535 (default 8000)
         PP_DEBUG: Enable debug mode ("1" or "true")
         PP_CORS_ORIGINS: Comma-separated allowed origins (default: none, reject cross-origin)
         PP_MAX_UPLOAD_MB: Maximum request body size in megabytes, counted on the
@@ -28,7 +31,14 @@ class Settings:
             for rate limiting (default: none, so the limiter keys on the
             connecting address and ignores ``X-Forwarded-For``)
         PP_MAX_TEXT_CHARS: Maximum length, in characters, of each text field
-            of a JSON request (``iml``, ``text``, ``context``) (default 100000)
+            of a request (``iml``, ``text``, ``context``, ``instruction``, and the
+            ``transcript`` and ``profile`` fields of audio-to-iml) (default 100000)
+        PP_MAX_WORDS_CHARS: Maximum size of the ``words`` field of audio-to-iml
+            (word timings JSON), in characters, or bytes when it is sent as a
+            file (default 1000000: the full response of any supported speech
+            recogniser for PP_MAX_AUDIO_SECONDS of speech, with room to spare).
+            Words may overlap by at most 500 ms, so the analysis they cost is
+            bounded by the audio's length plus a small amount per word.
         PP_MAX_SYNTH_SECONDS: Maximum duration of the audio ``/v1/synthesize``
             produces; longer documents are rejected before synthesis (default 120)
         PP_MAX_AUDIO_SECONDS: Maximum duration of an audio upload; longer audio
@@ -53,6 +63,9 @@ class Settings:
     rate_limit_per_minute: int = field(default_factory=lambda: _env_int("PP_RATE_LIMIT", 60))
     trusted_proxies: list[str] = field(default_factory=lambda: _env_list("PP_TRUSTED_PROXIES"))
     max_text_chars: int = field(default_factory=lambda: _env_int("PP_MAX_TEXT_CHARS", 100_000))
+    max_words_chars: int = field(
+        default_factory=lambda: _env_int("PP_MAX_WORDS_CHARS", 1_000_000)
+    )
     max_synth_seconds: float = field(
         default_factory=lambda: _env_float("PP_MAX_SYNTH_SECONDS", 120.0)
     )
@@ -70,6 +83,8 @@ class Settings:
                 raise ValueError(
                     f"{name} ({variable}) must be an integer >= {minimum}, got {value!r}"
                 )
+        if self.port > MAX_PORT:
+            raise ValueError(f"port (PP_PORT) must be at most {MAX_PORT}, got {self.port!r}")
         for name, variable in _DURATION_SETTINGS.items():
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not (
@@ -102,6 +117,7 @@ _INT_SETTINGS: dict[str, tuple[str, int]] = {
     "max_upload_size_mb": ("PP_MAX_UPLOAD_MB", 1),
     "rate_limit_per_minute": ("PP_RATE_LIMIT", 0),
     "max_text_chars": ("PP_MAX_TEXT_CHARS", 1),
+    "max_words_chars": ("PP_MAX_WORDS_CHARS", 1),
     "max_concurrent_jobs": ("PP_MAX_CONCURRENT_JOBS", 1),
     "max_queued_jobs": ("PP_MAX_QUEUED_JOBS", 0),
 }

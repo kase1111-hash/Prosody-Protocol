@@ -16,8 +16,15 @@ from pathlib import Path
 import pytest
 
 from prosody_protocol import PauseInterval, SpanFeatures, WordAlignment
-from prosody_protocol.assembler import DEFAULT_MIN_EMOTION_CONFIDENCE, IMLAssembler
+from prosody_protocol.assembler import (
+    DEFAULT_MIN_EMOTION_CONFIDENCE,
+    MAX_PAUSE_MS,
+    PROFILE_ATTRIBUTE,
+    IMLAssembler,
+    ProfileMatch,
+)
 from prosody_protocol.emotion_classifier import SpeakerBaseline
+from prosody_protocol.exceptions import ProfileError
 from prosody_protocol.models import (
     ChildNode,
     Emphasis,
@@ -26,7 +33,10 @@ from prosody_protocol.models import (
     Prosody,
 )
 from prosody_protocol.parser import IMLParser
+from prosody_protocol.profiles import ProfileLoader, ProsodyMapping, ProsodyProfile
 from prosody_protocol.validator import IMLValidator
+
+PROFILES_DIR = Path(__file__).parent / "fixtures" / "profiles"
 
 # A word in the tables below: (text, start_ms, end_ms, f0_hz, intensity_db),
 # with optional extra SpanFeatures fields as a dict.
@@ -376,6 +386,44 @@ class TestPauseInsertion:
         """With nothing after the '?', the gap is silence after the last word."""
         doc = _assemble([("Wait", 0, 300, 120, 65), ("?", 1500, 1500, 120, 65)])
         assert doc.utterances[0].children == ("Wait?",)
+
+    def test_silence_over_a_minute_is_a_one_minute_pause(self, validator: IMLValidator) -> None:
+        """Spec 6.4: producers SHOULD NOT emit pauses over 60000 ms (V33)."""
+        words = [("Please", 0, 400, 120, 65), ("hold.", 450, 900, 120, 65),
+                 ("Thanks", 71_440, 71_800, 120, 65), ("for", 71_850, 72_000, 120, 65),
+                 ("waiting.", 72_050, 72_600, 120, 65)]
+        with pytest.warns(UserWarning, match=r"The silence of 70\.5 s after 'hold\.' is "
+                          r'written as <pause duration="60000"/>'):
+            doc = _assemble(words)
+        assert [u.children for u in doc.utterances] == [
+            ("Please hold.",), (Pause(duration=MAX_PAUSE_MS), "Thanks for waiting."),
+        ]
+        result = validator.validate(_xml(doc))
+        assert result.valid and not result.issues
+
+    def test_several_long_silences_are_reported_once(self) -> None:
+        words = [("one", 0, 300, 120, 65), ("two", 61_300, 61_600, 120, 65),
+                 ("three", 161_600, 161_900, 120, 65), ("four", 162_000, 162_300, 120, 65)]
+        assembly = IMLAssembler()._assemble(
+            [_make_alignment(*w[:3]) for w in words], _features(words), []
+        )
+        pauses = [n for u in assembly.document.utterances for n in _nodes(u.children)
+                  if isinstance(n, Pause)]
+        assert pauses == [Pause(duration=MAX_PAUSE_MS)] * 2
+        assert assembly.notes == [
+            "2 silences longer than 60 s (the longest 100.0 s, after 'two') are written as "
+            '<pause duration="60000"/>, the longest pause spec 6.4 recommends.'
+        ]
+
+    def test_one_minute_pause_is_kept(self) -> None:
+        words = [("one", 0, 300, 120, 65), ("two.", 60_300, 60_600, 120, 65)]
+        assembly = IMLAssembler()._assemble(
+            [_make_alignment(*w[:3]) for w in words], _features(words), []
+        )
+        assert assembly.document.utterances[0].children == (
+            "one", Pause(duration=60_000), " two."
+        )
+        assert assembly.notes == []
 
     def test_fractional_millisecond_timings(self, validator: IMLValidator) -> None:
         """Float timings used to give duration="730.5", which is invalid IML."""
@@ -1005,6 +1053,227 @@ class TestDeprecatedConstants:
 
         with pytest.raises(AttributeError, match="NO_SUCH_THRESHOLD"):
             assembler.NO_SUCH_THRESHOLD  # noqa: B018
+
+
+# ---------------------------------------------------------------------------
+# Prosody profiles (spec Section 7)
+# ---------------------------------------------------------------------------
+
+
+def _profile(
+    *mappings: tuple[dict[str, str], str, float], user_id: str = "user_1"
+) -> ProsodyProfile:
+    return ProsodyProfile(
+        profile_version="0.1.0",
+        user_id=user_id,
+        description=None,
+        mappings=tuple(ProsodyMapping(dict(p), emotion, boost) for p, emotion, boost in mappings),
+    )
+
+
+SPIKE_PROFILE = _profile(({"volume": "spike"}, "sincere", 0.2))
+
+
+def _spiked(text: str = "I did not say that.", louder: int = 2) -> list[Word]:
+    """Evenly spoken words, one of them 13 dB louder (a volume "spike")."""
+    words = _sentence(text)
+    word = words[louder]
+    words[louder] = (word[0], word[1], word[2], word[3], 78.0)
+    return words
+
+
+def _flat_fast(text: str, start_ms: int = 0) -> list[Word]:
+    """Monotone words (flat F0 contours) at 7 syllables per second."""
+    return [
+        (w[0], w[1], w[2], 120.0, 65.0, {"f0_contour": [120.0] * 10, "speech_rate": 7.0})
+        for w in _sentence(text, start_ms)
+    ]
+
+
+class TestProfiles:
+    def test_matching_mapping_sets_emotion_and_boosts_confidence(
+        self, validator: IMLValidator
+    ) -> None:
+        """Spec 7.2: the mapping takes precedence, confidence = classifier's + boost."""
+        without = _assemble(_spiked(), assembler=IMLAssembler(_Fixed("angry", 0.6)))
+        assert (without.utterances[0].emotion, without.utterances[0].confidence) == ("angry", 0.6)
+
+        assembler = IMLAssembler(_Fixed("angry", 0.6), profile=SPIKE_PROFILE)
+        doc = _assemble(_spiked(), assembler=assembler)
+        utterance = doc.utterances[0]
+        assert (utterance.emotion, utterance.confidence) == ("sincere", pytest.approx(0.8))
+        assert utterance.extra_attributes == ((PROFILE_ATTRIBUTE, "volume=spike"),)
+        xml = _xml(doc)
+        assert 'emotion="sincere"' in xml and 'x-profile="volume=spike"' in xml
+        result = validator.validate(xml)
+        assert result.valid and not result.issues
+
+    def test_profile_marker_does_not_name_the_speaker(self) -> None:
+        """x-profile holds the matched pattern (sorted by key), never the user_id."""
+        profile = _profile(
+            ({"volume": "spike", "pitch_contour": "flat"}, "sincere", 0.2),
+            user_id="jane.doe@example.com",
+        )
+        words = [(*w[:5], {"f0_contour": [120.0] * 10}) for w in _spiked()]
+        doc = _assemble(words, assembler=IMLAssembler(_Fixed("angry", 0.6), profile=profile))
+        assert doc.utterances[0].extra_attributes == (
+            (PROFILE_ATTRIBUTE, "pitch_contour=flat volume=spike"),
+        )
+        assert "jane.doe" not in _xml(doc)
+
+    def test_matches_are_reported(self) -> None:
+        assembler = IMLAssembler(_Fixed("angry", 0.6), profile=SPIKE_PROFILE)
+        words = _sentence("It was fine.") + _spiked("Then you said that.", 3)
+        words = words[:3] + [(w[0], w[1] + 2000, w[2] + 2000, *w[3:]) for w in words[3:]]
+        alignments = [_make_alignment(w[0], w[1], w[2]) for w in words]
+        features = [
+            _make_features(w[0], w[1], w[2], w[3], w[4], **(w[5] if len(w) > 5 else {}))
+            for w in words
+        ]
+        doc, matches, _ = assembler._assemble(alignments, features, [])
+        assert len(doc.utterances) == 2
+        assert matches == [ProfileMatch(
+            utterance=1,
+            observed=matches[0].observed,
+            pattern={"volume": "spike"},
+            emotion="sincere",
+            confidence=pytest.approx(0.8),
+            applied=True,
+        )]
+        assert matches[0].observed["volume"] == "spike"
+        assert doc.utterances[0].extra_attributes == ()
+        assert doc.utterances[0].emotion == "angry"
+
+    def test_confidence_is_capped_at_one(self) -> None:
+        assembler = IMLAssembler(_Fixed("angry", 0.9), profile=SPIKE_PROFILE)
+        assert _assemble(_spiked(), assembler=assembler).utterances[0].confidence == 1.0
+
+    def test_abstention_applies_after_the_profile(self) -> None:
+        """A profile adjusts the classifier's estimate; it cannot make up confidence."""
+        assembler = IMLAssembler(_Fixed("neutral", 0.1), profile=SPIKE_PROFILE)
+        doc, matches, _ = assembler._assemble(
+            [_make_alignment(w[0], w[1], w[2]) for w in _spiked()], _features(_spiked()), []
+        )
+        utterance = doc.utterances[0]
+        assert (utterance.emotion, utterance.confidence, utterance.extra_attributes) == (
+            None, None, ()
+        )
+        assert [(m.emotion, m.confidence, m.applied) for m in matches] == [
+            ("sincere", pytest.approx(0.3), False)
+        ]
+        assert "x-profile" not in _xml(doc)
+
+        lenient = IMLAssembler(
+            _Fixed("neutral", 0.1), profile=SPIKE_PROFILE, min_emotion_confidence=0.25
+        )
+        utterance = _assemble(_spiked(), assembler=lenient).utterances[0]
+        assert (utterance.emotion, utterance.confidence) == ("sincere", pytest.approx(0.3))
+
+    def test_no_match_leaves_the_classification(self) -> None:
+        assembler = IMLAssembler(_Fixed("angry", 0.6), profile=SPIKE_PROFILE)
+        doc, matches, _ = assembler._assemble(
+            [_make_alignment(w[0], w[1], w[2]) for w in _sentence("I see.")],
+            _features(_sentence("I see.")),
+            [],
+        )
+        assert (doc.utterances[0].emotion, doc.utterances[0].confidence) == ("angry", 0.6)
+        assert doc.utterances[0].extra_attributes == ()
+        assert matches == []
+
+    def test_most_specific_mapping_wins(self) -> None:
+        profile = _profile(
+            ({"volume": "spike"}, "sincere", 0.1),
+            ({"volume": "spike", "rate": "fast"}, "joyful", 0.1),
+            ({"rate": "fast", "volume": "spike"}, "surprised", 0.1),
+        )
+        words = [(*w[:5], {"speech_rate": 7.0}) for w in _spiked()]
+        doc = _assemble(words, assembler=IMLAssembler(_Fixed("angry", 0.6), profile=profile))
+        # Two keys beat one; of the two with two keys, the first listed wins.
+        assert doc.utterances[0].emotion == "joyful"
+
+    def test_fixture_profile_flat_and_fast_is_excitement(self) -> None:
+        """The spec 7.1 example: monotone, fast speech from this speaker is excitement."""
+        profile = ProfileLoader().load(PROFILES_DIR / "autism_spectrum.json")
+        words = _flat_fast("I just got the new keyboard.")
+        doc, matches, _ = IMLAssembler(_Fixed("angry", 0.63), profile=profile)._assemble(
+            [_make_alignment(w[0], w[1], w[2]) for w in words],
+            [_make_features(w[0], w[1], w[2], w[3], w[4], **w[5]) for w in words],  # type: ignore[misc]
+            [],
+        )
+        utterance = doc.utterances[0]
+        assert (utterance.emotion, utterance.confidence) == ("excitement", pytest.approx(0.78))
+        assert utterance.extra_attributes == (("x-profile", "pitch_contour=flat rate=fast"),)
+        assert matches[0].observed["pitch_contour"] == "flat"
+        assert matches[0].observed["rate"] == "fast"
+
+    def test_profile_property(self) -> None:
+        assert IMLAssembler(profile=SPIKE_PROFILE).profile is SPIKE_PROFILE
+        assert IMLAssembler().profile is None
+
+    def test_pitch_level_needs_a_baseline(self) -> None:
+        """"pitch" is only judged against the speaker's own speech (reference
+        features, or the recording's typical utterances)."""
+        profile = _profile(({"pitch": "high"}, "surprised", 0.2))
+        high = _sentence("Is that so?", 0, 150, 65)
+        alone = _assemble(high, assembler=IMLAssembler(_Fixed("neutral", 0.4), profile=profile))
+        assert alone.utterances[0].emotion is None
+
+        calibrated = _assemble(
+            high,
+            assembler=IMLAssembler(_Fixed("neutral", 0.4), profile=profile),
+            reference_features=_features(_sentence("This is my voice.", 0, 120, 65)),
+        )
+        assert (calibrated.utterances[0].emotion, calibrated.utterances[0].confidence) == (
+            "surprised", pytest.approx(0.6)
+        )
+
+        doc = _assemble(
+            CALM + SHOUTED, assembler=IMLAssembler(_Fixed("neutral", 0.4), profile=profile)
+        )
+        assert [u.emotion for u in doc.utterances] == [None, None, None, "surprised"]
+
+    def test_profile_with_unclassifiable_confidence(self) -> None:
+        assembler = IMLAssembler(
+            _Fixed("angry", math.nan), profile=SPIKE_PROFILE, min_emotion_confidence=0.0
+        )
+        utterance = _assemble(_spiked(), assembler=assembler).utterances[0]
+        assert (utterance.emotion, utterance.confidence) == ("sincere", pytest.approx(0.2))
+        plain = IMLAssembler(_Fixed("angry", math.nan), min_emotion_confidence=0.0)
+        assert _assemble(_spiked(), assembler=plain).utterances[0].emotion is None
+
+    @pytest.mark.parametrize(
+        ("fixture", "rule"), [("invalid_bad_version", "P1"), ("invalid_empty_mappings", "P3")]
+    )
+    def test_invalid_fixture_profiles_rejected(self, fixture: str, rule: str) -> None:
+        """ProfileLoader.load reads these; the assembler refuses to apply them."""
+        profile = ProfileLoader().load(PROFILES_DIR / f"{fixture}.json")
+        with pytest.raises(ProfileError, match=rule):
+            IMLAssembler(profile=profile)
+
+    def test_minimal_fixture_profile_needs_a_baseline(self) -> None:
+        """Its one mapping is pitch=high, which is judged against a baseline only."""
+        profile = ProfileLoader().load(PROFILES_DIR / "minimal_valid.json")
+        high = _sentence("Is that so?", 0, 150, 65)
+        doc = _assemble(
+            high,
+            assembler=IMLAssembler(_Fixed("neutral", 0.45), profile=profile),
+            reference_features=_features(_sentence("This is my voice.", 0, 120, 65)),
+        )
+        assert (doc.utterances[0].emotion, doc.utterances[0].confidence) == ("excited", 0.55)
+
+    def test_invalid_profile_rejected(self) -> None:
+        with pytest.raises(ProfileError, match="P5"):
+            IMLAssembler(profile=_profile(({"loudness": "high"}, "angry", 0.1)))
+        with pytest.raises(ProfileError, match="P8"):
+            IMLAssembler(profile=_profile(({"volume": "loud"}, "angry", 1.5)))
+        with pytest.raises(ProfileError, match=r"prosody_mappings\[1\].*XML does not allow"):
+            IMLAssembler(profile=_profile(
+                ({"volume": "loud"}, "angry", 0.1), ({"volume": "spike"}, "calm\x01", 0.1)
+            ))
+        # The user_id is never written to the IML, so any string will do.
+        IMLAssembler(profile=_profile(({"volume": "loud"}, "angry", 0.1), user_id="a\x01b"))
+        with pytest.raises(TypeError, match="ProsodyProfile"):
+            IMLAssembler(profile={"user_id": "x"})  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

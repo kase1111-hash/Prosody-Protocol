@@ -17,6 +17,8 @@ def run(host: str | None = None, port: int | None = None) -> None:
 
     ``host`` and ``port`` default to the ``PP_HOST`` / ``PP_PORT``
     environment variables (see :class:`prosody_protocol.server.config.Settings`).
+    A *port* outside 0-65535 raises :class:`ValueError`; 0 lets the system
+    choose a free port.
     """
     try:
         import uvicorn
@@ -26,12 +28,14 @@ def run(host: str | None = None, port: int | None = None) -> None:
             "Install with: pip install 'prosody-protocol[api]'"
         ) from exc
 
-    from .config import Settings
+    from .config import MAX_PORT, Settings
 
+    if port is not None and not 0 <= port <= MAX_PORT:
+        raise ValueError(f"port must be between 0 and {MAX_PORT}, got {port}")
     settings = Settings()
     uvicorn.run(
         "prosody_protocol.server.app:app",
         host=host or settings.host,
-        port=port or settings.port,
+        port=settings.port if port is None else port,
         log_level="debug" if settings.debug else "info",
     )
