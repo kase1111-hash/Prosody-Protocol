@@ -10,8 +10,9 @@ checked so the documentation cannot drift from the code:
   pass :class:`~prosody_protocol.IMLValidator`; fragments rooted at
   ``<prosody>``, ``<emphasis>``, ``<pause>`` or ``<segment>`` are checked
   inside an ``<utterance>``;
-- ``bash``/``shell``/``console`` lines that start with ``prosody-protocol``
-  run through :func:`prosody_protocol.cli.main` and must exit 0.
+- ``bash``/``shell`` lines, and ``console`` lines after a ``$ `` prompt,
+  that start with ``prosody-protocol`` run through
+  :func:`prosody_protocol.cli.main` and must exit 0.
 
 An HTML comment on the line directly above a fence changes this:
 
@@ -24,6 +25,7 @@ Blocks that need an optional extra are skipped when it is not installed.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import os
 import re
@@ -42,7 +44,31 @@ DOC_FILES = sorted(
 DOC_FILES = [p for p in DOC_FILES if p.exists()]
 
 # Modules whose absence means "extra not installed" rather than a doc bug.
-OPTIONAL_MODULES = {"numpy", "parselmouth", "fastapi", "httpx", "sklearn", "yaml", "joblib"}
+# The modules each optional extra provides. A failure that names an extra is
+# a skip only when that extra really is missing here; otherwise it is a bug.
+EXTRA_MODULES = {
+    "audio": ("numpy", "parselmouth"),
+    "whisper": ("whisper",),
+    "ml": ("sklearn", "yaml", "joblib"),
+    "api": ("fastapi", "uvicorn", "multipart"),
+}
+OPTIONAL_MODULES = {m for mods in EXTRA_MODULES.values() for m in mods} | {"httpx"}
+_EXTRA_IN_TEXT = re.compile(r"prosody-protocol\[(\w+)\]")
+
+
+def _missing(module: str) -> bool:
+    try:
+        return importlib.util.find_spec(module) is None
+    except (ImportError, ValueError):
+        return True
+
+
+def _missing_extra_named_in(text: str) -> str | None:
+    """The first extra named in *text* whose modules are not installed."""
+    for extra in _EXTRA_IN_TEXT.findall(text):
+        if any(_missing(m) for m in EXTRA_MODULES.get(extra, ())):
+            return extra
+    return None
 
 _FENCE = re.compile(r"^(?P<indent>[ \t]*)(?P<fence>`{3,}|~{3,})(?P<info>[^`\n]*)$")
 _DIRECTIVE = re.compile(r"<!--\s*docs-test:\s*(?P<what>[\w-]+)\s*-->")
@@ -108,8 +134,7 @@ def docs_cwd(tmp_path: Path) -> object:
 def _skip_if_optional_missing(exc: BaseException) -> None:
     if isinstance(exc, ImportError):
         name = (getattr(exc, "name", None) or "").split(".")[0]
-        text = str(exc)
-        if name in OPTIONAL_MODULES or "prosody-protocol[" in text:
+        if (name in OPTIONAL_MODULES and _missing(name)) or _missing_extra_named_in(str(exc)):
             pytest.skip(f"optional dependency missing: {exc}")
 
 
@@ -170,6 +195,8 @@ def _cli_commands(block: Block) -> list[list[str]]:
         line = raw.strip()
         if line.startswith("$ "):
             line = line[2:]
+        elif block.lang == "console" and not pending:
+            continue  # console blocks mix commands ("$ ...") with their output
         if pending:
             line = pending + " " + line
             pending = ""
@@ -207,7 +234,7 @@ def test_cli_examples_run(block: Block, docs_cwd: Path) -> None:
                 code = main(argv)
             except SystemExit as exc:  # argparse --help / errors
                 code = exc.code if isinstance(exc.code, int) else 1
-        if code != 0 and "prosody-protocol[" in err.getvalue():
+        if code != 0 and _missing_extra_named_in(err.getvalue()):
             pytest.skip(f"optional extra missing for {argv}: {err.getvalue().strip()}")
         assert code == 0, (
             f"`prosody-protocol {' '.join(argv)}` at {block.where()} exited {code}: "
