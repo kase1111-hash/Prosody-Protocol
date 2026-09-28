@@ -23,7 +23,7 @@ jobs:
           pip install -e ".[audio,ml,api,dev]"
 
       - name: Lint with ruff
-        run: ruff check src/ tests/ training/
+        run: ruff check src/ tests/ training/ examples/
 
       - name: Type check with mypy
         run: mypy src/
@@ -104,6 +104,8 @@ jobs:
           cd /tmp
           /tmp/smoke/bin/python -c "import prosody_protocol, prosody_protocol.server.app; print(prosody_protocol.__version__)"
           /tmp/smoke/bin/prosody-protocol --help
+          /tmp/smoke/bin/prosody-protocol doctor
+          echo '<utterance>Hello there.</utterance>' | /tmp/smoke/bin/prosody-protocol validate -
           /tmp/smoke/bin/python -m prosody_protocol.server --port 8765 &
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8765/v1/health && break; sleep 1; done
           curl -sf http://127.0.0.1:8765/v1/health
