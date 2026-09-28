@@ -1,110 +1,145 @@
-# Coqui TTS Integration
+# Coqui TTS
 
-Use Prosody Protocol with Coqui TTS for open-source speech synthesis.
+[Coqui TTS](https://github.com/idiap/coqui-ai-TTS) is an open-source
+text-to-speech toolkit that runs locally; its XTTS v2 model clones a voice
+from a short reference recording. (Coqui, the company, closed in 2024; the
+toolkit is maintained by the community as the `coqui-tts` package, which
+still imports as `TTS`.)
 
-## Concept
+Coqui TTS takes plain text. It has no SSML input, and XTTS has no controls
+for pitch, loudness or emphasis within a sentence, so `IMLToSSML` output is
+of no use to it. What you can carry over from IML:
 
-Coqui TTS is an open-source text-to-speech engine that supports SSML input.
-The `IMLToSSML` converter translates IML prosody markup into SSML that Coqui
-can use to generate expressive speech.
+| IML | With Coqui TTS |
+|-----|----------------|
+| the words | the `text` |
+| `<pause>` | synthesize the text between pauses separately and insert silence of the pause's length |
+| a whole-utterance `rate` | XTTS's `speed` argument (1.0 is normal) |
+| `pitch`, `volume`, `<emphasis>`, `pitch_contour`, `emotion` | lost; XTTS imitates the reference recording's voice and, to a degree, its manner, so a reference spoken in the wanted mood is the closest you get |
 
-## Setup
+If you need the prosody itself, use an engine that renders it (see
+[below](#when-you-need-the-prosody)).
+
+The Coqui calls on this page are not run by the docs tests (they need
+PyTorch and a model download); the `prosody_protocol` parts are.
+
+## Split the document at its pauses
+
+```python
+from pathlib import Path
+
+from prosody_protocol import IMLParser, Pause
+
+
+def split_at_pauses(iml: str) -> list[tuple[str, int]]:
+    """The document as (text, silence in ms after it) chunks, split at its pauses."""
+    chunks: list[tuple[str, int]] = []
+    words: list[str] = []
+
+    def walk(children) -> None:
+        for child in children:
+            if isinstance(child, str):
+                words.append(child)
+            elif isinstance(child, Pause):
+                chunks.append((" ".join("".join(words).split()), child.duration))
+                words.clear()
+            else:  # <prosody>, <emphasis>, <segment>: keep the words
+                walk(child.children)
+
+    for utterance in IMLParser().parse(iml).utterances:
+        walk(utterance.children)
+        words.append(" ")
+    chunks.append((" ".join("".join(words).split()), 0))
+    return [(text, ms) for text, ms in chunks if text or ms]
+
+
+iml = Path("examples/sarcasm.iml").read_text(encoding="utf-8")
+for chunk in split_at_pauses(iml):
+    print(chunk)
+```
+
+```text
+("I've been on hold for forty minutes. Oh, that's just wonderful.", 600)
+('Really great service.', 0)
+```
+
+The same for IML measured from a recording, whose pauses `AudioToIML`
+found in the audio:
+
+```python
+from prosody_protocol import AudioToIML, load_word_timings
+
+words = load_word_timings("examples/monotone.deepgram.json")
+for chunk in split_at_pauses(AudioToIML().convert("examples/monotone.wav", words=words)):
+    print(chunk)
+```
+
+```text
+('I read the list.', 310)
+('The room is booked.', 300)
+('I have the slides.', 310)
+('And we got the grant!', 0)
+```
+
+## Speak the chunks with XTTS
 
 ```bash
-pip install prosody-protocol TTS
+pip install coqui-tts
 ```
 
-## Basic Usage
-
+<!-- docs-test: skip -->
 ```python
-from prosody_protocol import IMLToSSML
+import wave
 
-converter = IMLToSSML()
-
-iml = '''<utterance emotion="calm">
-  Please <prosody rate="slow" pitch="-3%">take your time</prosody>.
-</utterance>'''
-
-ssml = converter.convert(iml)
-print(ssml)
-```
-
-## With Coqui TTS
-
-```python
+import numpy as np
 from TTS.api import TTS
-from prosody_protocol import IMLToSSML, IMLParser
 
-# Initialize Coqui TTS
-tts = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC")
+tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+rate = tts.synthesizer.output_sample_rate
 
-# Convert IML to plain text (Coqui basic mode)
-parser = IMLParser()
-doc = parser.parse(iml)
-text = parser.to_plain_text(doc)
+pieces = []
+for text, pause_ms in split_at_pauses(iml):
+    if text:
+        samples = tts.tts(text=text, speaker_wav="reference.wav", language="en")
+        pieces.append(np.asarray(samples, dtype=np.float32))
+    pieces.append(np.zeros(int(rate * pause_ms / 1000), dtype=np.float32))
 
-# Synthesize
-tts.tts_to_file(text=text, file_path="output.wav")
+audio = np.clip(np.concatenate(pieces), -1.0, 1.0)
+with wave.open("customer.wav", "wb") as out:
+    out.setnchannels(1)
+    out.setsampwidth(2)
+    out.setframerate(rate)
+    out.writeframes((audio * 32767).astype("<i2").tobytes())
 ```
 
-## Using Prosodic Cues for Voice Selection
+`reference.wav` is a few seconds of the voice to clone (use a recording you
+have the right to use). `tts.tts` returns the samples; `tts.tts_to_file(text=...,
+speaker_wav=..., language=..., file_path=...)` writes one chunk straight to a
+file. For an utterance that IML marks as faster or slower as a whole (such
+as `<prosody rate="170%">` around all of it), pass `speed=1.7` to that
+chunk's `tts.tts` call.
 
-Use the emotion from IML to select appropriate Coqui voices or styles:
+Check the model's license before you build on it. XTTS v2 is released
+under the Coqui Public Model License (CPML), which allows non-commercial
+use only. The first load downloads the model and stops at an interactive
+prompt until you accept the CPML (or state that you hold a commercial
+license); in a script or a container, set `COQUI_TOS_AGREED=1` to accept
+it without the prompt, which blocks otherwise.
 
-```python
-from prosody_protocol import IMLParser
+## When you need the prosody
 
-parser = IMLParser()
-doc = parser.parse(iml)
-emotion = doc.utterances[0].emotion
+- **espeak-ng, locally.** `IMLToAudio` speaks IML with espeak-ng, rendering
+  pitch, volume, rate, pauses, emphasis and pitch contours. The voice is
+  robotic, but the delivery follows the markup:
 
-# Map emotions to voice styles
-voice_map = {
-    "calm": "tts_models/en/ljspeech/tacotron2-DDC",
-    "joyful": "tts_models/en/ljspeech/glow-tts",
-    "sad": "tts_models/en/ljspeech/tacotron2-DDC",
-}
+  ```bash
+  prosody-protocol synthesize examples/sarcasm.iml -o sarcasm.wav
+  ```
 
-model_name = voice_map.get(emotion, voice_map["calm"])
-tts = TTS(model_name=model_name)
-```
+- **SSML engines.** Azure AI Speech, Google Cloud Text-to-Speech and Amazon
+  Polly accept `IMLToSSML`'s output to a much larger degree (breaks,
+  `<prosody>` rate, pitch and volume, and on some voices `<emphasis>`);
+  check the vendor's SSML reference for the voice you use.
 
-## IML-to-Audio via Built-in Synthesizer
-
-For quick prototyping, use the SDK's built-in synthesizer (no external TTS needed):
-
-```python
-from prosody_protocol import IMLToAudio
-
-synthesizer = IMLToAudio()
-wav_bytes = synthesizer.synthesize(iml)
-
-with open("output.wav", "wb") as f:
-    f.write(wav_bytes)
-```
-
-The built-in synthesizer produces basic sine-wave audio with pitch and volume
-modulation from IML attributes. For production use, pair with Coqui TTS or
-ElevenLabs for natural-sounding output.
-
-## Text-to-IML-to-Speech Pipeline
-
-Generate expressive speech from plain text:
-
-```python
-from prosody_protocol import TextToIML, IMLToSSML
-
-# 1. Predict prosody from text
-predictor = TextToIML()
-iml = predictor.predict(
-    "I can't believe this happened!",
-    context="frustrated",
-)
-
-# 2. Convert to SSML
-ssml = IMLToSSML().convert(iml)
-
-# 3. Synthesize with Coqui
-tts.tts_to_file(text=IMLParser().to_plain_text(IMLParser().parse(iml)),
-                file_path="frustrated_output.wav")
-```
+`IMLToAudio(engine="coqui")` is not implemented and raises
+`ConversionError`.

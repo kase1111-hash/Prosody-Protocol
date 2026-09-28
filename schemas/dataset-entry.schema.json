@@ -20,13 +20,14 @@
   "properties": {
     "id": {
       "type": "string",
-      "description": "Unique identifier for this entry.",
-      "minLength": 1
+      "description": "Unique identifier for this entry (unique within the dataset).",
+      "pattern": "\\S"
     },
     "timestamp": {
       "type": "string",
-      "description": "ISO-8601 timestamp when the entry was created.",
-      "format": "date-time"
+      "description": "ISO-8601 timestamp when the entry was created. The format is advisory: loaders warn about, but accept, other non-empty values.",
+      "format": "date-time",
+      "pattern": "\\S"
     },
     "source": {
       "type": "string",
@@ -40,17 +41,18 @@
     },
     "audio_file": {
       "type": "string",
-      "description": "Relative path to the audio file (WAV) within the dataset directory.",
-      "minLength": 1
+      "description": "Relative path to the audio file (WAV) within the dataset directory. It MUST NOT be absolute (/x, C:\\x, \\\\host\\x), contain a '..' segment, or contain a control character (U+0000-U+001F, U+007F).",
+      "pattern": "^(?![/\\\\])(?![A-Za-z]:)(?![\\s\\S]*[\\x00-\\x1f\\x7f])(?![\\s\\S]*?(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$))[\\s\\S]*\\S"
     },
     "transcript": {
       "type": "string",
-      "description": "Plain text transcript of the audio."
+      "description": "Plain text transcript of the audio.",
+      "pattern": "\\S"
     },
     "iml": {
       "type": "string",
-      "description": "IML-annotated version of the transcript.",
-      "minLength": 1
+      "description": "IML-annotated version of the transcript. It MUST be a valid IML document.",
+      "pattern": "\\S"
     },
     "speaker_id": {
       "type": ["string", "null"],
@@ -59,7 +61,7 @@
     "emotion_label": {
       "type": "string",
       "description": "Primary emotion label for the entry.",
-      "minLength": 1
+      "pattern": "\\S"
     },
     "annotator": {
       "type": "string",
@@ -68,7 +70,7 @@
     },
     "consent": {
       "type": "boolean",
-      "description": "Whether explicit consent was given for this data.",
+      "description": "Whether explicit consent was given for this data. Entries without it MUST NOT be stored or used (spec 8.1).",
       "const": true
     },
     "metadata": {

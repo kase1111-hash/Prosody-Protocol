@@ -1,79 +1,167 @@
 # Contributing to Prosody Protocol
 
-Thank you for your interest in contributing to the Prosody Protocol project.
+Thank you for your interest in contributing to the Prosody Protocol project:
+the IML specification, the `prosody_protocol` SDK, datasets and research are
+all welcome.
 
-## Getting Started
+## Development setup
 
 1. Fork and clone the repository.
-2. Install in development mode:
+2. Install the package in editable mode with the extras CI uses (Python 3.10
+   or newer):
 
    ```bash
-   pip install -e ".[dev]"
+   pip install -e ".[audio,ml,api,dev]"
    ```
 
-3. Run the test suite to verify your setup:
+   `whisper` (built-in speech recognition) is left out on purpose: it pulls
+   in PyTorch, and no test needs it.
+
+3. Optionally install the system tools some tests use. Tests that need them
+   skip when they are missing.
+
+   - **espeak-ng**: speech synthesis, and the speech fixtures of the audio
+     tests.
+   - **ffmpeg**: decoding OGG/Opus, WebM, M4A and MP3.
+
+   On Debian or Ubuntu: `sudo apt install espeak-ng ffmpeg`; on macOS:
+   `brew install espeak-ng ffmpeg`.
+
+4. Check what your environment can do, then run the tests:
 
    ```bash
+   prosody-protocol doctor
    pytest
    ```
 
-## Development Workflow
+## Checks
 
-1. Create a branch from `main` for your work.
-2. Make your changes, following the style guidelines below.
-3. Add or update tests for any new or changed behavior.
-4. Run the full check suite before submitting:
+Run these before opening a pull request; CI runs the same:
 
-   ```bash
-   ruff check src/ tests/
-   mypy src/
-   pytest --cov=prosody_protocol
-   ```
+```bash
+ruff check src/ tests/ training/ examples/
+mypy src/
+pytest --cov=prosody_protocol
+```
 
-5. Open a pull request with a clear description of the change.
+CI also runs the tests with only the core installed (the package without
+extras, plus pytest) and smoke-tests the built wheel. To try the core-only job
+locally, use a fresh virtual environment:
 
-## Code Style
+```bash
+python -m venv /tmp/pp-core && /tmp/pp-core/bin/pip install -e . pytest
+/tmp/pp-core/bin/pytest
+```
+
+## Where things live
+
+| Path | What |
+|------|------|
+| `spec.md` | The IML specification (normative) |
+| `schemas/` | XML Schema for IML; JSON schemas for prosody profiles and dataset entries |
+| `src/prosody_protocol/` | The SDK. `__init__.py` defines the public API |
+| `src/prosody_protocol/cli.py` | The `prosody-protocol` command (also `python -m prosody_protocol`) |
+| `src/prosody_protocol/server/` | The REST API (FastAPI) |
+| `training/` | scikit-learn baselines and their scripts (not in the wheel) |
+| `examples/` | Files for the README and examples/README.md; regenerate with `examples/make_examples.py` |
+| `tests/` | pytest suite; IML fixtures in `tests/fixtures/valid/` and `tests/fixtures/invalid/`, audio in `tests/fixtures/audio/` |
+| `docs/` | API reference, CLI reference, quickstart, integration guides |
+
+## Code conventions
 
 - Python 3.10+ with type annotations on all public APIs.
 - Formatted and linted with [Ruff](https://docs.astral.sh/ruff/) (line length 100).
 - Type-checked with [mypy](https://mypy-lang.org/) in strict mode.
-- Docstrings on all public classes and methods (Google style).
-
-## IML Examples
-
-When adding or editing IML examples anywhere in the project:
-
-- Examples must be valid XML.
-- Use realistic prosodic values (not extreme or nonsensical).
-- Always include `confidence` when `emotion` is present on `<utterance>`.
-- Prefer the core emotion vocabulary from `spec.md` Section 3.1.
-- Use RFC 2119 language (MUST, SHOULD, MAY) in spec text.
+- Docstrings on all public classes and methods.
+- **Keep the core lxml-only.** A bare install (`pip install .` or
+  `pip install -e .`, no extras) has only `lxml`. The modules that `prosody_protocol/__init__.py` imports directly
+  (parser, validator, models, exceptions, `_types`, alignment, assembler,
+  emotion_classifier, iml_to_ssml, text_to_iml, llm, profiles, datasets) and
+  `cli.py` must import with the standard library and lxml alone. Code that
+  needs numpy or praat-parselmouth goes in a module listed in `_LAZY` in
+  `__init__.py`, which raises `ImportError` naming the extra to install.
+  Tests that need an extra start with `pytest.importorskip(...)`.
+- Expected errors raise a subclass of `ProsodyProtocolError`, never a raw
+  third-party exception.
 
 ## Tests
 
 - Tests use [pytest](https://docs.pytest.org/).
-- Place IML test fixtures in `tests/fixtures/valid/` or `tests/fixtures/invalid/`.
-- Name fixtures descriptively: `valid_sarcasm.xml`, `invalid_missing_confidence.xml`.
-- Aim for high coverage on parser and validator code.
+- Add or update tests for any new or changed behavior, and check that a new
+  test fails without the change.
+- Name IML fixtures descriptively: `valid_sarcasm.xml`,
+  `invalid_missing_confidence.xml`.
+- The audio fixtures and the synthetic training dataset are generated by
+  `tests/generate_audio_fixtures.py` and
+  `tests/generate_training_fixture.py` (they need espeak-ng and the `audio`
+  extra).
+
+## Documentation
+
+`tests/test_docs_examples.py` checks the examples in README.md,
+examples/README.md and `docs/**/*.md`:
+
+- `python` blocks of a file run in order, in one namespace, from a scratch
+  directory where `examples/` points to the repository's examples;
+- `xml` blocks rooted at `<iml>` or `<utterance>` must be valid IML
+  (fragments rooted at `<prosody>`, `<emphasis>`, `<pause>` or `<segment>`
+  are checked inside an `<utterance>`);
+- lines of `bash`, `sh`, `shell` or `console` blocks that start with
+  `prosody-protocol` run through the CLI and must exit 0 (`serve` is
+  skipped).
+
+Put `<!-- docs-test: skip -->` on the line above a block only when it calls
+an external service (an LLM API, a hosted speech recognizer or TTS) or needs
+the `whisper` extra or network access, and keep the `prosody_protocol` part
+of such an example in a separate block that runs. Put
+`<!-- docs-test: invalid -->` above an IML example that is meant to be
+invalid. Show real output: run the example and paste what it prints.
+Run just these tests with:
+
+```bash
+pytest -p no:cacheprovider tests/test_docs_examples.py
+```
+
+Be honest about what the code does. Emotion labels are heuristic estimates,
+prosodic cues must never be presented as the sole basis for a
+consequential decision, and no example may suggest a use that spec
+Section 8.2 prohibits (deception detection, covert emotional
+surveillance, profiling in hiring, lending or law enforcement).
+
+## IML examples
+
+When adding or editing IML examples anywhere in the project:
+
+- Examples must be valid XML and pass `IMLValidator`.
+- Use realistic prosodic values (not extreme or nonsensical).
+- Always include `confidence` when `emotion` is present on `<utterance>`.
+- Prefer the core emotion vocabulary from `spec.md` Section 3.1.
+- Use RFC 2119 language (MUST, SHOULD, MAY) in normative spec text, and
+  keep `tests/test_xsd.py` passing: it checks every spec example against
+  the validator and the XML Schema.
 
 ## Datasets
 
-If contributing dataset entries:
+Dataset entries must pass both `schemas/dataset-entry.schema.json` and
+`DatasetLoader` (see [datasets/README.md](datasets/README.md)):
 
-- Each entry must conform to `schemas/dataset-entry.schema.json` (when available).
-- Audio must be WAV format, 16kHz mono recommended.
-- IML annotations must pass `IMLValidator`.
-- Include consent confirmation in the entry metadata.
+- Every entry needs `"consent": true`, recorded only when the speaker
+  explicitly agreed to have their speech and its emotional annotations
+  stored (spec Section 8.1). Entries without it are never loaded.
+- Audio is referenced by a relative path inside the dataset; WAV, 16 kHz
+  mono is recommended.
+- The `iml` field must be valid IML.
 
-## Reporting Issues
+## Reporting issues
 
-Open an issue on GitHub with:
+Open an issue on [GitHub](https://github.com/kase1111-hash/Prosody-Protocol/issues) with:
 
 - A clear title and description.
-- Steps to reproduce (if applicable).
-- Expected vs. actual behavior.
-- IML snippets or audio samples if relevant.
+- Steps to reproduce, and the output of `prosody-protocol doctor`.
+- Expected and actual behavior.
+- IML snippets or audio samples if relevant (only audio you may share).
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the MIT License (code) or CC-BY-4.0 (specification and documentation).
+By contributing, you agree that your contributions will be licensed under
+the MIT License (code) or CC-BY-4.0 (specification and documentation).

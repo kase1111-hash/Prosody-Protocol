@@ -1,0 +1,56 @@
+{
+  "text": " I never said she stole my money.",
+  "segments": [
+    {
+      "id": 0,
+      "start": 0.25,
+      "end": 3.895,
+      "text": " I never said she stole my money.",
+      "words": [
+        {
+          "word": " I",
+          "start": 0.25,
+          "end": 0.564,
+          "probability": 1.0
+        },
+        {
+          "word": " never",
+          "start": 0.614,
+          "end": 1.081,
+          "probability": 1.0
+        },
+        {
+          "word": " said",
+          "start": 1.131,
+          "end": 1.536,
+          "probability": 1.0
+        },
+        {
+          "word": " she",
+          "start": 2.136,
+          "end": 2.494,
+          "probability": 1.0
+        },
+        {
+          "word": " stole",
+          "start": 2.544,
+          "end": 3.009,
+          "probability": 1.0
+        },
+        {
+          "word": " my",
+          "start": 3.059,
+          "end": 3.482,
+          "probability": 1.0
+        },
+        {
+          "word": " money.",
+          "start": 3.532,
+          "end": 3.895,
+          "probability": 1.0
+        }
+      ]
+    }
+  ],
+  "language": "en"
+}

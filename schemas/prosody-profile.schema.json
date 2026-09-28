@@ -20,8 +20,8 @@
       "examples": ["user_789"]
     },
     "description": {
-      "type": "string",
-      "description": "Human-readable description of the user's prosodic characteristics and why this profile exists.",
+      "type": ["string", "null"],
+      "description": "Human-readable description of the user's prosodic characteristics and why this profile exists, or null.",
       "examples": ["Autism spectrum - monotone speech with rate-based expression"]
     },
     "prosody_mappings": {

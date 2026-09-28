@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!-- INVALID: encoded in ISO-8859-1, not UTF-8 (violates V30 / spec 2.2) -->
+<utterance>
+  Un café, s'il vous plaît.
+</utterance>

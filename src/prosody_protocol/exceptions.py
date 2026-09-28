@@ -1,5 +1,13 @@
 """Custom exception hierarchy for the prosody_protocol SDK."""
 
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .validator import ValidationIssue
+
 
 class ProsodyProtocolError(Exception):
     """Base exception for all prosody_protocol errors."""
@@ -21,7 +29,18 @@ class IMLParseError(ProsodyProtocolError):
 
 
 class IMLValidationError(ProsodyProtocolError):
-    """Raised when IML document fails validation."""
+    """Raised when an IML document fails validation.
+
+    ``issues`` holds the :class:`~prosody_protocol.validator.ValidationIssue`
+    objects that made the document invalid (empty when none were given).
+    :meth:`ValidationResult.raise_for_errors
+    <prosody_protocol.validator.ValidationResult.raise_for_errors>` raises
+    this with the document's errors attached.
+    """
+
+    def __init__(self, message: str, issues: Sequence[ValidationIssue] = ()) -> None:
+        self.issues: tuple[ValidationIssue, ...] = tuple(issues)
+        super().__init__(message)
 
 
 class ProfileError(ProsodyProtocolError):

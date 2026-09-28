@@ -1,0 +1,32 @@
+task: pitch_contour
+description: "Pitch contour shape classification of measured F0 tracks by a random forest"
+
+model:
+  type: random_forest          # scikit-learn baseline
+  n_estimators: 50
+  max_depth: 8
+
+data:
+  sequence_length: 20          # resample each F0 track to this many points (semitones)
+  contour_classes:             # entries annotated with other contours are skipped
+    - rise
+    - fall
+    - rise-fall
+    - fall-rise
+    - flat
+
+training:                      # scikit-learn RandomForestClassifier parameters
+  min_samples_split: 2
+  min_samples_leaf: 1
+  random_state: 42
+
+evaluation:
+  metrics:
+    - precision
+    - recall
+    - f1
+  average: macro
+
+output:
+  checkpoint_dir: training/checkpoints/pitch_contour_forest
+  export_format: json

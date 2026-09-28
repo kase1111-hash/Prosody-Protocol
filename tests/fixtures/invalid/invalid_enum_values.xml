@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INVALID: rate, pitch_contour, quality, tempo and rhythm outside their vocabularies
+     (violates V22-V26 / spec 3.2, 3.5) -->
+<utterance>
+  <segment tempo="glacial" rhythm="jazzy">
+    <prosody rate="ludicrous" pitch_contour="wobble" quality="robotic">Hello there.</prosody>
+  </segment>
+</utterance>

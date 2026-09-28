@@ -1,6 +1,6 @@
 {
   "name": "training_synthetic",
-  "version": "0.1.0",
-  "description": "Synthetic dataset for training pipeline validation (10 samples)",
+  "version": "0.2.0",
+  "description": "10 short espeak-ng clips whose speed, pitch, pitch range and loudness follow their emotion label (tests/generate_training_fixture.py). Synthetic: it tests the training pipeline, it does not teach real emotion recognition.",
   "size": 10
 }

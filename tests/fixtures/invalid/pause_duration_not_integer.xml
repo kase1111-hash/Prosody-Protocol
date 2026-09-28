@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INVALID: pause durations written with digit separators and non-ASCII digits
+     (violates V6 / spec 2.6, 3.3) -->
+<utterance>
+  Well<pause duration="8_00"/> I<pause duration="&#1640;&#1632;&#1632;"/> suppose.
+</utterance>

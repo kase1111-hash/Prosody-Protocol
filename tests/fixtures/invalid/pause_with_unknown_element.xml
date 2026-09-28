@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- INVALID: <pause> contains an element; unknown elements are content here
+     (violates V7 / spec 3.3) -->
+<utterance xmlns:x="urn:example:notes">
+  Well<pause duration="800"><x:note/></pause> I suppose.
+</utterance>

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE utterance [
+  <!ENTITY product "Prosody Protocol">
+]>
+<!-- INVALID: IML documents must not contain a DOCTYPE (violates V31 / spec 2.5) -->
+<utterance>
+  I love &product;.
+</utterance>

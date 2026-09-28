@@ -1,0 +1,43 @@
+task: ser
+description: "Speech emotion recognition: logistic regression on prosodic features measured from the audio"
+
+model:
+  type: logistic_regression    # scikit-learn baseline
+  labels:                      # the data may only contain these emotion labels
+    - neutral
+    - angry
+    - frustrated
+    - joyful
+    - sad
+    - fearful
+    - sarcastic
+    - calm
+
+data:
+  features:                    # measured from each entry's audio by ProsodyAnalyzer
+    - f0_mean                  # Hz
+    - f0_range                 # Hz
+    - intensity_mean           # dB
+    - speech_rate              # syllables/second
+    - jitter                   # percent
+    - shimmer                  # percent
+    - hnr                      # dB
+  label_field: emotion_label
+
+training:                      # scikit-learn LogisticRegression parameters
+  C: 1.0                       # inverse regularisation strength
+  max_iter: 200
+  solver: lbfgs
+  class_weight: balanced       # weight classes by inverse frequency
+  random_state: 42
+
+evaluation:
+  metrics:
+    - precision
+    - recall
+    - f1
+  average: macro
+
+output:
+  checkpoint_dir: training/checkpoints/ser_logreg
+  export_format: json

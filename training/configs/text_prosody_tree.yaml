@@ -1,8 +1,8 @@
 task: text_to_prosody
-description: "Per-token prosodic label prediction from plain text"
+description: "Per-token prosody labels (read from IML markup) predicted from plain-text features by a decision tree"
 
 model:
-  type: decision_tree    # baseline; swap for BERT + sequence labeling when ml extras installed
+  type: decision_tree          # scikit-learn baseline
   max_depth: 10
 
 data:
@@ -14,7 +14,7 @@ data:
     - sentence_position
     - prev_word_length
     - next_word_length
-  labels:
+  labels:                      # label dimensions, read from <prosody>/<emphasis>/<segment>
     pitch_level:
       - high
       - mid
@@ -28,9 +28,10 @@ data:
       - normal
       - slow
 
-training:
+training:                      # scikit-learn DecisionTreeClassifier parameters
   min_samples_split: 2
   min_samples_leaf: 1
+  random_state: 42
 
 evaluation:
   metrics:
@@ -40,5 +41,5 @@ evaluation:
   average: macro
 
 output:
-  format: pickle
+  checkpoint_dir: training/checkpoints/text_prosody_tree
   export_format: json
