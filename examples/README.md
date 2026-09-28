@@ -1,10 +1,12 @@
 # Examples
 
 Small files to try the SDK, the `prosody-protocol` command and the REST API
-with. Run the commands from the repository root. The commands that read
-audio need the `audio` extra (`pip install 'prosody-protocol[audio]'`);
-`synthesize` speaks with espeak-ng when it is installed. `prosody-protocol
-doctor` shows what your installation can do.
+with. Run the commands from the root of a clone. The commands that read
+audio need the `audio` extra (`pip install -e ".[audio]"`); `synthesize`
+speaks with espeak-ng when it is installed. `prosody-protocol doctor` shows
+what your installation can do. The [quick start](../docs/quickstart.md)
+walks through the same files in Python, and the
+[CLI reference](../docs/cli.md) lists every option.
 
 | File | What it is |
 |------|------------|
@@ -12,14 +14,14 @@ doctor` shows what your installation can do.
 | `speech.whisper.json` | The word timings of `speech.wav` as an openai-whisper `transcribe(..., word_timestamps=True)` result: `segments[].words[]`, with Whisper's leading spaces and times in seconds (recognizer statistics such as tokens and log-probabilities are left out). The timings are exact: the audio was built word by word. |
 | `speech.txt` | The plain transcript of `speech.wav`. |
 | `monotone.wav` | Four short sentences in a flat, monotone synthetic voice, 6.4 s, 16 kHz mono: three at an ordinary pace, then "And we got the grant!" much faster. The speaker of `profile.json`. |
-| `monotone.deepgram.json` | The word timings of `monotone.wav` as a Deepgram transcription response (`results.channels[0].alternatives[0].words[]`). `--words` recognises the shape of each supported recogniser's output. |
+| `monotone.deepgram.json` | The word timings of `monotone.wav` as a Deepgram transcription response (`results.channels[0].alternatives[0].words[]`). `--words` recognizes the shape of each supported recognizer's output. |
 | `sarcasm.iml` | A two-utterance IML document: a frustrated customer, then a sarcastic one. |
 | `profile.json` | A prosody profile (spec Section 7) for a speaker whose flat, monotone delivery is easily misread: a flat voice is their calm, and fast speech their excitement. |
 | `make_examples.py` | Regenerates `speech.wav`, `speech.whisper.json`, `speech.txt`, `monotone.wav` and `monotone.deepgram.json` (needs espeak-ng and the `audio` extra). |
 
 ## Annotate a recording
 
-Bring the words from any speech recogniser (here, Whisper's output) and let
+Bring the words from any speech recognizer (here, Whisper's output) and let
 the SDK measure how they were said:
 
 ```sh
@@ -53,7 +55,7 @@ prosody-protocol from-audio examples/speech.wav --words examples/speech.whisper.
 
 With only a transcript (no timings), prosody is measured for the utterance
 as a whole; with neither, Whisper transcribes the audio if it is installed
-(`pip install 'prosody-protocol[whisper]'`), and otherwise each stretch of
+(`pip install -e ".[whisper]"`), and otherwise each stretch of
 speech is a `[speech]` placeholder:
 
 ```sh
@@ -156,10 +158,14 @@ for match in result.profile_matches:
 
 ## REST API
 
-Start the server with `prosody-protocol serve` (needs the `api` extra), then:
+Start the server with `prosody-protocol serve` (needs the `api` extra:
+`pip install -e ".[api]"`), then:
 
 ```sh
 curl -F audio=@examples/speech.wav -F words=@examples/speech.whisper.json -F language=en-US http://127.0.0.1:8000/v1/convert/audio-to-iml
 curl -F audio=@examples/monotone.wav -F words=@examples/monotone.deepgram.json -F profile=@examples/profile.json http://127.0.0.1:8000/v1/convert/audio-to-iml
 python -c 'import json; print(json.dumps({"iml": open("examples/sarcasm.iml").read()}))' | curl -H 'Content-Type: application/json' -d @- http://127.0.0.1:8000/v1/convert/iml-to-prompt
 ```
+
+The [API reference](../docs/API.md#rest-api) documents every endpoint, its
+fields and errors, and the server's `PP_*` settings.

@@ -8,7 +8,7 @@ the source checkout only; they are not part of the installed
 | Task | Config | Model | Input features | Target labels |
 |------|--------|-------|----------------|---------------|
 | `ser` (speech emotion recognition) | `configs/ser_logreg.yaml` | logistic regression | prosody of each recording, measured by `ProsodyAnalyzer`: F0 mean and range (Hz), intensity (dB), speech rate (syllables/s), jitter and shimmer (%), HNR (dB) | the entry's `emotion_label` |
-| `text_to_prosody` | `configs/text_prosody_tree.yaml` | decision tree | per token of text: length, position, capitalisation, punctuation, neighbours' lengths | per token: pitch/volume/rate level read from the IML markup around it |
+| `text_to_prosody` | `configs/text_prosody_tree.yaml` | decision tree | per token of text: length, position, capitalization, punctuation, neighbors' lengths | per token: pitch/volume/rate level read from the IML markup around it |
 | `pitch_contour` | `configs/pitch_contour_forest.yaml` | random forest | the recording's F0 track, resampled to 20 points in semitones relative to its median | the `pitch_contour` of a `<prosody>` covering the entry's whole text |
 
 Features always come from the audio or the text, and labels from the
@@ -56,11 +56,19 @@ What each task needs:
   out; entries annotated only in part are skipped with a warning.
 
 The repository ships no training corpus. The only dataset in it is the test
-fixture `tests/fixtures/datasets/training_synthetic`: 10 entries whose audio
-files are the **same 440 Hz tone**. The commands below use it to show that
-the pipeline runs. It cannot teach a model anything. Train on your own
-recordings, or on a Mavis export (`MavisBridge.export_dataset` with
-`audio_path` for each session).
+fixture `tests/fixtures/datasets/training_synthetic`: 10 short clips of
+espeak-ng speech (16 kHz mono, under 2 s each), one speaker, eight emotion
+labels. Each clip's speed, pitch, pitch range and loudness follow its label
+the way acted emotional speech tends to (angry: louder, faster, higher;
+sad: quieter, slower, lower; and so on), so there is something to learn,
+but the "emotion" is nothing more than those synthesizer settings. The
+commands below use it to show that the pipeline runs; it says nothing about
+real emotional speech. `python tests/generate_training_fixture.py`
+regenerates it (it needs espeak-ng and the `audio` extra).
+
+Train on your own recordings, or on a Mavis export
+(`MavisBridge.export_dataset` with `audio_path` for each session). Aim for
+dozens of recordings per class at least, from several speakers.
 
 ## Commands
 
@@ -79,7 +87,7 @@ python training/scripts/data_prep.py \
 ```
 
 ```
-UserWarning: Cannot split 10 entries into 3 speaker_id-disjoint sets: they have only 1 distinct speaker_id value(s). ...
+UserWarning: Cannot split 10 entries into 3 speaker_id-disjoint sets: they have only 1 distinct speaker_id value(s). Splitting entries individually; evaluation sets share speaker_ids with the training set.
 Data prepared for task 'ser' in /tmp/pp/prepared/ser:
   train: 8 entries, 8 rows
   val: 1 entries, 1 rows
@@ -107,17 +115,18 @@ Training complete for task 'ser'
   Features: f0_mean, f0_range, intensity_mean, speech_rate, jitter, shimmer, hnr
   Classes: angry, calm, fearful, frustrated, joyful, neutral, sad, sarcastic
   Training samples: 8
-  Training time: 0.008s
-  Train accuracy: 0.125
+  Training time: 0.011s
+  Train accuracy: 1.0
   Val accuracy: 0.0000 (1 samples)
   Val macro F1: 0.0000
   Checkpoint saved to: /tmp/pp/checkpoints/ser
 ```
 
-A train accuracy of 0.125 is correct here: 8 identical clips carry 8
-different labels, so no model can do better than one in eight. Use
-`--dataset <dir>` instead of `--prepared-data` to prepare and train in one
-step. Without `--output`, the checkpoint goes to the config's
+(The training time varies.) The perfect train accuracy is memorization:
+the 8 training clips carry 8 different labels, and 7 features are enough
+to tell 8 points apart. The one validation clip (neutral) is misclassified.
+Use `--dataset <dir>` instead of `--prepared-data` to prepare and train in
+one step. Without `--output`, the checkpoint goes to the config's
 `output.checkpoint_dir`.
 
 The checkpoint directory holds `model.joblib` (the model), `metadata.json`
@@ -136,17 +145,22 @@ python training/scripts/evaluate.py \
 ```
 Label                 Precision     Recall         F1  Support
 --------------------------------------------------------------
-angry                    1.0000     1.0000     1.0000        1
+angry                    0.0000     0.0000     0.0000        1
 calm                        n/a        n/a        n/a        0
 fearful                     n/a        n/a        n/a        0
-...
+frustrated               0.0000     0.0000     0.0000        0
+joyful                      n/a        n/a        n/a        0
+neutral                     n/a        n/a        n/a        0
+sad                         n/a        n/a        n/a        0
 sarcastic                   n/a        n/a        n/a        0
 --------------------------------------------------------------
-macro avg                1.0000     1.0000     1.0000        1
-accuracy                                       1.0000        1
+macro avg                0.0000     0.0000     0.0000        1
+accuracy                                       0.0000        1
 
 Report saved to: /tmp/pp/reports/ser_test.json
 ```
+
+(The data preparation warning from step 1 is printed first.)
 
 `--dataset` prepares the split again, using the config saved in the
 checkpoint (`--config` overrides it); `--prepared-data <dir>` evaluates
@@ -155,10 +169,10 @@ split, in its true labels or its predictions, as scikit-learn's does.
 Classes the model knows but the split lacks are listed as `n/a`, and in the
 JSON report they have `null` scores.
 
-The 1.0 above is **chance**. The model cannot tell the identical clips
-apart, so it gives every input the same label. The single test entry
-happens to have that label. A test split of one entry measures nothing:
-evaluate on dozens of entries per class at least.
+The single test entry is an angry clip, which the model calls frustrated
+(the fixture's angry and frustrated clips are both loud and fast). Either
+way, a test split of one entry measures nothing: evaluate on dozens of
+entries per class at least, from speakers the model was not trained on.
 
 ### 4. Export
 
@@ -175,7 +189,7 @@ Model exported successfully:
   Format: json (config.json, model.json)
 ```
 
-`--format json` (the default, or the config's `output.export_format`) writes
+The directory also gets `export_metadata.json`. `--format json` (the default, or the config's `output.export_format`) writes
 `model.json`, which holds the fitted parameters as plain JSON: class names,
 feature names, the imputation and scaling values, and coefficients or tree
 nodes. `training/portable.py` documents the format. `PortableModel` runs it
@@ -197,19 +211,21 @@ classifier = TrainedEmotionClassifier("/tmp/pp/exports/ser")
 converter = AudioToIML(emotion_classifier=classifier)
 print(converter.convert(
     "tests/fixtures/datasets/training_synthetic/audio/synth_002.wav",
-    transcript="I CANNOT believe you did that!",
+    transcript="I cannot believe you did that!",
 ))
 ```
 
 ```
-<iml version="0.1.0"><utterance>I CANNOT believe you did that!</utterance></iml>
+<iml version="0.1.0"><utterance emotion="frustrated" confidence="0.69"><prosody pitch_contour="fall">I cannot believe you did that!</prosody></utterance></iml>
 ```
 
-The classifier summarises the utterance's word features with the same code
-data preparation uses (`training/features.py`), so the model sees the kind
-of input it was trained on. Its confidence is the model's probability for
-the label. `AudioToIML` leaves out the emotion when that is below 0.5, as
-here: the fixture model gives every label 1/8. Utterances without voiced
+This clip is labeled angry: the model, trained on eight clips, is wrong
+and fairly sure of itself, which is what an uncalibrated model trained on
+little data does. The classifier summarizes the utterance's word features
+with the same code data preparation uses (`training/features.py`), so the
+model sees the kind of input it was trained on. Its confidence is the
+model's probability for the label; `AudioToIML` leaves out the emotion when
+that is below 0.5 (`min_emotion_confidence`). Utterances without voiced
 speech get `("neutral", 0.0)`, which means no emotion.
 `TrainedEmotionClassifier.from_checkpoint(dir)` builds the classifier from
 a checkpoint instead (a pickle; see below).
@@ -220,12 +236,25 @@ To run any exported model on feature rows directly:
 from training.portable import PortableModel
 
 model = PortableModel.load("/tmp/pp/exports/ser")    # directory or model.json
-model.feature_names                                  # ('f0_mean', 'f0_range', ...)
-model.predict_labels([[180.0, 40.0, 65.0, 4.0, 1.0, 3.0, 18.0]])
+print(model.feature_names)
+print(model.predict_labels([[180.0, 40.0, 65.0, 4.0, 1.0, 3.0, 18.0]]))
+```
+
+```
+('f0_mean', 'f0_range', 'intensity_mean', 'speech_rate', 'jitter', 'shimmer', 'hnr')
+['fearful']
 ```
 
 Text-prosody and pitch-contour models export the same way. They are not
 wired into `TextToIML` or `AudioToIML`.
+
+The other two tasks need annotations the fixture barely has. Its IML marks
+only whole utterances, so `text_prosody_tree.yaml` trains on a single class
+(every token is `mid_normal_normal`) and scores a meaningless 1.0; and
+`pitch_contour_forest.yaml` stops with `Error: Training set is empty: no
+usable entries in the train split (entries skipped in all splits, by
+reason: {'no pitch_contour covering the whole utterance': 10})`, exit
+status 1.
 
 ## Checkpoints are pickles
 
@@ -262,7 +291,7 @@ have scikit-learn's meaning:
 
 | Model type | Hyperparameters |
 |------------|-----------------|
-| `logistic_regression` | `C` (inverse regularisation strength), `max_iter`, `solver` (`lbfgs`, `newton-cg`, `newton-cholesky`, `sag`, `saga`; `liblinear` for two classes), `class_weight` (`balanced` or null), `random_state` |
+| `logistic_regression` | `C` (inverse regularization strength), `max_iter`, `solver` (`lbfgs`, `newton-cg`, `newton-cholesky`, `sag`, `saga`; `liblinear` for two classes), `class_weight` (`balanced` or null), `random_state` |
 | `decision_tree` | `max_depth`, `min_samples_split`, `min_samples_leaf`, `class_weight`, `random_state` |
 | `random_forest` | the `decision_tree` ones and `n_estimators` |
 
@@ -301,7 +330,7 @@ always trained these scikit-learn baselines.
 - **Absolute features.** The SER features are absolute: Hz and dB. They
   depend on the speaker's voice and on the microphone and gain as much as
   on emotion, so a model trained on one set of speakers or recording
-  conditions transfers poorly to others. There is no speaker normalisation.
+  conditions transfers poorly to others. There is no speaker normalization.
   The SDK's rule-based `RuleBasedEmotionClassifier` judges deviations from
   a speaker baseline instead.
 - **Uncalibrated confidence.** The confidence is a raw logistic-regression
@@ -311,9 +340,10 @@ always trained these scikit-learn baselines.
   and pitch-contour features describe whole recordings.
 - **Shallow text features.** The text-to-prosody features do not look at
   what the words mean. Expect the model to learn patterns such as "the
-  capitalised word is stressed", not real prosody prediction.
+  capitalized word is stressed", not real prosody prediction.
 - **Small splits are noise.** Metrics from a handful of samples (as with
   the fixture's 1-entry val and test splits) are noise. Check the support
   column.
-- **Synthetic fixture.** The fixture dataset's clips are identical. Poor
-  scores on it are the correct result.
+- **Synthetic fixture.** The fixture's clips are espeak-ng speech whose
+  "emotion" is a handful of synthesizer settings, from one voice. Scores on
+  it, good or bad, say nothing about real speech.

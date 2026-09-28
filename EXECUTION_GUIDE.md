@@ -1,5 +1,11 @@
 # Prosody Protocol -- Execution Guide
 
+> **Historical document.** This is the original build plan, kept for
+> reference. It is not maintained and does not describe the current code:
+> names, file layouts, defaults and some planned features differ. For
+> current usage see the [README](README.md), [docs/](docs/) and
+> [CHANGELOG.md](CHANGELOG.md); for the format, [spec.md](spec.md).
+
 A step-by-step coding plan for bringing the Prosody Protocol from specification to production. Each phase is broken into discrete milestones with concrete deliverables, file layouts, dependencies, and acceptance criteria.
 
 ---
