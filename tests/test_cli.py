@@ -31,6 +31,7 @@ from prosody_protocol import __version__, cli
 from prosody_protocol._install import install_hint
 from prosody_protocol.cli import main
 from prosody_protocol.llm import build_messages, to_llm_context
+from prosody_protocol.models import Prosody
 from prosody_protocol.parser import IMLParser
 from prosody_protocol.validator import IMLValidator
 
@@ -377,6 +378,23 @@ class TestTextCommands:
 
 @needs_audio
 class TestFromAudio:
+    def test_several_calibration_recordings(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """Earlier turns of a conversation can be the baseline together."""
+        words = json.loads((AUDIO / "speech_raised.json").read_text())["words"]
+        words_file = write(tmp_path, "words.json", json.dumps(words))
+        code, out, err = run(
+            capsys, "from-audio", str(AUDIO / "speech_raised.wav"), "--words", words_file,
+            "--calibration", str(AUDIO / "speech_calibration.wav"),
+            "--calibration", str(SPEECH),
+        )
+        assert code == 0, err
+        [utterance] = IMLParser().parse(out).utterances
+        [child] = utterance.children
+        assert isinstance(child, Prosody) and child.pitch and child.pitch.startswith("+")
+        assert "No speaker baseline" not in err
+
     def test_words_give_emphasis_and_pauses(
         self, capsys: pytest.CaptureFixture[str], tmp_path: Path
     ) -> None:
@@ -829,6 +847,22 @@ class TestBenchmark:
             "--tolerance", "0.9",
         )
         assert code == 0
+
+    def test_calibration_reproduces_the_committed_baseline(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The CLI reproduces tests/fixtures/benchmarks/make_baselines.py's run."""
+        dataset = FIXTURES / "datasets" / "training_synthetic"
+        baseline = FIXTURES / "benchmarks" / "training_synthetic.json"
+        args = ["benchmark", str(dataset), "--stt", "none", "--baseline", str(baseline)]
+        code, out, _ = run(
+            capsys, *args, "--calibration", str(dataset / "audio" / "synth_001.wav")
+        )
+        assert code == 0, out
+        # Without a baseline recording, every single-utterance clip abstains.
+        code, out, _ = run(capsys, *args)
+        assert code == 1
+        assert "emotion_coverage regressed" in out or "was not measured" in out, out
 
     def test_thresholds(self, capsys: pytest.CaptureFixture[str]) -> None:
         code, out, _ = run(

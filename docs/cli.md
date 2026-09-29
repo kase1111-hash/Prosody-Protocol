@@ -279,7 +279,7 @@ Other options:
 |--------|--------|
 | `--language TAG` | BCP 47 language tag, e.g. `en-US` (`en_US` is accepted as `en-US`). Labels the output and is passed to Whisper. |
 | `--profile FILE` | the speaker's prosody profile (JSON, spec Section 7). Notes on standard error say which utterances it set. |
-| `--calibration AUDIO` | a recording of the same speaker talking as usual (for example an earlier turn), used as the baseline for pitch, loudness, rate, emotion and the profile. One recording here; the SDK (`calibration_audio=`) and the REST API take several. Not used when the words carry several speaker labels. |
+| `--calibration AUDIO` | a recording of the same speaker talking as usual (for example an earlier turn), used as the baseline for pitch, loudness, rate, emotion and the profile. Repeat it for several recordings (such as several earlier turns); each is analyzed once. Not used when the words carry several speaker labels. |
 | `--extended` | add the measurements (`f0_mean`, `jitter`, ...) to the words; the markup and the text are otherwise the same |
 | `--min-confidence F` | leave out emotions below this confidence (default 0.5) |
 | `--json` | print `{iml, plain_text, transcript_source, warnings, profile_matches}` |
@@ -440,7 +440,8 @@ To play it at once, write to standard output:
 ```text
 prosody-protocol benchmark DATASET_DIR [--save REPORT.json] [--baseline REPORT.json]
     [--tolerance F] [--threshold METRIC=VALUE]... [--max-samples N]
-    [--words-from {auto,timings,transcript,stt}] [--stt {auto,whisper,none}]
+    [--calibration AUDIO] [--words-from {auto,timings,transcript,stt}]
+    [--stt {auto,whisper,none}]
     [--abstention-label LABEL] [--language TAG]
 ```
 
@@ -468,6 +469,7 @@ outputs that are only placeholders are left out of those metrics.
 | `--tolerance F` | allowed drop against the baseline (default 0.01) |
 | `--threshold METRIC=VALUE` | a limit, repeatable: minimums for `emotion_accuracy`, `emotion_coverage`, `emotion_f1_macro`, `pitch_accuracy`, `pitch_coverage`, `pause_f1`, `validity_rate`; maximums for `confidence_ece`, `failure_rate` (default 0, so any failed conversion fails). An `emotion_accuracy` limit without an `emotion_coverage` limit counts entries without an emotion as wrong (likewise `pitch_accuracy` and `pitch_coverage`) |
 | `--max-samples N` | evaluate only the first N entries |
+| `--calibration AUDIO` | a recording of the speakers talking as usual, used as the baseline for every entry (repeat for several). Without one, an entry that is a single utterance gets no emotion; tests/fixtures/benchmarks/training_synthetic.json was made with `--stt none --calibration tests/fixtures/datasets/training_synthetic/audio/synth_001.wav` |
 | `--abstention-label LABEL` | score an output without an emotion as LABEL (such as `neutral`); by default it is an abstention, which lowers `emotion_coverage` and counts as a miss in the per-class F1, but is left out of `emotion_accuracy` |
 | `--stt`, `--language` | as for `from-audio` |
 

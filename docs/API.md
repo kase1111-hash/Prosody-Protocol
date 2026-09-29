@@ -184,7 +184,7 @@ subtag of 1-8 letters followed by `-` and subtags of 1-8 letters or digits
 registry, so `english` passes. Language arguments of the SDK and the CLI
 read a POSIX-style `en_US` as `en-US`; IML documents and dataset entries
 are checked as written, so `language="en_US"` in a document is a V29 error.
-The REST API's `language` field takes only the tag form (`en_US` is a 422).
+The REST API's `language` field reads `en_US` as `en-US` too.
 
 ## Data models
 

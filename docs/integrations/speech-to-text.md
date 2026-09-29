@@ -299,17 +299,17 @@ for warning in result.warnings:
 0: [pause 0.3s] The room is booked.
 1: [pause 0.3s] I have the slides.
 1: And we got the grant!
-Speaker '0': No speaker baseline: without calibration_audio, ...
-Speaker '1': No speaker baseline: without calibration_audio, ...
+Speaker '0': No speaker baseline: the speaker's usual pitch  ...
+Speaker '1': No speaker baseline: the speaker's usual pitch  ...
 ```
 
 (The warnings are cut short here.) Each speaker has only two utterances,
 too few to show their usual voice, so neither gets a baseline, and "And we
 got the grant!" is no longer marked as fast. `calibration_audio` and a
 prosody profile describe one speaker, so they are not used when the words
-carry several speaker labels, and a warning says so (the "No speaker
-baseline" warnings above still name `calibration_audio` as the remedy). To
-use them, convert one speaker's words on their own.
+carry several speaker labels, and a warning says so. To use them, convert
+one speaker's words on their own, as the "No speaker baseline" warnings
+advise.
 
 Without speaker labels, a conversation is measured as one speaker. When the
 utterances' pitch falls into two groups more than 7 semitones apart, as

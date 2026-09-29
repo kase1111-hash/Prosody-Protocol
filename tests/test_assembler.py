@@ -510,6 +510,18 @@ class TestSpeakers:
         assert any(n.startswith("The prosody profile describes one speaker") for n in assembly.info)
         assert assembly.matches == []
 
+    def test_baseline_advice_with_several_speakers_does_not_ask_for_calibration(self) -> None:
+        """calibration_audio is set aside for several speakers: don't tell users to pass it."""
+        turns = [(_sentence("yes i know"), "A"), (_sentence("right then.", 1000), "B")]
+        reference = _features(_sentence("this is how I sound.", f0=120))
+        assembly = _assembly(turns, reference_features=reference)
+        notes = [n for n in assembly.info if "No speaker baseline" in n]
+        assert len(notes) == 2, assembly.info
+        for note in notes:
+            assert note.startswith(("Speaker 'A': ", "Speaker 'B': ")), note
+            assert "without calibration_audio" not in note
+            assert "convert this speaker's words on their own with calibration_audio" in note
+
     def test_no_baseline_is_noted(self) -> None:
         one = _assembly([(_sentence("I see."), None)])
         assert [n[:60] for n in one.info] == [

@@ -893,6 +893,10 @@ _REMEDY = (
     "Pass calibration_audio (recordings of the speaker's usual speech, such as their "
     "earlier turns) to assess them."
 )
+_SEVERAL_REMEDY = (
+    "To assess them, convert this speaker's words on their own with calibration_audio "
+    "(recordings of their usual speech, such as their earlier turns)."
+)
 
 
 def _speaker_prefix(speaker: str | None, several: bool) -> str:
@@ -920,22 +924,26 @@ def _without_baseline(classifier: EmotionClassifier) -> str:
     return ""
 
 
-def _no_baseline_note(measured: int, emotion: str) -> str:
+def _no_baseline_note(measured: int, emotion: str, several: bool = False) -> str:
     """Why a speaker with *measured* utterances and no calibration speech has
-    no baseline; *emotion* is the :func:`_without_baseline` clause."""
+    no baseline; *emotion* is the :func:`_without_baseline` clause. With
+    *several* speakers, calibration_audio is not used at all, so the remedy
+    is to convert the speaker's words on their own."""
+    remedy = _SEVERAL_REMEDY if several else _REMEDY
     if measured == 1:
+        missing = "" if several else " without calibration_audio"
         return (
-            "No speaker baseline: a single utterance without calibration_audio has nothing "
-            "to compare its pitch, loudness and rate with, so they were not marked"
-            f"{emotion}. {_REMEDY}"
+            f"No speaker baseline: a single utterance{missing} has nothing to compare its "
+            f"pitch, loudness and rate with, so they were not marked{emotion}. {remedy}"
         )
     levels = "" if measured < MIN_BASELINE_UTTERANCES else ", at different levels"
+    source = "their own utterances" if several else "the recording"
+    missing = "" if several else "without calibration_audio, "
     return (
-        "No speaker baseline: without calibration_audio, the speaker's usual pitch and "
-        f"loudness come from the recording, which needs at least {MIN_BASELINE_UTTERANCES} "
-        f"utterances, most of them at a similar level; this one has {measured}{levels}. "
-        f"Pitch, loudness and rate were marked only relative to one another{emotion}. "
-        f"{_REMEDY}"
+        f"No speaker baseline: {missing}the speaker's usual pitch and loudness come from "
+        f"{source}, which needs at least {MIN_BASELINE_UTTERANCES} utterances, most of "
+        f"them at a similar level; this one has {measured}{levels}. Pitch, loudness and "
+        f"rate were marked only relative to one another{emotion}. {remedy}"
     )
 
 
@@ -1270,6 +1278,7 @@ class IMLAssembler:
                 labelled=speaker is not None,
                 prefix=_speaker_prefix(speaker, several),
                 info=info,
+                several=several,
             )
 
         utterances: list[Utterance] = []
@@ -1331,6 +1340,7 @@ class IMLAssembler:
         labelled: bool,
         prefix: str,
         info: list[str],
+        several: bool = False,
     ) -> _Baselines:
         """The baselines of one speaker's *utterances*; adds to *info* what they lack."""
         emotion = _without_baseline(self._classifier)
@@ -1350,7 +1360,7 @@ class IMLAssembler:
                 if any(_span_f0(f) is not None or _span_intensity(f) is not None for f in spans)
             )
             if measured:
-                info.append(prefix + _no_baseline_note(measured, emotion))
+                info.append(prefix + _no_baseline_note(measured, emotion, several))
             return _Baselines(baseline, SpeakerBaseline(), None, use_profile=True)
         profile = [f for i in typical for f in utterances[i]]
         return _Baselines(baseline, baseline, profile, use_profile=True)

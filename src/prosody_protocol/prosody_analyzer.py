@@ -495,7 +495,7 @@ def _check_sound(sound: parselmouth.Sound, source: str) -> None:
         )
     if sound.duration < MIN_AUDIO_DURATION_S:
         raise AudioProcessingError(
-            f"Audio is too short to analyse ({sound.duration * 1000:.0f} ms; at least "
+            f"Audio is too short to analyze ({sound.duration * 1000:.0f} ms; at least "
             f"{MIN_AUDIO_DURATION_S * 1000:.0f} ms is needed): {source}"
         )
     _check_samples(sound.values, source)

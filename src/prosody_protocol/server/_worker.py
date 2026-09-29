@@ -5,6 +5,7 @@ Only the SDK is imported here, so a worker starts without loading FastAPI.
 
 from __future__ import annotations
 
+import dataclasses
 import multiprocessing
 import multiprocessing.connection
 import os
@@ -225,16 +226,23 @@ def convert_audio(
     """
     names = [(path, display_name), *calibration]
     try:
-        return _converter(options, [p for p, _ in calibration]).convert_detailed(
+        result = _converter(options, [p for p, _ in calibration]).convert_detailed(
             path, words=options.words, transcript=options.transcript
         )
     except AudioProcessingError as exc:
-        # Name the client's files, not the server's temporary copies.
-        message = str(exc)
-        for temporary, name in names:
-            message = message.replace(str(Path(temporary).resolve()), name)
-            message = message.replace(temporary, name)
+        message = _client_names(str(exc), names)
         raise _server_side(exc, message) or AudioProcessingError(message) from exc
+    return dataclasses.replace(
+        result, warnings=tuple(_client_names(note, names) for note in result.warnings)
+    )
+
+
+def _client_names(text: str, names: Sequence[tuple[str, str]]) -> str:
+    """*text* with the server's temporary copies named as the client's files."""
+    for temporary, name in names:
+        text = text.replace(str(Path(temporary).resolve()), name)
+        text = text.replace(temporary, name)
+    return text
 
 
 def _server_side(exc: AudioProcessingError, message: str) -> AudioProcessingError | None:

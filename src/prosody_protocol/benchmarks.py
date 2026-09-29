@@ -1039,7 +1039,7 @@ class Benchmark:
             logger.warning(
                 "%d of %d outputs have only '%s' placeholders instead of words, so their "
                 "pauses and pitch contours are not scored. Give the entries word timings "
-                "(metadata '%s'), or use a converter that recognises the words.",
+                "(metadata '%s'), or use a converter that recognizes the words.",
                 num_unaligned,
                 processed,
                 _PLACEHOLDER,

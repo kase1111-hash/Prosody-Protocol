@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 
 from prosody_protocol import IMLParser, IMLToSSML, IMLValidator, TextToIML
-from prosody_protocol._types import WordAlignment
+from prosody_protocol._types import WordAlignment, normalize_language_tag
 from prosody_protocol.alignment import parse_word_timings
 from prosody_protocol.assembler import _checked_profile
 from prosody_protocol.audio_to_iml import MAX_WORD_OVERLAP_MS, _checked_text, _checked_words
@@ -34,11 +34,12 @@ from ..errors import BUSY_RESPONSES, ERROR_RESPONSES, APIError, ErrorResponse
 
 router = APIRouter()
 
-# BCP 47 language tag, as validator rule V29 checks it. The query parameter
+# BCP 47 language tag, as validator rule V29 checks it; the POSIX locale form
+# ("en_US") is read as "en-US", as in the SDK and CLI. The query parameter
 # may also be empty, which means no language (an empty form field already
 # arrives as None).
-_LANGUAGE_PATTERN = r"^[A-Za-z]{1,8}(-[A-Za-z0-9]{1,8})*$"
-_LANGUAGE_QUERY_PATTERN = r"^([A-Za-z]{1,8}(-[A-Za-z0-9]{1,8})*)?$"
+_LANGUAGE_PATTERN = r"^[A-Za-z]{1,8}([-_][A-Za-z0-9]{1,8})*$"
+_LANGUAGE_QUERY_PATTERN = r"^([A-Za-z]{1,8}([-_][A-Za-z0-9]{1,8})*)?$"
 _LANGUAGE_DESCRIPTION = (
     'BCP 47 language tag of the speech ("fr-FR"). It labels the output and is passed '
     "to speech recognition. When omitted, the language speech recognition detects "
@@ -412,6 +413,10 @@ async def audio_to_iml(
     text fields or as files. Unreadable audio, or audio longer than the
     server's PP_MAX_AUDIO_SECONDS, is a 400 audio_processing_error.
     """
+    if language:
+        language = normalize_language_tag(language)
+    if language_query:
+        language_query = normalize_language_tag(language_query)
     # BCP 47 tags are case-insensitive: "FR-fr" and "fr-FR" agree.
     if language and language_query and language.lower() != language_query.lower():
         raise RequestValidationError(

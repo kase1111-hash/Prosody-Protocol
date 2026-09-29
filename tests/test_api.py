@@ -553,6 +553,26 @@ class TestAudioToIMLEndpoint:
         assert resp.status_code == 200, resp.text
         assert "language=" not in resp.json()["iml"]
 
+    @pytest.mark.parametrize("where", ["data", "params"])
+    def test_posix_locale_language_is_read_as_bcp47(self, client: TestClient, where: str) -> None:
+        """en_US is en-US, as in the SDK and the CLI."""
+        resp = client.post(
+            "/v1/convert/audio-to-iml",
+            files={"audio": ("speech.wav", SPEECH_WAV.read_bytes(), "audio/wav")},
+            **{where: {"language": "en_US"}},
+        )
+        assert resp.status_code == 200, resp.text
+        assert 'language="en-US"' in resp.json()["iml"]
+
+    def test_same_language_in_both_forms_does_not_conflict(self, client: TestClient) -> None:
+        resp = client.post(
+            "/v1/convert/audio-to-iml",
+            files={"audio": ("speech.wav", SPEECH_WAV.read_bytes(), "audio/wav")},
+            data={"language": "en_US"},
+            params={"language": "en-us"},
+        )
+        assert resp.status_code == 200, resp.text
+
     def test_invalid_language_returns_422(self, client: TestClient) -> None:
         with open(SPEECH_WAV, "rb") as f:
             resp = client.post(
@@ -887,6 +907,22 @@ class TestAudioToIMLFields:
         assert resp.json()["error"] == "audio_processing_error"
         assert "'quiet.wav'" in resp.json()["detail"]
         assert tempfile.gettempdir() not in resp.json()["detail"]
+
+    def test_skipped_calibration_is_named_in_the_warning(self, client: TestClient) -> None:
+        """Warnings, like errors, name the client's files, not server paths."""
+        silence = (AUDIO_FIXTURES / "silence_1s.wav").read_bytes()
+        resp = client.post(
+            "/v1/convert/audio-to-iml",
+            files=[("audio", ("a.wav", SPEECH_WAV.read_bytes())),
+                   ("calibration", ("quiet.wav", silence)),
+                   ("calibration", ("turn1.wav", SPEECH_WAV.read_bytes()))],
+            data={"words": speech_words_json()},
+        )
+        assert resp.status_code == 200, resp.text
+        warnings = resp.json()["warnings"]
+        skipped = [w for w in warnings if "were not used" in w]
+        assert skipped and "calibration 'quiet.wav'" in skipped[0], warnings
+        assert not any(tempfile.gettempdir() in w or "upload" in w for w in warnings), warnings
 
     def test_empty_calibration_counts_as_absent(self, client: TestClient) -> None:
         resp = post_speech(client, words=speech_words_json(), calibration="")

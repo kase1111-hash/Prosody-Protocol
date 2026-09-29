@@ -235,8 +235,8 @@ emotion here (its best guess is "neutral" at 0.3); the
 [profile section](#apply-a-prosody-profile) shows how this speaker's fast,
 flat speech is read. The calibration should be the same speaker, recorded
 with the same setup; with word timings that carry several speaker labels it
-is not used, and a warning says so. On the command line, `from-audio
---calibration EARLIER.wav` takes one recording; over REST, repeat the
+is not used, and a warning says so. On the command line, repeat `from-audio
+--calibration EARLIER.wav` for several recordings; over REST, repeat the
 `calibration` field (up to 5 recordings).
 
 ### Without word timings

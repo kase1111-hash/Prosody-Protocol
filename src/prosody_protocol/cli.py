@@ -467,13 +467,14 @@ def _require_whisper(command: str, alternatives: str) -> None:
 
 
 def _cmd_from_audio(args: argparse.Namespace) -> int:
+    calibrations: list[str] = args.calibration or []
     _check_single_stdin(
-        args.audio, args.words, args.transcript_file, args.profile, args.calibration
+        args.audio, args.words, args.transcript_file, args.profile, *calibrations
     )
     audio_to_iml = _require("prosody_protocol.audio_to_iml", "from-audio", "audio")
     from .alignment import load_word_timings, parse_word_timings
 
-    for path in (args.audio, args.calibration):
+    for path in (args.audio, *calibrations):
         if path is not None and path != STDIN:
             _require_file(path)
     words = None
@@ -496,9 +497,9 @@ def _cmd_from_audio(args: argparse.Namespace) -> int:
 
     with contextlib.ExitStack() as stack:
         audio = stack.enter_context(_audio_path(args.audio))
-        calibration = (
-            None if args.calibration is None
-            else stack.enter_context(_audio_path(args.calibration))
+        calibration_paths = [stack.enter_context(_audio_path(c)) for c in calibrations]
+        calibration: str | list[str] | None = (
+            calibration_paths[0] if len(calibration_paths) == 1 else calibration_paths or None
         )
         converter = audio_to_iml.AudioToIML(
             stt_model=args.whisper_model,
@@ -509,8 +510,9 @@ def _cmd_from_audio(args: argparse.Namespace) -> int:
             stt=args.stt,
             profile=profile,
         )
-        stdin_copy = (
-            audio if args.audio == STDIN else calibration if args.calibration == STDIN else None
+        stdin_copy = audio if args.audio == STDIN else next(
+            (copy for copy, c in zip(calibration_paths, calibrations, strict=True) if c == STDIN),
+            None,
         )
         try:
             result = converter.convert_detailed(audio, words=words, transcript=transcript)
@@ -660,7 +662,14 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
             ) from None
 
     dataset = DatasetLoader().load(args.dataset_dir)
-    converter = audio_to_iml.AudioToIML(language=args.language, stt=args.stt)
+    calibrations: list[str] = args.calibration or []
+    for path in calibrations:
+        _require_file(path)
+    converter = audio_to_iml.AudioToIML(
+        language=args.language,
+        stt=args.stt,
+        calibration_audio=calibrations or None,
+    )
     logger = logging.getLogger("prosody_protocol.benchmarks")
     handler = _LogToStderr(logging.WARNING)
     logger.addHandler(handler)
@@ -946,8 +955,9 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_argument(
         "--calibration",
         metavar="AUDIO",
-        help="a recording of the same speaker talking neutrally, as the baseline "
-        "('-' for stdin)",
+        action="append",
+        help="a recording of the same speaker talking as usual (such as an earlier turn), "
+        "as the baseline; repeat for several ('-' for stdin)",
     )
     sub.add_argument(
         "--stt",
@@ -1031,13 +1041,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-samples", type=_positive_int, metavar="N", help="evaluate the first N entries"
     )
     sub.add_argument(
+        "--calibration",
+        metavar="AUDIO",
+        action="append",
+        help="a recording of the speakers talking as usual, as the baseline for every entry; "
+        "repeat for several (without one, a single-utterance entry gets no emotion)",
+    )
+    sub.add_argument(
         "--words-from",
         choices=["auto", "timings", "transcript", "stt"],
         default="auto",
         help="what the converter gets besides the audio: auto (default): each entry's word "
-        "timings (metadata.word_timings) when it has them, else its transcript; timings: "
-        "word timings only; transcript: the transcript; stt: nothing (speech recognition, "
-        "see --stt)",
+        "timings (metadata.word_timings) when it has them, else nothing when Whisper is "
+        "installed and --stt is not none (Whisper finds the words, with timings), else its "
+        "transcript; timings: word timings only; transcript: the transcript; stt: nothing "
+        "(speech recognition, see --stt)",
     )
     sub.add_argument(
         "--stt",
