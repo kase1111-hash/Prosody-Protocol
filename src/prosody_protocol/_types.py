@@ -7,7 +7,32 @@ imported without numpy or parselmouth installed.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+
+#: The form of a BCP 47 language tag that IML accepts (spec 2.x, validator
+#: V29, iml-1.0.xsd): a primary subtag of 1-8 letters, then subtags of 1-8
+#: letters or digits. Only the form is checked, not the IANA registry.
+LANGUAGE_TAG_RE = re.compile(r"[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*")
+
+
+def is_language_tag(value: object) -> bool:
+    """Whether *value* is a language tag in the form IML accepts."""
+    return isinstance(value, str) and LANGUAGE_TAG_RE.fullmatch(value) is not None
+
+
+def normalize_language_tag(value: object, what: str = "language") -> str:
+    """Return *value* as an IML language tag, reading ``en_US`` as ``en-US``.
+
+    For tags given to the SDK's APIs. Documents and datasets are checked as
+    written, with :func:`is_language_tag`. Raises :class:`ValueError` for a
+    value that is not a language tag.
+    """
+    tag = value.replace("_", "-") if isinstance(value, str) else value
+    if not is_language_tag(tag):
+        raise ValueError(f'{what} must be a BCP 47 tag such as "en-US"; got {value!r}')
+    assert isinstance(tag, str)
+    return tag
 
 
 @dataclass(frozen=True, repr=False)

@@ -62,6 +62,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
+from ._types import normalize_language_tag
 from .exceptions import ConversionError, IMLParseError
 from .models import (
     ChildNode,
@@ -79,7 +80,6 @@ SSML_NAMESPACE = "http://www.w3.org/2001/10/synthesis"
 DEFAULT_LANGUAGE = "en-US"
 
 _ESPEAK_VENDORS = frozenset({"espeak-ng", "espeak"})
-_BCP47_RE = re.compile(r"[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*")
 
 # Characters XML 1.0 cannot carry (C0 controls other than tab/LF/CR, lone
 # surrogates, U+FFFE and U+FFFF).
@@ -722,13 +722,8 @@ class IMLToSSML:
         speaker_voices: Mapping[str, str] | None = None,
         strict: bool = True,
     ) -> None:
-        if not _BCP47_RE.fullmatch(default_language):
-            raise ValueError(
-                f"default_language={default_language!r} is not a BCP 47 language tag "
-                '(e.g. "en-US")'
-            )
         self.vendor = vendor
-        self.default_language = default_language
+        self.default_language = normalize_language_tag(default_language, "default_language")
         self.speaker_voices: dict[str, str] = dict(speaker_voices or {})
         self.strict = strict
         self._parser = IMLParser()

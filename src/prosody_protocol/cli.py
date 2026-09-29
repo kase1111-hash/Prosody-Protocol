@@ -40,7 +40,6 @@ import json
 import logging
 import math
 import platform
-import re
 import shutil
 import sys
 import tempfile
@@ -51,6 +50,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 from ._install import install_hint
+from ._types import normalize_language_tag
 from ._version import __version__
 from .exceptions import ProsodyProtocolError
 
@@ -72,7 +72,6 @@ EXIT_USAGE = 2
 STDIN = "-"
 
 # A BCP 47 language tag, as validator rule V29 checks it.
-_BCP47_RE = re.compile(r"[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*")
 
 _MAX_PORT = 65_535
 
@@ -266,10 +265,13 @@ def _port(text: str) -> int:
 
 
 def _language(text: str) -> str:
-    tag = text.replace("_", "-")  # POSIX locale style, as in $LANG
-    if not _BCP47_RE.fullmatch(tag):
-        raise argparse.ArgumentTypeError(f'{text!r} is not a BCP 47 language tag (e.g. "en-US")')
-    return tag
+    # POSIX locale style ("en_US", as in $LANG) names the same language.
+    try:
+        return normalize_language_tag(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f'{text!r} is not a BCP 47 language tag (e.g. "en-US")'
+        ) from None
 
 
 def _threshold(text: str) -> tuple[str, float]:

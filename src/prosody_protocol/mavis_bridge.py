@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from ._install import install_hint
+from ._types import normalize_language_tag
 
 try:
     import numpy as np
@@ -130,10 +131,13 @@ class MavisBridge:
     - Dataset entries (JSON) for the dataset infrastructure
     - Feature vectors (numpy) for sklearn training
     - IML markup from phoneme prosody parameters
+
+    *language* is a BCP 47 tag (``en_US`` is read as ``en-US``); anything
+    else raises :class:`ValueError`.
     """
 
     def __init__(self, language: str = "en-US") -> None:
-        self.language = language
+        self.language = normalize_language_tag(language)
         self._parser = IMLParser()
 
     def phoneme_events_to_entry(

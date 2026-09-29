@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import bisect
 import difflib
+import importlib.util
 import inspect
 import json
 import logging
@@ -881,8 +882,11 @@ class Benchmark:
 
         - ``"auto"`` (default): the entry's word timings as ``words=``
           when its ``metadata["word_timings"]`` has them (any format
-          :func:`~prosody_protocol.alignment.parse_word_timings` reads),
-          else its transcript as ``transcript=``;
+          :func:`~prosody_protocol.alignment.parse_word_timings` reads);
+          else nothing when the converter can recognize speech itself (it
+          has an ``stt`` mode other than ``"none"`` and openai-whisper is
+          installed), since recognized words carry timings; else its
+          transcript as ``transcript=``;
         - ``"timings"``: word timings when the entry has them, else nothing
           (the converter's own speech recognition);
         - ``"transcript"``: always the transcript;
@@ -1088,9 +1092,24 @@ class Benchmark:
                     )
                 words: list[WordAlignment] = parse_word_timings(raw)
                 return {"words": words}, "timings"
+        if self.words_from == "auto" and self._converter_recognizes_speech():
+            return {}, "stt"
         if self.words_from in ("auto", "transcript") and "transcript" in self._accepted:
             return {"transcript": entry.transcript}, "transcript"
         return {}, "stt"
+
+    def _converter_recognizes_speech(self) -> bool:
+        """Whether the converter would find the words itself, with timings.
+
+        True for an :class:`~prosody_protocol.AudioToIML` whose ``stt`` is
+        not ``"none"`` when openai-whisper is installed.
+        """
+        if getattr(self.converter, "stt", "none") not in ("auto", "whisper"):
+            return False
+        try:
+            return importlib.util.find_spec("whisper") is not None
+        except (ImportError, ValueError):
+            return False
 
     def _get_predicted_iml(self, entry: DatasetEntry, sources: dict[str, int]) -> str | None:
         """Run the converter on an entry's audio; ``None`` when that fails."""

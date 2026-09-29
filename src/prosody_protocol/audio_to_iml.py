@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
 from ._install import install_hint
-from ._types import PauseInterval, SpanFeatures, WordAlignment
+from ._types import PauseInterval, SpanFeatures, WordAlignment, normalize_language_tag
 from .assembler import (
     DEFAULT_MIN_EMOTION_CONFIDENCE,
     PROFILE_ATTRIBUTE,
@@ -75,7 +75,6 @@ _CALIBRATION_SPAN_MS = 300
 _XML_INVALID_CHARS = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
 
 # A BCP 47 language tag, as validator rule V29 checks it.
-_BCP47_RE = re.compile(r"[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*")
 
 #: Caller-supplied words may start at most this long (ms) before an earlier
 #: word of the same speaker ends. Speech recognisers give one speaker's
@@ -406,13 +405,9 @@ class AudioToIML:
     ) -> None:
         if stt not in _STT_MODES:
             raise ValueError(f"stt must be one of {', '.join(_STT_MODES)}; got {stt!r}")
-        if isinstance(language, str):
+        if language is not None:
             # POSIX locale style ("en_US") names the same language.
-            language = language.replace("_", "-")
-        if language is not None and not (
-            isinstance(language, str) and _BCP47_RE.fullmatch(language)
-        ):
-            raise ValueError(f'language must be a BCP 47 tag such as "en-US"; got {language!r}')
+            language = normalize_language_tag(language)
         self.max_duration_s = _checked_max_duration(max_duration_s)
         self.stt_model = stt_model
         self.include_extended = include_extended

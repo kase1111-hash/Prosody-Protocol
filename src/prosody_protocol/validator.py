@@ -63,6 +63,7 @@ from typing import Literal, cast
 
 from lxml import etree
 
+from ._types import is_language_tag
 from .exceptions import IMLValidationError
 from .parser import (
     _IML_ELEMENTS,
@@ -127,7 +128,6 @@ _SEMVER_RE = re.compile(
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
-_BCP47_RE = re.compile(r"[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*")
 
 # Attributes each IML element defines; anything else must be an x- or
 # namespaced extension attribute (spec 9.2).
@@ -338,7 +338,7 @@ class _Walker:
 
         # V29: language is a BCP 47 tag
         language = root.get("language")
-        if language is not None and not _BCP47_RE.fullmatch(language):
+        if language is not None and not is_language_tag(language):
             self._add(
                 "error", "V29",
                 f'language="{language}" is not a BCP 47 language tag (e.g. "en-US")', root,

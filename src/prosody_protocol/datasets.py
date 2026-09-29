@@ -43,6 +43,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import cast
 
+from ._types import is_language_tag
 from .exceptions import DatasetError
 from .validator import IMLValidator, ValidationIssue, ValidationResult
 
@@ -55,7 +56,6 @@ _VALID_ANNOTATORS = frozenset({"human", "model", "hybrid"})
 _ISO_8601_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
 )
-_BCP47_RE = re.compile(r"[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)*")
 
 _REQUIRED_STR_FIELDS = (
     "id", "timestamp", "source", "language", "audio_file",
@@ -346,7 +346,7 @@ class DatasetLoader:
 
         # language BCP-47 format.
         language = entry.get("language", "")
-        if isinstance(language, str) and language and not _BCP47_RE.fullmatch(language):
+        if isinstance(language, str) and language and not is_language_tag(language):
             issues.append(ValidationIssue(
                 severity="error",
                 rule="D6",

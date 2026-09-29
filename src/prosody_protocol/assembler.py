@@ -46,7 +46,7 @@ from dataclasses import dataclass, fields, replace
 from itertools import accumulate, groupby, pairwise
 from typing import Any, NamedTuple
 
-from ._types import PauseInterval, SpanFeatures, WordAlignment
+from ._types import PauseInterval, SpanFeatures, WordAlignment, normalize_language_tag
 from .emotion_classifier import (
     BaselineAwareEmotionClassifier,
     EmotionClassifier,
@@ -1150,7 +1150,8 @@ class IMLAssembler:
             at least 200 ms long becomes a ``<pause>``; where none was
             detected, a gap of 200 ms or more between word timings does.
         language:
-            Optional BCP-47 language tag.
+            Optional BCP 47 language tag (``en_US`` is read as ``en-US``);
+            anything else raises :class:`ValueError`.
         reference_features:
             Features of the same speaker talking neutrally (e.g. calibration
             speech, recorded with the same setup). They define the speaker
@@ -1189,6 +1190,8 @@ class IMLAssembler:
             A silence longer than :data:`MAX_PAUSE_MS` was written as a
             pause of that length.
         """
+        if language is not None:
+            language = normalize_language_tag(language)
         assembly = self._assemble(
             alignments, features, pauses, language, reference_features=reference_features
         )

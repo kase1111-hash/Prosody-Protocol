@@ -1276,6 +1276,35 @@ class TestWordsGivenToTheConverter:
         ]
 
     @pytest.mark.parametrize(
+        ("stt", "whisper_installed", "expected"),
+        [
+            ("auto", True, {"timings": 1, "transcript": 0, "stt": 1}),
+            ("whisper", True, {"timings": 1, "transcript": 0, "stt": 1}),
+            ("none", True, {"timings": 1, "transcript": 1, "stt": 0}),
+            ("auto", False, {"timings": 1, "transcript": 1, "stt": 0}),
+        ],
+    )
+    def test_auto_prefers_the_converters_own_recognition(
+        self, monkeypatch, stt, whisper_installed, expected
+    ):
+        """Recognized words carry timings; a bare transcript would place no pauses."""
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec(name, *args, **kwargs):
+            if name == "whisper":
+                return object() if whisper_installed else None
+            return real_find_spec(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+        converter = KeywordConverter({"a.wav": _TWO_WORDS, "b.wav": _TWO_WORDS})
+        converter.stt = stt  # type: ignore[attr-defined]
+        report = self._run([_timed_entry("a"), _entry("b", "neutral")], converter)
+        assert report.word_sources == expected
+        assert converter.inputs["a.wav"]["words"] is not None  # timings always win
+
+    @pytest.mark.parametrize(
         ("words_from", "expected"),
         [
             ("auto", ("words", "transcript")),
