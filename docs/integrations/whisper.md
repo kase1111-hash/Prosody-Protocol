@@ -40,19 +40,24 @@ print(result.iml)
   warning. Without the extra, `stt="whisper"` raises `AudioProcessingError`
   (`prosody-protocol from-audio --stt whisper` exits with status 2 and an
   install hint).
-- `stt_model` is the Whisper model size (`tiny`, `base` (default), `small`,
-  `medium`, `large-v3`, ...). The model is loaded on the first conversion
-  and reused by the same converter, so create one converter for a batch.
+- `stt_model` is the Whisper model (`tiny`, `base` (default), `small`,
+  `medium`, `large-v3`, ..., or a checkpoint path). The model is loaded on
+  the first conversion and reused by the same converter, so create one
+  converter for a batch.
 - `language="fr-FR"` is passed to Whisper as `fr` and labels the document.
   With `language=None`, Whisper detects the language, and its code (`en`)
   labels the document.
 - Whisper gets the audio already decoded by the SDK (16 kHz mono), so its
-  timestamps refer to exactly the samples that are measured. Load and
-  transcription failures raise `AudioProcessingError`.
+  timestamps refer to exactly the samples that are measured. A model that
+  cannot be loaded, or a failed transcription, raises
+  `SpeechRecognitionError`, a subclass of `AudioProcessingError`.
 
 The same from the command line: `prosody-protocol from-audio speech.wav
 --stt whisper --whisper-model small`. The REST server uses Whisper when it
-is installed (`/v1/health` reports `"whisper": true`).
+is installed (`/v1/health` reports `"whisper": true`), with the model named
+by `PP_STT_MODEL` (default `base`); a model that cannot be loaded gives 503
+`speech_recognition_unavailable`, a failed transcription 500
+`speech_recognition_failed`.
 
 ## Bring your own Whisper output
 
@@ -86,7 +91,7 @@ print(AudioToIML(language="en-US").convert("examples/speech.wav", words=words))
 
 ```text
 [WordAlignment(word='I', start_ms=250, end_ms=564), WordAlignment(word='never', start_ms=614, end_ms=1081), WordAlignment(word='said', start_ms=1131, end_ms=1536)]
-<iml version="0.1.0" language="en-US"><utterance>I never said<pause duration="660"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
+<iml version="0.1.0" language="en-US"><utterance>I never said<pause duration="610"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
 ```
 
 `load_word_timings("words.json")` detects the format from a file, and
@@ -108,7 +113,10 @@ words = from_whisper(list(segments))
 them), and WhisperX's aligned result (`result["segments"]` with `words`).
 WhisperX leaves words it could not align without times; each joins its
 neighboring timed word (the previous one, or the next one at the start of a
-segment or sentence).
+segment or sentence). After WhisperX's `assign_word_speakers`, each word's
+`speaker` (or else its segment's) is kept as its speaker label, and each
+speaker gets their own utterances and baseline (see
+[several speakers](speech-to-text.md#several-speakers)).
 
 ### The OpenAI transcription API
 
@@ -139,8 +147,9 @@ stole 134 Hz
 ```
 
 Pass `reference_features=analyzer.analyze("calibration.wav", ...)` to
-`assemble` to measure against a neutral recording of the same speaker
-(what `AudioToIML(calibration_audio=...)` does). See the
+`assemble` to measure against a recording of the same speaker talking as
+usual (what `AudioToIML(calibration_audio=...)` does, with the calibration
+speech cut into word-sized spans). See the
 [API reference](../API.md#imlassembler) for what the assembler writes.
 
 ## Many files
@@ -177,6 +186,9 @@ recordings come from users.
 - The transcript is only as good as Whisper's; misrecognized words are
   measured all the same.
 - Emotion labels come from a rule-based heuristic that needs a baseline of
-  the same speaker (`calibration_audio`, or at least three utterances) and
-  abstains otherwise. It was checked on synthetic speech, not a real-speech
-  benchmark: treat its labels as estimates.
+  the same speaker (`calibration_audio`, such as their earlier turns, or at
+  least three utterances) and abstains otherwise, with a warning. It was
+  checked on synthetic speech, not a real-speech benchmark: treat its
+  labels as estimates.
+- Whisper's text has punctuation, so utterances split at sentence ends;
+  where it has none, they split at pauses of 0.5 s or more.

@@ -47,7 +47,7 @@ print(entry.id, entry.audio_file, entry.annotator, entry.consent)
 ```
 
 ```text
-<utterance emotion="joyful" confidence="0.86"><prosody pitch="-29%" volume="-4dB">the</prosody> <prosody pitch="+14%" volume="+1dB">SUN</prosody></utterance>
+<utterance emotion="joyful" confidence="1.0"><prosody pitch="-29%" volume="-4dB">the</prosody> <prosody pitch="+14%" volume="+1dB">SUN</prosody></utterance>
 mavis_session_001 audio/session_001.wav hybrid True
 ```
 
@@ -59,17 +59,21 @@ How the entry is made:
   `phonemes_per_word=[1, 2]` instead.
 - **Markup.** A word whose mean pitch differs from the session's mean by
   more than 10%, or whose volume by more than 30%, gets a `<prosody>` with
-  its pitch and volume relative to that mean. Both words differ here, so the
+  its pitch and volume relative to that mean; a value that rounds to the
+  session's own (`+0%`, `+0dB`) is left out. Both words differ here, so the
   low "the" is marked as well as "SUN".
-- **Emotion.** `emotion_label` is your label (the annotator is then
-  `"hybrid"`: your label, the bridge's markup). Without it the bridge
-  guesses from averages: volume above 0.8 is `angry` when the mean pitch is
-  above 300 Hz and `joyful` otherwise, breathiness above 0.5 is `sad`,
-  volume below 0.3 is `calm`, anything else `neutral` (annotator
-  `"model"`).
-- **Confidence.** The `confidence` the bridge writes grows with the
-  session's pitch and volume range (0.5 to 0.9). It says how varied the
-  session was, not how likely the label is.
+- **Emotion.** `emotion_label` is your label, such as the emotion the
+  player set out to express, and the IML states it with `confidence="1.0"`:
+  it is a label, not a measurement (the annotator is then `"hybrid"`: your
+  label, the bridge's markup). Without it the bridge guesses from averages:
+  volume above 0.8 is `angry` when the mean pitch is above 300 Hz and
+  `joyful` otherwise, breathiness above 0.5 is `sad`, volume below 0.3 is
+  `calm`, anything else `neutral`. The guess becomes the entry's
+  `emotion_label` (annotator `"model"`) but is not written into the IML,
+  whose utterance then has no `emotion` or `confidence`: a threshold rule on
+  averages has no measured accuracy to state.
+- **Language.** `MavisBridge(language=...)` takes a BCP 47 tag (`en_US` is
+  read as `en-US`); anything else raises `ValueError`.
 - **Consent.** `consent` defaults to `False`; `DatasetLoader` and
   `export_dataset` refuse entries without it (spec 8.1). Set it only when
   the player agreed.

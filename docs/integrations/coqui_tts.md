@@ -77,7 +77,7 @@ for chunk in split_at_pauses(AudioToIML().convert("examples/monotone.wav", words
 ```text
 ('I read the list.', 310)
 ('The room is booked.', 300)
-('I have the slides.', 310)
+('I have the slides.', 290)
 ('And we got the grant!', 0)
 ```
 
@@ -116,8 +116,8 @@ with wave.open("customer.wav", "wb") as out:
 have the right to use). `tts.tts` returns the samples; `tts.tts_to_file(text=...,
 speaker_wav=..., language=..., file_path=...)` writes one chunk straight to a
 file. For an utterance that IML marks as faster or slower as a whole (such
-as `<prosody rate="170%">` around all of it), pass `speed=1.7` to that
-chunk's `tts.tts` call.
+as the `<prosody rate="165%">` around "And we got the grant!" in the IML of
+`examples/monotone.wav`), pass `speed=1.65` to that chunk's `tts.tts` call.
 
 Check the model's license before you build on it. XTTS v2 is released
 under the Coqui Public Model License (CPML), which allows non-commercial

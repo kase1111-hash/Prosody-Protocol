@@ -56,7 +56,7 @@ Each file in `entries/` is one JSON object that follows
 | `id` | yes | Unique within the dataset |
 | `timestamp` | yes | When the entry was created, ISO 8601 |
 | `source` | yes | `mavis`, `recorded` or `synthetic` |
-| `language` | yes | BCP 47 tag, e.g. `en-US` |
+| `language` | yes | BCP 47 tag, e.g. `en-US`, as written (`en_US` is an error) |
 | `audio_file` | yes | Path relative to the dataset directory, with no `..`, no absolute path and no control characters. WAV, 16 kHz mono is recommended |
 | `transcript` | yes | Plain text of the recording |
 | `iml` | yes | The IML annotation; it must be valid IML |
@@ -64,7 +64,7 @@ Each file in `entries/` is one JSON object that follows
 | `annotator` | yes | `human`, `model` or `hybrid` |
 | `consent` | yes | Must be `true` (see [Consent](#consent)) |
 | `speaker_id` | no | A string or `null`. Used to keep speakers out of more than one split |
-| `metadata` | no | An object for anything else; unknown top-level fields are errors |
+| `metadata` | no | An object for anything else; unknown top-level fields are errors. `metadata.word_timings`, if present, holds the recording's word timings (see below) |
 
 ## Loading and validation
 
@@ -77,7 +77,7 @@ Each file in `entries/` is one JSON object that follows
 | D3 | `source` is not `mavis`, `recorded` or `synthetic` | error |
 | D4 | `annotator` is not `human`, `model` or `hybrid` | error |
 | D5 | `timestamp` does not look like ISO 8601 | warning |
-| D6 | `language` is not a BCP 47 tag | error |
+| D6 | `language` is not in the form of a BCP 47 tag (1-8 letters, then `-` and subtags of 1-8 letters or digits, as validator rule V29 checks) | error |
 | D7 | `iml` fails IML validation | error |
 | D8 | The audio file does not exist (only with `check_audio=True`) | error |
 | D9 | `audio_file` is absolute, leaves the dataset directory or contains a control character | error |
@@ -107,7 +107,9 @@ DatasetError: 1 of 2 entries in my-dataset failed validation (load with DatasetL
 
 `load(path, check_audio=True)` also requires every audio file to exist,
 `iter_entries(path)` validates lazily, one entry at a time, and
-`validate_entry(entry)` checks a single entry dict. The loaded `Dataset`
+`validate_entry(entry)` checks a single entry dict. A file that cannot be
+read, is not UTF-8 or is not JSON (including JSON nested too deeply)
+raises `DatasetError`. The loaded `Dataset`
 has `name`, `entries` (`DatasetEntry` objects), `metadata` and `root`, the
 directory it was loaded from.
 
@@ -124,8 +126,14 @@ train, val, test = loader.split(dataset)   # 80/10/10, seed 42
 `split()` is deterministic for a given seed and keeps each `speaker_id` in
 one split (`group_by="speaker_id"`, the default), so no test speaker is
 also a training speaker. With fewer speakers than splits it warns and
-splits entries individually; `group_by=None` always does. It does not
-stratify by emotion.
+splits entries individually; `group_by=None` always does.
+`loader.split(dataset, stratify_by="emotion_label")` splits each label by
+the ratios on its own, so (at 80/10/10) a label with at least three entries
+has one in every split; with speaker grouping, whole speakers still stay together, so
+the sizes follow the ratios less closely. After any split, a warning names
+the labels that are in the training split but missing from a non-empty
+validation or test split (among those with enough entries, or speakers, to
+be in every split).
 
 ## Creating a dataset
 
@@ -141,11 +149,32 @@ stratify by emotion.
   session without stated consent. See
   [docs/integrations/mavis.md](../docs/integrations/mavis.md).
 
+## Word timings
+
+An entry may carry the word timings of its recording in
+`metadata.word_timings`, in any format `load_word_timings` reads (a
+Whisper, Deepgram, AssemblyAI or Google response, or a list of
+`{"word", "start_ms", "end_ms"}` records). For example, as the `metadata`
+of the entry above:
+
+```json
+{"session": "s1", "word_timings": [{"word": "Oh,", "start_ms": 120, "end_ms": 380}, {"word": "that's", "start_ms": 400, "end_ms": 690}, {"word": "great.", "start_ms": 720, "end_ms": 1240}]}
+```
+
+`Benchmark` gives them to the converter as `words=`, so pauses, stresses
+and word-level pitch can be placed and scored. Without them it gives the
+transcript, which places no pauses (or, when Whisper is installed and the
+converter may use it, nothing: Whisper finds the words and their timings).
+The training scripts do not use them.
+
 ## Using a dataset
 
 - `Benchmark(dataset, converter).run()` (or
   `prosody-protocol benchmark my-dataset`) scores a converter's emotion
-  labels, pauses, pitch contours and IML validity against the entries.
+  labels, pauses, pitch contours and IML validity against the entries. An
+  output without an emotion is an abstention: it lowers `emotion_coverage`
+  rather than `emotion_accuracy`. See the
+  [CLI reference](../docs/cli.md#benchmark).
 - `training/` trains scikit-learn baselines on a dataset; see
   [training/README.md](../training/README.md).
 

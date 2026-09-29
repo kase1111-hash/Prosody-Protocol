@@ -29,34 +29,36 @@ prosody-protocol from-audio examples/speech.wav --words examples/speech.whisper.
 ```
 
 ```xml
-<iml version="0.1.0" language="en-US"><utterance>I never said<pause duration="660"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
+<iml version="0.1.0" language="en-US"><utterance>I never said<pause duration="610"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
 ```
 
-The stressed word and the pause are marked. (The pause is 660 ms rather
-than 600 because the silence starts where the "d" of "said" fades out.) The
-same, as a transcript an LLM can read:
+The stressed word and the pause are marked (the pause measures 610 ms; the
+gap in the recording is 600 ms). The same, as a transcript an LLM can read:
 
 ```sh
 prosody-protocol from-audio examples/speech.wav --words examples/speech.whisper.json --prompt
 ```
 
 ```text
-I never said [pause 0.7s] she **stole** (much higher pitch, falling) my money (falling).
+I never said [pause 0.6s] she **stole** (much higher pitch, falling) my money.
 ```
 
-`--json` reports where the words came from (`"transcript_source": "words"`)
-and any warnings. No emotion is reported: a single sentence without
-calibration audio (`--calibration`) does not show the speaker's usual voice
-to compare with.
+No emotion and no overall pitch or loudness are reported: a single sentence
+without calibration audio (`--calibration`, a recording of the speaker
+talking as usual) does not show the speaker's usual voice to compare with.
+Each command says so on standard error (`warning: No speaker baseline:
+...`), and `--json` reports where the words came from
+(`"transcript_source": "words"`) and lists the warnings.
 
 ```sh
 prosody-protocol from-audio examples/speech.wav --words examples/speech.whisper.json --json
 ```
 
-With only a transcript (no timings), prosody is measured for the utterance
-as a whole; with neither, Whisper transcribes the audio if it is installed
-(`pip install -e ".[whisper]"`), and otherwise each stretch of
-speech is a `[speech]` placeholder:
+With only a transcript (no timings), nothing can be placed on the words, and
+the utterance as a whole is measured only against calibration audio, so here
+the output is the plain text with two warnings; with neither, Whisper
+transcribes the audio if it is installed (`pip install -e ".[whisper]"`),
+and otherwise each stretch of speech is a `[speech]` placeholder:
 
 ```sh
 prosody-protocol from-audio examples/speech.wav --transcript-file examples/speech.txt
@@ -68,14 +70,14 @@ A prosody profile, written with the speaker, says what their atypical
 prosody means. `monotone.wav` is the speaker of `profile.json`. On its own,
 the recording gets no emotion: the flat voice gives the default reading too
 little to go on (its best guess for every sentence is "neutral", at a
-confidence of 0.30 to 0.47, below the 0.5 needed to report it).
+confidence of 0.31 to 0.47, below the 0.5 needed to report it).
 
 ```sh
 prosody-protocol from-audio examples/monotone.wav --words examples/monotone.deepgram.json
 ```
 
 ```xml
-<iml version="0.1.0"><utterance>I read the list.</utterance><utterance><pause duration="310"/>The room is booked.</utterance><utterance><pause duration="300"/>I have the slides.</utterance><utterance><pause duration="310"/><prosody rate="170%">And we got the grant!</prosody></utterance></iml>
+<iml version="0.1.0"><utterance>I read the list.</utterance> <utterance><pause duration="310"/>The room is booked.</utterance> <utterance><pause duration="300"/>I have the slides.</utterance> <utterance><pause duration="290"/><prosody rate="165%">And we got the grant!</prosody></utterance></iml>
 ```
 
 With the profile, a mapping that matches an utterance takes precedence
@@ -87,7 +89,7 @@ prosody-protocol from-audio examples/monotone.wav --words examples/monotone.deep
 ```
 
 ```xml
-<iml version="0.1.0"><utterance emotion="calm" confidence="0.61" x-profile="pitch_contour=flat">I read the list.</utterance><utterance emotion="calm" confidence="0.62" x-profile="pitch_contour=flat"><pause duration="310"/>The room is booked.</utterance><utterance emotion="calm" confidence="0.61" x-profile="pitch_contour=flat"><pause duration="300"/>I have the slides.</utterance><utterance emotion="joyful" confidence="0.6" x-profile="pitch_contour=flat rate=fast"><pause duration="310"/><prosody rate="170%">And we got the grant!</prosody></utterance></iml>
+<iml version="0.1.0"><utterance emotion="calm" confidence="0.61" x-profile="pitch_contour=flat">I read the list.</utterance> <utterance emotion="calm" confidence="0.62" x-profile="pitch_contour=flat"><pause duration="310"/>The room is booked.</utterance> <utterance emotion="calm" confidence="0.61" x-profile="pitch_contour=flat"><pause duration="300"/>I have the slides.</utterance> <utterance emotion="joyful" confidence="0.61" x-profile="pitch_contour=flat rate=fast"><pause duration="290"/><prosody rate="165%">And we got the grant!</prosody></utterance></iml>
 ```
 
 The profile's use is reported (spec 7.2). Each utterance whose emotion a
@@ -99,7 +101,7 @@ not name the person. Standard error explains each match:
 note: prosody profile 'example_user' set utterance 1 to 'calm' (confidence 0.61; matched pitch_contour=flat)
 note: prosody profile 'example_user' set utterance 2 to 'calm' (confidence 0.62; matched pitch_contour=flat)
 note: prosody profile 'example_user' set utterance 3 to 'calm' (confidence 0.61; matched pitch_contour=flat)
-note: prosody profile 'example_user' set utterance 4 to 'joyful' (confidence 0.60; matched pitch_contour=flat, rate=fast)
+note: prosody profile 'example_user' set utterance 4 to 'joyful' (confidence 0.61; matched pitch_contour=flat, rate=fast)
 ```
 
 and `--json` lists the matches in `profile_matches`, including those whose

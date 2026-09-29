@@ -51,9 +51,11 @@ What each task needs:
   beyond, or `<segment tempo="rushed"/"drawn-out">`. Absolute pitch
   (`185Hz`) counts as `mid`. Audio is not needed.
 - **pitch_contour**: audio, and IML in which one `<prosody pitch_contour="...">`
-  covers all of the entry's text, e.g. one short phrase per entry. Entries
-  have no word timings, so the F0 of a part of the utterance cannot be cut
-  out; entries annotated only in part are skipped with a warning.
+  covers all of the entry's text, e.g. one short phrase per entry. The
+  scripts do not read word timings (not even an entry's
+  `metadata.word_timings`, which `Benchmark` uses), so the F0 of a part of
+  the utterance cannot be cut out; entries annotated only in part are
+  skipped with a warning.
 
 The repository ships no training corpus. The only dataset in it is the test
 fixture `tests/fixtures/datasets/training_synthetic`: 10 short clips of
@@ -356,7 +358,7 @@ always trained these scikit-learn baselines.
   check only catches input far outside the training data (non-speech,
   another kind of recording altogether); within that range, a wrong label
   can still come with a high confidence.
-- **Utterance level only.** Dataset entries have no word timings, so SER
+- **Utterance level only.** The scripts do not use word timings, so SER
   and pitch-contour features describe whole recordings.
 - **Shallow text features.** The text-to-prosody features do not look at
   what the words mean. Expect the model to learn patterns such as "the

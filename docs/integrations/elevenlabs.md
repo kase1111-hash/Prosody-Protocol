@@ -126,7 +126,7 @@ print(to_elevenlabs_text(measured))
 ```
 
 ```text
-I never said <break time="0.66s" /> she stole my money.
+I never said <break time="0.61s" /> she stole my money.
 ```
 
 The emphasis on "stole", the sentence's point, is lost on the way.

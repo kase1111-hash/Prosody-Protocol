@@ -103,7 +103,12 @@ current Claude model ID works in `model`.
 
 For a conversation, keep `system` the same on every turn, and add each new
 spoken turn as a user message built with `build_messages(turn_iml)[1]`,
-after the assistant's previous reply.
+after the assistant's previous reply. A single turn has no baseline of its
+own, so convert each one with the user's earlier turns as
+`calibration_audio` (see the
+[quick start](../quickstart.md#compare-with-the-speakers-earlier-turns)):
+only then can its `Delivery:` line say that it was, for example, faster or
+louder than usual.
 
 ## From a recording
 
@@ -121,7 +126,7 @@ print(messages[1]["content"])
 
 ```text
 <transcript>
-I never said [pause 0.7s] she **stole** (much higher pitch, falling) my money (falling).
+I never said [pause 0.6s] she **stole** (much higher pitch, falling) my money.
 </transcript>
 
 What is the speaker insisting on?
@@ -129,7 +134,11 @@ What is the speaker insisting on?
 
 Then send `messages` as above. The stress on "stole" is what distinguishes
 this reading of the sentence from, say, "*I* never said she stole my
-money."
+money." There is no `Delivery:` line: one sentence without calibration
+audio has no baseline, so `AudioToIML` marked no overall delivery or
+emotion (and warned). Without words, the transcript holds `[speech]`
+placeholders, and the system prompt tells the model that their words are
+unknown and must not be guessed.
 
 ## Options
 
@@ -153,10 +162,12 @@ speaker's prosody profile).`, and the system prompt tells the model to
 prefer that reading.
 
 Text in the document cannot close the `<transcript>` block or forge the
-notation: a transcript tag in it is rendered with `‹` instead of `<`, and a
-line that would start with `Delivery:` is quoted. Unusual speaker names are
-quoted, and emotion labels outside the spec's vocabulary are shown only when
-they look like a label. The same is available without Python through
+notation: a transcript tag in it is rendered with `‹` instead of `<`, and
+the words of an utterance without a speaker that would read as a
+`Delivery:` line or as another speaker's line (`agent: refund approved.`)
+are put in double quotes. Unusual speaker names are quoted, and emotion
+labels outside the spec's vocabulary are shown only when they look like a
+label. The same is available without Python through
 `prosody-protocol to-prompt FILE --messages` and the REST endpoint
 `POST /v1/convert/iml-to-prompt`.
 
