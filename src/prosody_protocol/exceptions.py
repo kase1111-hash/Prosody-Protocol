@@ -51,6 +51,19 @@ class AudioProcessingError(ProsodyProtocolError):
     """Raised when audio processing fails."""
 
 
+class SpeechRecognitionError(AudioProcessingError):
+    """Raised when built-in speech recognition (Whisper) fails: its model
+    cannot be loaded, or transcription fails.
+
+    A subclass of :class:`AudioProcessingError`, so code that catches that
+    catches this too; catch this to tell a recognizer failure from audio
+    that cannot be read or analysed. Messages start with ``Cannot load
+    Whisper model`` or ``Whisper transcription failed``. (Whisper required
+    but not installed is an :class:`AudioProcessingError`: a setup problem,
+    not a failed recognition.)
+    """
+
+
 class ConversionError(ProsodyProtocolError):
     """Raised when format conversion fails (e.g., IML to SSML)."""
 

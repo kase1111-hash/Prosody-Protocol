@@ -10,7 +10,10 @@ Covers:
   and rounding to whole milliseconds; numpy scalar times
 - load_word_timings shape detection from dicts, lists and files (UTF-8,
   UTF-8 with BOM, UTF-16, UTF-32)
-- parse_word_timings parses JSON text and never reads a file
+- parse_word_timings parses JSON text and never reads a file, in time
+  linear in its size (punctuation restoration included)
+- Speaker labels from diarization are kept (Deepgram, AssemblyAI, Google,
+  WhisperX, records)
 - The adapters' output drives the assembler: punctuation splits utterances
 """
 
@@ -20,6 +23,7 @@ import csv
 import dataclasses
 import io
 import json
+import time
 from datetime import timedelta
 from enum import Enum
 from pathlib import Path
@@ -220,6 +224,10 @@ def google_response(*, diarize: bool = False) -> dict[str, Any]:
 GOOGLE_EXPECTED = [
     WordAlignment(a.word, a.start_ms - 300, a.end_ms - 300) for a in JFK_EXPECTED
 ]
+
+
+def _spoken_by(speaker: str, words: list[WordAlignment]) -> list[WordAlignment]:
+    return [dataclasses.replace(w, speaker=speaker) for w in words]
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +467,8 @@ class TestFromGoogle:
         assert from_google(google_response()) == GOOGLE_EXPECTED
 
     def test_diarization_summary_result_is_not_duplicated(self) -> None:
-        assert from_google(google_response(diarize=True)) == GOOGLE_EXPECTED
+        # The summary's speaker tags are kept as speaker labels.
+        assert from_google(google_response(diarize=True)) == _spoken_by("1", GOOGLE_EXPECTED)
 
     def test_v2_offsets(self) -> None:
         response = {
@@ -487,7 +496,7 @@ class TestFromGoogle:
         response = google_response(diarize=True)
         for word in response["results"][-1]["alternatives"][0]["words"]:
             word["speakerLabel"] = str(word.pop("speakerTag"))
-        assert from_google(response) == GOOGLE_EXPECTED
+        assert from_google(response) == _spoken_by("1", GOOGLE_EXPECTED)
 
     def test_summary_rule_needs_speaker_labels(self) -> None:
         # Without speaker labels the repeated words are not taken for a
@@ -596,6 +605,95 @@ class TestFromRecords:
         with pytest.raises(ValueError, match="unit"):
             from_records([], unit="min")  # type: ignore[arg-type]
 
+    def test_speaker_field(self) -> None:
+        records = [
+            {"word": "Hi.", "start": 0.1, "end": 0.4, "speaker": "agent"},
+            {"word": "Hello.", "start": 0.9, "end": 1.3, "speaker": 2},
+            {"word": "Bye.", "start": 1.5, "end": 1.9},
+        ]
+        assert [w.speaker for w in from_records(records)] == ["agent", "2", None]
+        assert [w.speaker for w in from_records(records, speaker_key=None)] == [None] * 3
+
+
+# ---------------------------------------------------------------------------
+# Speaker labels
+# ---------------------------------------------------------------------------
+
+
+class TestSpeakerLabels:
+    """Diarization labels are kept, so each speaker gets their own baseline."""
+
+    def test_deepgram_speakers(self) -> None:
+        response = deepgram_response(diarize=True)
+        words = response["results"]["channels"][0]["alternatives"][0]["words"]
+        for word in words[14:]:
+            word["speaker"] = 1
+        result = from_deepgram(response)
+        assert [w.speaker for w in result] == ["0"] * 14 + ["1"] * 8
+        assert [(w.word, w.start_ms, w.end_ms) for w in result] == [
+            (w.word, w.start_ms, w.end_ms) for w in JFK_EXPECTED
+        ]
+
+    def test_assemblyai_speakers(self) -> None:
+        transcript = assemblyai_transcript()
+        for index, word in enumerate(transcript["words"]):
+            word["speaker"] = "A" if index < 14 else "B"
+        assert [w.speaker for w in from_assemblyai(transcript)] == ["A"] * 14 + ["B"] * 8
+
+    def test_google_v1_speaker_tags(self) -> None:
+        response = google_response(diarize=True)
+        for word in response["results"][-1]["alternatives"][0]["words"][14:]:
+            word["speakerTag"] = 2
+        assert [w.speaker for w in from_google(response)] == ["1"] * 14 + ["2"] * 8
+
+    def test_google_python_client_unset_tag_is_no_speaker(self) -> None:
+        # The Python client reports speaker_tag=0 on words without diarization.
+        words = [
+            {"word": "Hello", "start_time": timedelta(seconds=0.1),
+             "end_time": timedelta(seconds=0.5), "speaker_tag": 0},
+        ]
+        response = {"results": [{"alternatives": [{"transcript": "Hello", "words": words}]}]}
+        assert from_google(response) == [WordAlignment("Hello", 100, 500)]
+
+    def test_whisperx_word_and_segment_speakers(self) -> None:
+        result = {
+            "segments": [
+                {
+                    "speaker": "SPEAKER_00",
+                    "words": [
+                        {"word": "Hi,", "start": 0.1, "end": 0.4, "speaker": "SPEAKER_00"},
+                        {"word": "there.", "start": 0.45, "end": 0.8},  # no word label
+                    ],
+                },
+                {
+                    "speaker": "SPEAKER_01",
+                    "words": [{"word": "Hello.", "start": 1.2, "end": 1.6,
+                               "speaker": "SPEAKER_01"}],
+                },
+            ]
+        }
+        assert [w.speaker for w in from_whisper(result)] == [
+            "SPEAKER_00", "SPEAKER_00", "SPEAKER_01"
+        ]
+
+    def test_word_alignment_round_trip(self) -> None:
+        words = [WordAlignment("Hi.", 100, 400, "A"), WordAlignment("Yes.", 900, 1200)]
+        assert load_word_timings([dataclasses.asdict(w) for w in words]) == words
+        assert load_word_timings(words) == words
+
+    def test_repr_shows_a_speaker_only_when_there_is_one(self) -> None:
+        assert repr(WordAlignment("Hi.", 100, 400)) == (
+            "WordAlignment(word='Hi.', start_ms=100, end_ms=400)"
+        )
+        assert repr(WordAlignment("Hi.", 100, 400, "A")) == (
+            "WordAlignment(word='Hi.', start_ms=100, end_ms=400, speaker='A')"
+        )
+
+    @pytest.mark.parametrize("speaker", [1.5, True, ["A"], {"id": 1}])
+    def test_invalid_speaker_is_an_error(self, speaker: Any) -> None:
+        with pytest.raises(ConversionError, match="speaker must be a string or an integer"):
+            from_records([{"word": "Hi", "start": 0.1, "end": 0.4, "speaker": speaker}])
+
 
 # ---------------------------------------------------------------------------
 # Cleanup and validation
@@ -693,7 +791,7 @@ class TestLoadWordTimings:
         [
             (openai_whisper_result(), JFK_EXPECTED),
             (openai_api_verbose_json(), JFK_EXPECTED),
-            (deepgram_response(diarize=True), JFK_EXPECTED),
+            (deepgram_response(diarize=True), _spoken_by("0", JFK_EXPECTED)),
             (assemblyai_transcript(), JFK_EXPECTED),
             (google_response(), GOOGLE_EXPECTED),
             (openai_whisper_result()["segments"], JFK_EXPECTED),
@@ -831,6 +929,43 @@ class TestParseWordTimings:
     def test_invalid_text(self, text: str, message: str) -> None:
         with pytest.raises(ConversionError, match=message):
             parse_word_timings(text)
+
+    def test_punctuation_restoration_is_linear(self) -> None:
+        """Words that differ from the text used to be matched with difflib in
+        time growing with the product of their numbers: 28,000 repeated words
+        with one extra token at each end (1.1 MB of JSON) took about a minute."""
+        count = 30_000
+        body = json.dumps({
+            "text": "b " + "a " * count + "c",
+            "words": [{"word": "a", "start": i * 0.1, "end": i * 0.1 + 0.05}
+                      for i in range(count)],
+        })
+        started = time.perf_counter()
+        words = parse_word_timings(body)
+        assert time.perf_counter() - started < 2.0
+        assert len(words) == count
+
+    def test_large_input_still_restores_punctuation(self) -> None:
+        """Beyond difflib's budget the linear matching still restores the
+        punctuation around words missing from, or misheard in, the word list."""
+        repeats = 60  # 1,320 words: past the budget, so the linear matching is used
+        text = " ".join([JFK_TEXT] * repeats)
+        expected = [w for _ in range(repeats) for w, _, _ in JFK_WORDS]
+        bare = [_bare(w) for w in expected]
+        bare[3] = "yellow"  # misheard: keeps its own form
+        del bare[500]  # a word missing from the word list
+        bare.insert(1000, "um")  # a word missing from the text
+        payload = {
+            "text": text,
+            "words": [{"word": w, "start": i * 0.5, "end": i * 0.5 + 0.3}
+                      for i, w in enumerate(bare)],
+        }
+        restored = [w.word for w in from_whisper(payload)]
+        want = list(expected)
+        want[3] = "yellow"
+        del want[500]
+        want.insert(1000, "um")
+        assert restored == want
 
 
 # ---------------------------------------------------------------------------

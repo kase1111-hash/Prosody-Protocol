@@ -12,7 +12,11 @@ Pipeline:
 Without word timings the output is coarser: a caller transcript gets
 utterance-level prosody only, and with no transcript at all each stretch
 of speech becomes a ``[speech]`` placeholder. Such output is flagged in
-:attr:`ConversionResult.warnings`.
+:attr:`ConversionResult.warnings`, as is anything else that could not be
+assessed: no speaker baseline (a single utterance without
+``calibration_audio``), several voices without speaker labels, words
+without sentence punctuation, and word timings that do not seem to match
+the audio.
 
 Spec reference: Sections 3-4.
 """
@@ -20,16 +24,18 @@ Spec reference: Sections 3-4.
 from __future__ import annotations
 
 import dataclasses
+import heapq
 import math
+import os
 import re
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 
 from ._install import install_hint
-from ._types import PauseInterval, SpanFeatures, WordAlignment
+from ._types import PauseInterval, SpanFeatures, WordAlignment, normalize_language_tag
 from .assembler import (
     DEFAULT_MIN_EMOTION_CONFIDENCE,
     PROFILE_ATTRIBUTE,
@@ -38,13 +44,15 @@ from .assembler import (
     _Assembly,
 )
 from .emotion_classifier import EmotionClassifier
-from .exceptions import AudioProcessingError
+from .exceptions import AudioProcessingError, ConversionError, SpeechRecognitionError
 from .models import IMLDocument, Utterance
 from .parser import IMLParser
 from .profiles import ProsodyProfile
 from .prosody_analyzer import _AudioAnalysis, _checked_max_duration
+from .validator import IMLValidator
 
 __all__ = [
+    "MAX_OVERLAPPING_SPEAKERS",
     "MAX_WORD_OVERLAP_MS",
     "PLACEHOLDER_TOKEN",
     "AudioToIML",
@@ -67,15 +75,32 @@ _CALIBRATION_SPAN_MS = 300
 _XML_INVALID_CHARS = re.compile("[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
 
 # A BCP 47 language tag, as validator rule V29 checks it.
-_BCP47_RE = re.compile(r"[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*")
 
 #: Caller-supplied words may start at most this long (ms) before an earlier
-#: word ends. Speech recognisers give words one after another, at most with
-#: a little jitter at their edges. Words that overlap more are bad timings,
-#: and each would have the same stretch of audio analysed again: a small
-#: list of words that each span the whole recording would cost as much as
-#: hours of audio.
+#: word of the same speaker ends. Speech recognisers give one speaker's
+#: words one after another, at most with a little jitter at their edges.
+#: Words that overlap more are bad timings, and each would have the same
+#: stretch of audio analysed again: a small list of words that each span
+#: the whole recording would cost as much as hours of audio.
 MAX_WORD_OVERLAP_MS = 500
+
+#: Words of different speakers (``WordAlignment.speaker``) may overlap
+#: further, as people talk over each other, but at most this many speakers'
+#: words may overlap one another by more than :data:`MAX_WORD_OVERLAP_MS`,
+#: which bounds the analysis at this many times the length of the audio.
+MAX_OVERLAPPING_SPEAKERS = 3
+
+#: Calibration audio: one recording, or several (e.g. earlier turns).
+CalibrationAudio: TypeAlias = "str | os.PathLike[str] | Sequence[str | os.PathLike[str]]"
+
+# Words may end this long (ms) after the end of the audio before it is noted:
+# recognisers round their last word's end.
+_END_TOLERANCE_MS = 250
+# Timing checks: words at least this long (ms) contain voiced sound when they
+# belong to the audio (every syllable has a vowel) ...
+_MIN_CHECKED_WORD_MS = 100
+# ... and the audio has at least this much voiced speech (s) to judge from.
+_MIN_CHECKED_SPEECH_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -95,9 +120,15 @@ class ConversionResult:
         recognition) or ``"none"`` (no transcript; each stretch of speech
         is a ``[speech]`` placeholder).
     warnings:
-        Human-readable notes on anything that degraded the output, such as
-        placeholder text, audio without voiced speech, or a silence of more
-        than a minute written as a one-minute pause (spec 6.4).
+        Human-readable notes on anything that degraded the output or could
+        not be assessed, such as placeholder text, a transcript without
+        word timings (only the utterance as a whole is measured), audio
+        without voiced speech, no speaker baseline (a single utterance
+        without ``calibration_audio``: no utterance-level delivery or
+        emotion), several voices without speaker labels, words without
+        sentence punctuation, word timings that do not seem to match the
+        audio, or a silence of more than a minute written as a one-minute
+        pause (spec 6.4).
     profile_matches:
         With a prosody profile: the utterances one of its mappings matched,
         in document order (spec 7.2 asks that profile usage be reported).
@@ -112,6 +143,81 @@ class ConversionResult:
     transcript_source: Literal["words", "transcript", "whisper", "none"]
     warnings: tuple[str, ...] = ()
     profile_matches: tuple[ProfileMatch, ...] = ()
+
+
+def _clamped(word: WordAlignment, duration_ms: int) -> WordAlignment:
+    """*word* with its timings cut off at the end of the audio."""
+    if word.end_ms <= duration_ms:
+        return word
+    return dataclasses.replace(
+        word, start_ms=min(word.start_ms, duration_ms), end_ms=duration_ms
+    )
+
+
+def _seconds(ms: float) -> str:
+    return f"{ms / 1000:.1f} s"
+
+
+def _timing_notes(analysis: _AudioAnalysis, words: Sequence[WordAlignment]) -> list[str]:
+    """Notes on word timings that do not seem to belong to the audio.
+
+    Cheap checks, one pass over the words: words that start or end after the
+    end of the audio; words of at least :data:`_MIN_CHECKED_WORD_MS` without
+    any voiced sound (every syllable has a vowel, so a word of the recording
+    has some -- unless it was whispered); and voiced speech outside every
+    word. The last two are only judged in audio with at least
+    :data:`_MIN_CHECKED_SPEECH_S` of voiced speech.
+    """
+    notes: list[str] = []
+    duration = analysis.duration_ms
+    after = [w for w in words if w.start_ms >= duration]
+    if after:
+        notes.append(
+            f"{len(after)} word(s) start after the end of the audio "
+            f"({duration} ms) and carry no acoustic features."
+        )
+    overrun = [w for w in words if w.start_ms < duration < w.end_ms - _END_TOLERANCE_MS]
+    if overrun:
+        latest = max(overrun, key=lambda w: w.end_ms)
+        notes.append(
+            f"{len(overrun)} word(s) end after the end of the audio ({duration} ms; "
+            f"{latest.word.strip()!r} ends at {latest.end_ms} ms) and were measured up to it."
+        )
+    speech_s = analysis.voiced_seconds()
+    inside = [w for w in words if w.start_ms < duration]
+    if speech_s < _MIN_CHECKED_SPEECH_S or not inside:
+        return notes
+
+    unvoiced = [
+        w for w in inside
+        if w.end_ms - w.start_ms >= _MIN_CHECKED_WORD_MS
+        and analysis.voiced_seconds(w.start_ms / 1000, min(w.end_ms, duration) / 1000) == 0.0
+    ]
+    if unvoiced and 10 * len(unvoiced) >= len(inside):
+        first = unvoiced[0]
+        notes.append(
+            f"{len(unvoiced)} of {len(inside)} words lie where the audio has no voiced sound "
+            f"(such as {first.word.strip()!r} at {_seconds(first.start_ms)}-"
+            f"{_seconds(first.end_ms)}): the word timings may belong to another recording, "
+            "or be offset (for example, relative to a longer stream)."
+        )
+
+    covered: list[list[int]] = []  # the words' time, merged, within the audio
+    for w in sorted(inside, key=lambda w: w.start_ms):
+        start, end = w.start_ms, min(w.end_ms, duration)
+        if covered and start <= covered[-1][1]:
+            covered[-1][1] = max(covered[-1][1], end)
+        elif end > start:
+            covered.append([start, end])
+    outside_s = speech_s - sum(analysis.voiced_seconds(a / 1000, b / 1000) for a, b in covered)
+    if 2 * outside_s > speech_s and outside_s >= _MIN_CHECKED_SPEECH_S:
+        notes.append(
+            f"{outside_s:.1f} s of the audio's {speech_s:.1f} s of voiced speech lie outside "
+            "the words and were not analysed. That is expected when the words are one "
+            "speaker's of several; otherwise the word timings may belong to another "
+            "recording, be offset, or cover only part of it."
+        )
+    return notes
 
 
 def _whisper_language(tag: str) -> str:
@@ -135,16 +241,20 @@ def _checked_words(words: Sequence[WordAlignment]) -> list[WordAlignment]:
     """Validate caller-supplied word timings and return them in time order.
 
     Each word needs finite timings with ``0 <= start_ms <= end_ms``, text
-    that XML allows, and must not start more than
-    :data:`MAX_WORD_OVERLAP_MS` before the end of an earlier word. That
-    bounds the analysis: each word adds at most that much audio that other
-    words also cover.
+    (and a speaker label, if any) that XML allows, and must not start more
+    than :data:`MAX_WORD_OVERLAP_MS` before the end of an earlier word of
+    the same speaker; words of more than :data:`MAX_OVERLAPPING_SPEAKERS`
+    speakers may not overlap one another by more than that. This bounds the
+    analysis: each word adds at most that much audio that other words of its
+    speaker also cover.
     """
     words = list(words)  # an iterator can be read only once
     for i, word in enumerate(words):
         if not isinstance(word, WordAlignment):
             raise TypeError(f"words[{i}] must be a WordAlignment, not {type(word).__name__}")
         _checked_text(word.word, f"words[{i}].word")
+        if word.speaker is not None:
+            _checked_text(word.speaker, f"words[{i}].speaker")
         for name in ("start_ms", "end_ms"):
             value = getattr(word, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -160,22 +270,39 @@ def _checked_words(words: Sequence[WordAlignment]) -> list[WordAlignment]:
                 f"{word.start_ms}-{word.end_ms} ms"
             )
     order = sorted(range(len(words)), key=lambda i: (words[i].start_ms, words[i].end_ms))
-    latest: int | None = None  # the earlier word that ends last
+    latest: dict[str | None, int] = {}  # each speaker's earlier word that ends last
+    ends: list[tuple[float, int]] = []  # heap of (end, index) of speakers' latest words
     for i in order:
         word = words[i]
-        if latest is not None:
-            earlier = words[latest]
+        own = latest.get(word.speaker)
+        if own is not None:
+            earlier = words[own]
             if earlier.end_ms - word.start_ms > MAX_WORD_OVERLAP_MS:
                 raise ValueError(
                     f"words[{i}] ({word.word!r}, {word.start_ms}-{word.end_ms} ms) starts "
-                    f"{earlier.end_ms - word.start_ms} ms before words[{latest}] "
+                    f"{earlier.end_ms - word.start_ms} ms before words[{own}] "
                     f"({earlier.word!r}, {earlier.start_ms}-{earlier.end_ms} ms) ends; "
                     f"word timings may overlap by at most {MAX_WORD_OVERLAP_MS} ms "
                     "(the words of one speaker, one after another)"
                 )
             if word.end_ms <= earlier.end_ms:
                 continue
-        latest = i
+        latest[word.speaker] = i
+        # Other speakers whose latest word overlaps this one by more than the
+        # tolerance (stale heap entries, superseded by a later word, are skipped).
+        while ends and ends[0][0] - word.start_ms <= MAX_WORD_OVERLAP_MS:
+            heapq.heappop(ends)
+        talking = {
+            words[j].speaker for _, j in ends
+            if words[j].speaker != word.speaker and latest[words[j].speaker] == j
+        }
+        if len(talking) >= MAX_OVERLAPPING_SPEAKERS:
+            raise ValueError(
+                f"words[{i}] ({word.word!r}, {word.start_ms}-{word.end_ms} ms) overlaps words "
+                f"of {len(talking)} other speakers by more than {MAX_WORD_OVERLAP_MS} ms; at "
+                f"most {MAX_OVERLAPPING_SPEAKERS} speakers' words may overlap"
+            )
+        heapq.heappush(ends, (word.end_ms, i))
     return [words[i] for i in order]
 
 
@@ -204,10 +331,25 @@ class AudioToIML:
         no ``emotion`` or ``confidence`` attribute (also after a profile has
         adjusted the confidence).
     calibration_audio:
-        Optional recording of the same speaker talking neutrally. Its pitch
-        and loudness become the baseline that relative ``pitch``/``volume``
-        values and emphasis are measured against, instead of the converted
-        file's own average.
+        Optional recording, or sequence of recordings, of the same speaker
+        talking as usual (neutrally), recorded with the same setup: for a
+        voice assistant, the user's earlier turns. Their pitch, loudness,
+        rate and pitch movement become the speaker baseline that
+        utterance-level ``pitch``/``volume``/``rate``, word offsets and
+        emotion are measured against, instead of the converted recording's
+        own typical utterances. Without it, a recording needs at least three
+        utterances, most of them at a similar level, to show the speaker's
+        usual level; a single turn otherwise gets no utterance-level
+        delivery and no emotion (:attr:`ConversionResult.warnings` says
+        so). Each file is analysed once and the result kept while it is
+        listed (and unchanged on disk), so a converter reused across turns
+        only analyses new files: assign a longer list to the
+        ``calibration_audio`` attribute as turns accumulate. An empty
+        sequence means no calibration. Files without voiced speech are
+        skipped with a warning; if none has any,
+        :class:`~prosody_protocol.exceptions.AudioProcessingError` is raised.
+        It is not used when the words carry several speaker labels (it
+        describes one speaker).
     stt:
         Where words come from when a conversion gets neither ``words`` nor
         ``transcript``: ``"whisper"`` requires openai-whisper, ``"none"``
@@ -215,8 +357,8 @@ class AudioToIML:
         ``"auto"`` (default) uses Whisper when it is installed and
         placeholders otherwise.
     max_duration_s:
-        Optional limit on the length of the audio (and of
-        ``calibration_audio``), in seconds. Longer audio is rejected with
+        Optional limit on the length of the audio (and of each
+        ``calibration_audio`` file), in seconds. Longer audio is rejected with
         :class:`~prosody_protocol.exceptions.AudioProcessingError` before it
         is loaded, since a small compressed upload can decode to hours of
         audio. ``None`` (default) means no limit.
@@ -233,7 +375,19 @@ class AudioToIML:
         ``user_id`` is not written), and
         :attr:`ConversionResult.profile_matches` lists every match. An
         invalid profile raises
-        :class:`~prosody_protocol.exceptions.ProfileError`.
+        :class:`~prosody_protocol.exceptions.ProfileError`. Like
+        ``calibration_audio``, it describes one speaker and is not applied
+        when the words carry several speaker labels.
+
+    Example: a voice assistant that converts each user turn against the
+    user's earlier turns::
+
+        converter = AudioToIML(stt="none")
+        earlier: list[str] = []
+        for turn, words in turns:  # audio file and word timings of each turn
+            converter.calibration_audio = earlier[-5:]  # at most 5 recent turns
+            result = converter.convert_detailed(turn, words=words)
+            earlier.append(turn)
     """
 
     def __init__(
@@ -244,26 +398,23 @@ class AudioToIML:
         language: str | None = None,
         *,
         min_emotion_confidence: float = DEFAULT_MIN_EMOTION_CONFIDENCE,
-        calibration_audio: str | Path | None = None,
+        calibration_audio: CalibrationAudio | None = None,
         stt: Literal["auto", "whisper", "none"] = "auto",
         max_duration_s: float | None = None,
         profile: ProsodyProfile | None = None,
     ) -> None:
         if stt not in _STT_MODES:
             raise ValueError(f"stt must be one of {', '.join(_STT_MODES)}; got {stt!r}")
-        if isinstance(language, str):
+        if language is not None:
             # POSIX locale style ("en_US") names the same language.
-            language = language.replace("_", "-")
-        if language is not None and not (
-            isinstance(language, str) and _BCP47_RE.fullmatch(language)
-        ):
-            raise ValueError(f'language must be a BCP 47 tag such as "en-US"; got {language!r}')
+            language = normalize_language_tag(language)
         self.max_duration_s = _checked_max_duration(max_duration_s)
         self.stt_model = stt_model
         self.include_extended = include_extended
         self.language = language
         self.min_emotion_confidence = min_emotion_confidence
-        self.calibration_audio = None if calibration_audio is None else Path(calibration_audio)
+        self._calibration_audio: Path | tuple[Path, ...] | None = None
+        self.calibration_audio = calibration_audio
         self.stt = stt
         self._assembler = IMLAssembler(
             emotion_classifier=emotion_classifier,
@@ -273,12 +424,49 @@ class AudioToIML:
         )
         self._parser = IMLParser()
         self._whisper_models: dict[str, Any] = {}
-        self._calibration: tuple[Path, list[SpanFeatures]] | None = None
+        self._validator = IMLValidator()
+        # Each calibration file's (mtime_ns, size) and word-sized spans.
+        self._calibration: dict[Path, tuple[tuple[int, int], list[SpanFeatures]]] = {}
 
     @property
     def profile(self) -> ProsodyProfile | None:
         """The speaker's prosody profile, if one is applied."""
         return self._assembler.profile
+
+    @property
+    def calibration_audio(self) -> Path | tuple[Path, ...] | None:
+        """The calibration recording (a :class:`~pathlib.Path`), recordings
+        (a tuple of them) or ``None``; see the class documentation.
+
+        It may be reassigned between conversions, for example to add the
+        latest turn; files analysed before are not analysed again.
+        """
+        return self._calibration_audio
+
+    @calibration_audio.setter
+    def calibration_audio(self, value: CalibrationAudio | None) -> None:
+        if value is None or isinstance(value, (str, os.PathLike)):
+            self._calibration_audio = None if value is None else Path(value)
+            return
+        if isinstance(value, (bytes, bytearray)) or not isinstance(value, Sequence):
+            raise TypeError(
+                "calibration_audio must be a path or a sequence of paths, "
+                f"not {type(value).__name__}"
+            )
+        paths = []
+        for index, item in enumerate(value):
+            if not isinstance(item, (str, os.PathLike)):
+                raise TypeError(
+                    f"calibration_audio[{index}] must be a path, not {type(item).__name__}"
+                )
+            paths.append(Path(item))
+        self._calibration_audio = tuple(paths)
+
+    def _calibration_paths(self) -> tuple[Path, ...]:
+        audio = self._calibration_audio
+        if audio is None:
+            return ()
+        return (audio,) if isinstance(audio, Path) else audio
 
     # -- Public API ---------------------------------------------------------
 
@@ -346,14 +534,24 @@ class AudioToIML:
         words:
             Word timings from any speech recogniser. No speech recognition
             runs. Each ``word`` is used as-is (surrounding whitespace is
-            allowed); timings beyond the end of the audio are clamped. Words
-            may overlap by at most :data:`MAX_WORD_OVERLAP_MS` (the words of
-            one speaker, one after another).
+            allowed); timings beyond the end of the audio are clamped to it
+            (and noted). Words of one speaker may overlap by at most
+            :data:`MAX_WORD_OVERLAP_MS`; words with different ``speaker``
+            labels may overlap further (see :data:`MAX_OVERLAPPING_SPEAKERS`).
+            Speaker labels start a new utterance where they change, become
+            its ``speaker_id``, and give each speaker their own baseline.
+            Words that lie over silence, or voiced speech that lies outside
+            the words, are noted as timings that may not belong to the
+            audio.
         transcript:
             The spoken text without timings. No speech recognition runs;
-            the text becomes one utterance whose emotion and prosody are
-            measured over the whole stretch of speech. No word-level tags
-            or pauses are placed, because nothing says where the words are.
+            the text becomes one utterance measured over the whole stretch
+            of speech. No pauses, emphasis or word-level tags are placed,
+            because nothing says where the words are, and a warning says
+            so. Its overall pitch, loudness, rate and emotion are only
+            assessed against a speaker baseline, which a single utterance
+            gets from ``calibration_audio``: without it the output is
+            usually the plain transcript.
 
         With a prosody profile, :attr:`ConversionResult.profile_matches`
         reports which utterances its mappings matched.
@@ -361,18 +559,23 @@ class AudioToIML:
         Raises
         ------
         AudioProcessingError
-            The audio cannot be read, decoded or analysed, is longer than
-            ``max_duration_s``, Whisper is required but not installed, or
-            Whisper fails.
+            The audio (or no calibration file) cannot be read, decoded or
+            analysed, is longer than ``max_duration_s``, Whisper is required
+            but not installed, or Whisper fails (then the subclass
+            :class:`~prosody_protocol.exceptions.SpeechRecognitionError`).
         ValueError
             Both *words* and *transcript* are given, a word has negative,
             reversed or non-finite timings or starts more than
-            :data:`MAX_WORD_OVERLAP_MS` before an earlier word ends, or the
-            text contains characters that XML does not allow (such as
-            control characters).
+            :data:`MAX_WORD_OVERLAP_MS` before an earlier word of its
+            speaker ends (or overlaps the words of too many other speakers),
+            or the text or a speaker label contains characters that XML
+            does not allow (such as control characters).
         TypeError
             An item of *words* is not a :class:`WordAlignment`, or a word,
-            timing or *transcript* has the wrong type.
+            timing, speaker label or *transcript* has the wrong type.
+        ConversionError
+            The assembled document is not valid IML (a bug; it is checked
+            so that invalid IML is never returned).
         """
         return self._convert(audio_path, words, transcript)
 
@@ -399,15 +602,11 @@ class AudioToIML:
 
         if checked is not None:
             source = "words"
-            alignments = checked
-            if not alignments:
+            if not checked:
                 notes.append("No words were supplied, so the document has no text.")
-            outside = sum(1 for w in alignments if w.start_ms >= analysis.duration_ms)
-            if outside:
-                notes.append(
-                    f"{outside} word(s) start after the end of the audio "
-                    f"({analysis.duration_ms} ms) and carry no acoustic features."
-                )
+            notes.extend(_timing_notes(analysis, checked))
+            # Measured and written only over the audio (duration_ms included).
+            alignments = [_clamped(word, analysis.duration_ms) for word in checked]
         elif transcript is not None:
             source = "transcript"
             alignments = self._transcript_alignment(analysis, transcript, notes)
@@ -430,11 +629,14 @@ class AudioToIML:
                 if not alignments:
                     notes.append("Speech recognition found no words in the audio.")
 
-        document, matches, assembly_notes = self._assemble(
-            analysis, alignments, pauses, language
+        assembly = self._assemble(
+            analysis, alignments, pauses, language, notes, check_punctuation=source == "words"
         )
-        notes.extend(assembly_notes)
-        if not analysis.has_speech:
+        document, matches = assembly.document, assembly.matches
+        notes.extend(assembly.notes)
+        if analysis.has_speech:
+            notes.extend(assembly.info)
+        else:
             # Silence and noise are never given an emotion, by a profile either.
             notes.append("No voiced speech was detected in the audio; no emotion is reported.")
             document = dataclasses.replace(document, utterances=tuple(
@@ -450,11 +652,16 @@ class AudioToIML:
             ))
             matches = []
 
+        iml = self._parser.to_iml_string(document)
+        errors = self._validator.validate(iml).errors
+        if errors:
+            problems = "; ".join(f"{issue.rule}: {issue.message}" for issue in errors[:3])
+            raise ConversionError(f"The assembled document is not valid IML: {problems}")
         return ConversionResult(
             document=document,
-            iml=self._parser.to_iml_string(document),
+            iml=iml,
             transcript_source=source,
-            warnings=tuple(notes),
+            warnings=tuple(dict.fromkeys(notes)),
             profile_matches=tuple(matches),
         )
 
@@ -464,6 +671,9 @@ class AudioToIML:
         alignments: list[WordAlignment],
         pauses: list[PauseInterval],
         language: str | None,
+        notes: list[str],
+        *,
+        check_punctuation: bool,
     ) -> _Assembly:
         if not alignments:
             # Nothing was said: an empty utterance with no emotion (don't
@@ -473,23 +683,37 @@ class AudioToIML:
                 version="0.1.0",
                 language=language,
             )
-            return _Assembly(empty, [], [])
+            return _Assembly(empty, [], [], [])
         return self._assembler._assemble(
             alignments=alignments,
             features=analysis.features(alignments),
             pauses=pauses,
             language=language,
-            reference_features=self._reference_features(),
+            reference_features=self._reference_features(notes),
+            check_punctuation=check_punctuation,
         )
 
     def _transcript_alignment(
         self, analysis: _AudioAnalysis, transcript: str, notes: list[str]
     ) -> list[WordAlignment]:
-        """One token holding the whole transcript, spanning the speech."""
+        """One token holding the whole transcript, spanning the speech.
+
+        Words are not spread over the audio: without timings, where each one
+        was said is unknown, and made-up timings would put pauses, emphasis
+        and pitch on the wrong words.
+        """
         text = " ".join(transcript.split())
         if not text:
             notes.append("The transcript is empty, so the document has no text.")
             return []
+        notes.append(
+            "The transcript has no word timings, so only the utterance as a whole was "
+            "measured: pauses, emphasis and word-level pitch or loudness cannot be placed, "
+            "and a transcript of several sentences is one utterance. Its overall pitch, "
+            "loudness, rate and emotion are assessed only against a speaker baseline, "
+            "which a single utterance gets from calibration_audio. For word-level markup, "
+            "pass word timings (words=), such as a speech recognizer's word timestamps."
+        )
         regions = analysis.voiced_regions()
         if regions:
             start_ms, end_ms = regions[0][0], regions[-1][1]
@@ -512,31 +736,65 @@ class AudioToIML:
             for start_ms, end_ms in analysis.voiced_regions()
         ]
 
-    def _reference_features(self) -> list[SpanFeatures] | None:
-        """Features of the calibration recording, measured once per path.
+    def _reference_features(self, notes: list[str]) -> list[SpanFeatures] | None:
+        """Features of the calibration recordings, each file measured once.
 
         The speech is cut into word-sized spans so that the baseline is
-        comparable with the per-word features it is applied to.
+        comparable with the per-word features it is applied to. A file is
+        analysed again only when it changed on disk; files no longer listed
+        are forgotten.
         """
-        path = self.calibration_audio
-        if path is None:
+        paths = self._calibration_paths()
+        if not paths:
+            self._calibration = {}
             return None
-        if self._calibration is None or self._calibration[0] != path:
-            analysis = _AudioAnalysis.from_path(path, self.max_duration_s)
-            spans: list[WordAlignment] = []
-            for start_ms, end_ms in analysis.voiced_regions():
-                edges = list(range(start_ms, end_ms, _CALIBRATION_SPAN_MS))
-                if len(edges) > 1 and end_ms - edges[-1] < _CALIBRATION_SPAN_MS // 2:
-                    edges.pop()  # fold a short remainder into the previous span
-                spans.extend(
-                    WordAlignment(word="[calibration]", start_ms=a, end_ms=b)
-                    for a, b in zip(edges, [*edges[1:], end_ms], strict=True)
-                )
-            features = [f for f in analysis.features(spans) if f.f0_mean is not None]
-            if not features:
-                raise AudioProcessingError(f"Calibration audio contains no voiced speech: {path}")
-            self._calibration = (path, features)
-        return self._calibration[1]
+        kept: dict[Path, tuple[tuple[int, int], list[SpanFeatures]]] = {}
+        features: list[SpanFeatures] = []
+        silent: list[Path] = []
+        for path in paths:
+            cached = self._calibration.get(path) or kept.get(path)
+            try:
+                stat = path.stat()
+                signature = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                signature = None  # _AudioAnalysis reports it
+            if cached is not None and cached[0] == signature:
+                spans = cached[1]
+            else:
+                spans = self._calibration_spans(path)
+                if signature is not None:
+                    cached = (signature, spans)
+            if cached is not None:
+                kept[path] = cached
+            if spans:
+                features.extend(spans)
+            else:
+                silent.append(path)
+        self._calibration = kept
+        if not features:
+            names = ", ".join(str(path) for path in silent)
+            raise AudioProcessingError(f"Calibration audio contains no voiced speech: {names}")
+        if silent:
+            names = ", ".join(str(path) for path in silent)
+            notes.append(
+                f"{len(silent)} of the {len(paths)} calibration_audio files contain no voiced "
+                f"speech and were not used: {names}."
+            )
+        return features
+
+    def _calibration_spans(self, path: Path) -> list[SpanFeatures]:
+        """The voiced word-sized spans of one calibration recording."""
+        analysis = _AudioAnalysis.from_path(path, self.max_duration_s)
+        spans: list[WordAlignment] = []
+        for start_ms, end_ms in analysis.voiced_regions():
+            edges = list(range(start_ms, end_ms, _CALIBRATION_SPAN_MS))
+            if len(edges) > 1 and end_ms - edges[-1] < _CALIBRATION_SPAN_MS // 2:
+                edges.pop()  # fold a short remainder into the previous span
+            spans.extend(
+                WordAlignment(word="[calibration]", start_ms=a, end_ms=b)
+                for a, b in zip(edges, [*edges[1:], end_ms], strict=True)
+            )
+        return [f for f in analysis.features(spans) if f.f0_mean is not None]
 
     # -- Whisper ----------------------------------------------------------------
 
@@ -562,7 +820,7 @@ class AudioToIML:
             try:
                 model = whisper.load_model(self.stt_model)
             except Exception as exc:
-                raise AudioProcessingError(
+                raise SpeechRecognitionError(
                     f"Cannot load Whisper model {self.stt_model!r}: {exc}"
                 ) from exc
             self._whisper_models[self.stt_model] = model
@@ -586,7 +844,7 @@ class AudioToIML:
                     # Whisper's leading space is kept; tokens are opaque to the assembler.
                     alignments.append(WordAlignment(word=token, start_ms=start_ms, end_ms=end_ms))
         except Exception as exc:
-            raise AudioProcessingError(f"Whisper transcription failed: {exc}") from exc
+            raise SpeechRecognitionError(f"Whisper transcription failed: {exc}") from exc
 
         detected = result.get("language")
         return alignments, detected if isinstance(detected, str) and detected else None

@@ -6,11 +6,14 @@ and pause information, and assembles a structured IML document.
 Steps:
   1. Resolve pauses: each detected silence between two words (or, where
      none was detected, the gap between their timings) of at least 200 ms
-  2. Group words into utterances at sentence ends -- or, in text without
-     sentence punctuation, at pauses of 1 s or more. The pause that ends an
+  2. Group words into utterances at sentence ends and where the speaker
+     changes -- or, in text without sentence punctuation, at pauses of
+     :data:`UTTERANCE_SPLIT_PAUSE_MS` (0.5 s) or more. The pause that ends an
      utterance is kept at the start of the next one.
-  3. Measure the speaker baseline: from calibration speech if given, else
-     from the recording's utterances, each counting once
+  3. Measure each speaker's baseline: from calibration speech if given (and
+     the words are one speaker's), else from the speaker's utterances, each
+     counting once. Utterances whose pitch falls into two clearly separate
+     groups, as from two voices, get no baseline (:data:`VOICE_SEPARATION_ST`)
   4. Classify emotion per utterance relative to that baseline -- when there
      is one to compare with (see :meth:`IMLAssembler.assemble`). With a
      prosody profile, a mapping that matches the utterance takes precedence
@@ -26,7 +29,8 @@ Pitch and volume offsets are relative to the speaker baseline; inside an
 utterance-level ``<prosody>`` they are relative to the utterance's level,
 and in a recording that is a single utterance (without calibration speech)
 to that utterance's typical level. Markup is at most two elements deep
-(spec Section 5.2).
+(spec Section 5.2), so an emphasized word inside an utterance-level
+``<prosody>`` is written as ``<emphasis>`` alone (see :meth:`_UtteranceBuilder._word`).
 """
 
 from __future__ import annotations
@@ -42,7 +46,7 @@ from dataclasses import dataclass, fields, replace
 from itertools import accumulate, groupby, pairwise
 from typing import Any, NamedTuple
 
-from ._types import PauseInterval, SpanFeatures, WordAlignment
+from ._types import PauseInterval, SpanFeatures, WordAlignment, normalize_language_tag
 from .emotion_classifier import (
     BaselineAwareEmotionClassifier,
     EmotionClassifier,
@@ -102,9 +106,15 @@ MIN_PAUSE_MS = 200
 #: assembler reports each silence it shortened.
 MAX_PAUSE_MS = 60_000
 
-# In text without sentence punctuation, pauses at least this long (ms) also
-# end an utterance. Punctuated text is split at sentence ends only.
-UTTERANCE_SPLIT_PAUSE_MS = 1000
+#: In text without sentence punctuation (from a recognizer asked for none),
+#: pauses at least this long (ms) end an utterance; punctuated text is split
+#: at sentence ends only. Pauses between sentences mostly last longer than
+#: half a second and hesitations within a sentence mostly less, so this
+#: separates most sentences, at the cost of sometimes splitting a sentence at
+#: a long hesitation (which still leaves each part's delivery measured) or
+#: joining sentences spoken without a pause. The assembler notes when it
+#: had to split this way.
+UTTERANCE_SPLIT_PAUSE_MS = 500
 
 # Utterance-level <prosody>: the utterance's median pitch (semitones) or
 # loudness (dB) differs from the speaker baseline by at least this much ...
@@ -120,6 +130,17 @@ UTTERANCE_RATE_RATIO = 1.4
 # UTTERANCE_PITCH_ST and UTTERANCE_VOLUME_DB of the baseline: otherwise it
 # does not show which level is the speaker's usual one.
 MIN_BASELINE_UTTERANCES = 3
+
+#: One speaker's utterances (all of them, without speaker labels) whose
+#: median pitches fall into two groups whose medians lie more than this many
+#: semitones apart -- each group of at least two utterances, with a gap of at
+#: least half that distance between them -- are taken to be two voices, such
+#: as the two sides of a call. They have no one baseline, so they are marked
+#: without one: no utterance-level offsets and no emotion. Voices of the
+#: same sex usually lie closer and are not detected; a speaker whose
+#: excitement raises some utterances this far above the others is taken
+#: for two voices.
+VOICE_SEPARATION_ST = 7.0
 
 # Word-level <prosody>: the word's pitch or loudness differs from the
 # utterance's level by at least this much.
@@ -165,6 +186,9 @@ MAX_RATE_RATIO = 2.0
 
 # Extended f0_contour attributes carry at most this many values.
 EXTENDED_CONTOUR_POINTS = 10
+# A span longer than this (ms) is a timing error, not a word: no duration_ms
+# is written for it (spec 6.4 finds durations beyond an hour implausible).
+_MAX_EXTENDED_DURATION_MS = 3_600_000
 
 # Thresholds of the previous assembler, which compared each word with the
 # mean of its own utterance. They no longer affect the output.
@@ -311,8 +335,9 @@ def _resolve_pauses(words: list[_Word], pauses: Sequence[PauseInterval]) -> list
 
     A detected silence belongs to the boundary its midpoint falls in (between
     the centres of the two words), clipped to the outer edges of those words;
-    silence before the first or after the last word is not a pause. Where no
-    silence was detected, the gap between the word timings is used.
+    silence before the first or after the last word is not a pause. Several
+    silences at one boundary add up (speech between them is not pause).
+    Where no silence was detected, the gap between the word timings is used.
     Durations are rounded to whole milliseconds, pauses shorter than
     :data:`MIN_PAUSE_MS` are dropped, and a pause before punctuation moves
     after it -- unless the punctuation ends the transcript, in which case
@@ -323,7 +348,7 @@ def _resolve_pauses(words: list[_Word], pauses: Sequence[PauseInterval]) -> list
     centres = list(
         accumulate(((w.alignment.start_ms + w.alignment.end_ms) / 2 for w in words), max)
     )
-    detected: dict[int, tuple[int, int]] = {}
+    detected: dict[int, list[tuple[int, int]]] = {}
     for pause in pauses:
         boundary = bisect_right(centres, (pause.start_ms + pause.end_ms) / 2) - 1
         if not 0 <= boundary < len(words) - 1:
@@ -331,19 +356,15 @@ def _resolve_pauses(words: list[_Word], pauses: Sequence[PauseInterval]) -> list
         start = max(pause.start_ms, words[boundary].alignment.start_ms)
         end = min(pause.end_ms, words[boundary + 1].alignment.end_ms)
         if end > start:
-            known = detected.get(boundary)
-            detected[boundary] = (start, end) if known is None else (
-                min(known[0], start), max(known[1], end)
-            )
+            detected.setdefault(boundary, []).append((start, end))
 
     result: list[int] = []
     for boundary in range(len(words) - 1):
         if boundary in detected:
-            start, end = detected[boundary]
+            duration = round(_covered_ms(detected[boundary]))
         else:
-            start = words[boundary].alignment.end_ms
-            end = words[boundary + 1].alignment.start_ms
-        duration = round(end - start)
+            gap = words[boundary + 1].alignment.start_ms - words[boundary].alignment.end_ms
+            duration = round(gap)
         result.append(duration if duration >= MIN_PAUSE_MS else 0)
 
     for boundary, duration in enumerate(result):
@@ -354,11 +375,34 @@ def _resolve_pauses(words: list[_Word], pauses: Sequence[PauseInterval]) -> list
     return result
 
 
+def _covered_ms(intervals: list[tuple[int, int]]) -> int:
+    """Total length of the union of *intervals* (start, end), in ms."""
+    total = 0
+    reach: int | None = None
+    for start, end in sorted(intervals):
+        if reach is not None and start < reach:
+            start = reach
+        if end > start:
+            total += end - start
+        reach = end if reach is None else max(reach, end)
+    return total
+
+
+def _is_punctuated(words: list[_Word]) -> bool:
+    """Whether the text has sentence punctuation to split utterances at."""
+    return any(_ends_sentence(w.text, None) for w in words)
+
+
 def _group_into_utterances(
     words: list[_Word], boundary_pauses: list[int]
 ) -> list[tuple[int, list[int]]]:
-    """Split word indices into utterances, each with the pause (ms) before it."""
-    punctuated = any(_ends_sentence(w.text, None) for w in words)
+    """Split word indices into utterances, each with the pause (ms) before it.
+
+    Utterances end at sentence ends (in text without sentence punctuation,
+    at pauses of :data:`UTTERANCE_SPLIT_PAUSE_MS` or more) and where the
+    speaker changes.
+    """
+    punctuated = _is_punctuated(words)
     cased = any(c.isupper() for w in words for c in w.text)
     groups: list[tuple[int, list[int]]] = []
     leading = 0
@@ -368,8 +412,10 @@ def _group_into_utterances(
         if i == len(words) - 1:
             break
         pause = boundary_pauses[i]
-        if _ends_sentence(word.text, words[i + 1].text, cased=cased) or (
-            not punctuated and pause >= UTTERANCE_SPLIT_PAUSE_MS
+        if (
+            _ends_sentence(word.text, words[i + 1].text, cased=cased)
+            or (not punctuated and pause >= UTTERANCE_SPLIT_PAUSE_MS)
+            or word.alignment.speaker != words[i + 1].alignment.speaker
         ):
             groups.append((leading, current))
             leading, current = pause, []
@@ -498,7 +544,7 @@ def _extended_attrs(features: SpanFeatures) -> dict[str, Any]:
     if rate is not None and rate >= 0.0:
         attrs["speech_rate"] = round(rate, 1)
     duration_ms = round(features.end_ms - features.start_ms)
-    if duration_ms > 0:
+    if 0 < duration_ms <= _MAX_EXTENDED_DURATION_MS:
         attrs["duration_ms"] = duration_ms
     for name in ("jitter", "shimmer"):
         value = _finite(getattr(features, name))
@@ -517,17 +563,11 @@ def _extended_attrs(features: SpanFeatures) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class _Level:
-    """What an utterance's words are compared with.
-
-    ``f0`` (Hz) and ``intensity`` (dB) are the utterance's level. The shifts
-    (semitones, dB) are how far that level lies from the speaker baseline;
-    they are non-zero only when the utterance-level ``<prosody>`` states them.
-    """
+    """What an utterance's words are compared with: the utterance's level,
+    ``f0`` (Hz) and ``intensity`` (dB)."""
 
     f0: float | None
     intensity: float | None
-    pitch_shift_st: float = 0.0
-    volume_shift_db: float = 0.0
 
 
 def _utterance_shift(
@@ -542,36 +582,28 @@ def _utterance_shift(
     attrs: dict[str, str] = {}
     f0 = _median(_span_f0(f) for f in spans)
     level_f0 = baseline.f0_mean if baseline.f0_mean is not None else f0
-    pitch_shift = 0.0
     if f0 is not None and baseline.f0_mean is not None:
         shift = _semitones(f0, baseline.f0_mean)
         if UTTERANCE_PITCH_ST <= abs(shift) <= MAX_PITCH_ST:
             attrs["pitch"] = _format_pitch(shift)
-            level_f0, pitch_shift = f0, shift
+            level_f0 = f0
 
     intensity = _median(_span_intensity(f) for f in spans)
     level_intensity = (
         baseline.intensity_mean if baseline.intensity_mean is not None else intensity
     )
-    volume_shift = 0.0
     if intensity is not None and baseline.intensity_mean is not None:
         shift = intensity - baseline.intensity_mean
         if UTTERANCE_VOLUME_DB <= abs(shift) <= MAX_VOLUME_DB:
             attrs["volume"] = _format_volume(shift)
-            level_intensity, volume_shift = intensity, shift
+            level_intensity = intensity
 
     rate = _mean(_span_rate(f) for f in spans)
     if rate is not None and baseline.speech_rate is not None:
         ratio = rate / baseline.speech_rate
         if UTTERANCE_RATE_RATIO <= max(ratio, 1.0 / ratio) <= MAX_RATE_RATIO:
             attrs["rate"] = f"{round(ratio * 20.0) * 5}%"  # nearest 5 %
-    return attrs, _Level(level_f0, level_intensity, pitch_shift, volume_shift)
-
-
-def _offset_attrs(pitch_st: float, volume_db: float) -> dict[str, str]:
-    """``pitch`` and ``volume`` attributes for these offsets, except those that round to 0."""
-    attrs = {"pitch": _format_pitch(pitch_st), "volume": _format_volume(volume_db)}
-    return {name: value for name, value in attrs.items() if value[1:] not in ("0%", "0dB")}
+    return attrs, _Level(level_f0, level_intensity)
 
 
 def _neighbour_median(values: list[float | None], index: int) -> float | None:
@@ -725,10 +757,17 @@ class _UtteranceBuilder:
     ) -> tuple[ChildNode, bool]:
         """The word, marked up where notable, and whether it stands alone.
 
-        An emphasized word with attributes of its own cannot stay inside the
-        utterance-level ``<prosody>`` (*wrapper*): ``<emphasis><prosody>``
-        inside it would be three elements deep. It stands alone instead,
-        carrying the utterance's attributes itself.
+        Inside the utterance-level ``<prosody>`` (*wrapper*) an emphasized
+        word is ``<emphasis>`` alone: ``<emphasis><prosody>`` would be three
+        elements deep. Its own pitch and loudness offsets are left out (the
+        emphasis says that it stands out) and so are its pitch contour, which
+        the pitch accent of a stressed word usually explains, and its
+        extended measurements. Only a contour on the utterance's last voiced
+        word (the rise of a question, the fall of a statement) or an unusual
+        voice quality is kept: the word then stands alone, outside the
+        wrapper, in a ``<prosody>`` with exactly the wrapper's attributes
+        plus these, so that the pieces read as one delivery. Whether a word
+        stands alone never depends on ``include_extended``.
         """
         feat = word.features
         if feat is None:
@@ -750,38 +789,34 @@ class _UtteranceBuilder:
         emphasis = "strong" if prominence >= 2.0 else "moderate" if prominence >= 1.0 else None
 
         attrs: dict[str, Any] = {}
-        pitch_st = volume_db = 0.0
         if f0 is not None and level.f0 is not None:
             offset = _semitones(f0, level.f0)
             if WORD_PITCH_ST <= abs(offset) <= MAX_PITCH_ST:
                 attrs["pitch"] = _format_pitch(offset)
-                pitch_st = offset
         if intensity is not None and level.intensity is not None:
             offset = intensity - level.intensity
             if WORD_VOLUME_DB <= abs(offset) <= MAX_VOLUME_DB:
                 attrs["volume"] = _format_volume(offset)
-                volume_db = offset
         if attrs or emphasis or is_last_voiced:
             contour = _pitch_contour(feat)
             if contour is not None and contour != "flat":
                 attrs["pitch_contour"] = contour
         if quality is not None:
             attrs["quality"] = quality
-        if self.include_extended:
-            attrs.update(_extended_attrs(feat))
+        extended = _extended_attrs(feat) if self.include_extended else {}
 
         if emphasis is None:
+            attrs.update(extended)
             return (_prosody((word.text,), attrs) if attrs else word.text), False
-        if wrapper and attrs:
-            # Standing alone, the word's pitch and volume add up the
-            # utterance's shift and the word's own offset from it.
-            alone: dict[str, Any] = {**wrapper, **attrs}
-            alone.pop("pitch", None)
-            alone.pop("volume", None)
-            alone.update(_offset_attrs(
-                level.pitch_shift_st + pitch_st, level.volume_shift_db + volume_db
-            ))
+        if wrapper:
+            kept = {"quality": quality} if quality is not None else {}
+            if is_last_voiced and "pitch_contour" in attrs:
+                kept["pitch_contour"] = attrs["pitch_contour"]
+            if not kept:
+                return Emphasis(level=emphasis, children=(word.text,)), False
+            alone: dict[str, Any] = {**wrapper, **kept, **extended}
             return Emphasis(level=emphasis, children=(_prosody((word.text,), alone),)), True
+        attrs.update(extended)
         inner: ChildNode = _prosody((word.text,), attrs) if attrs else word.text
         return Emphasis(level=emphasis, children=(inner,)), False
 
@@ -823,6 +858,114 @@ def _typical_utterances(
     if measured >= MIN_BASELINE_UTTERANCES and 2 * len(typical) > measured:
         return typical
     return None
+
+
+def _separate_voices(utterances: list[list[SpanFeatures]]) -> tuple[float, float] | None:
+    """The median pitches (Hz) of two voices among *utterances*, if they seem to hold two.
+
+    The utterances' median pitches are split into a lower and a higher group
+    of at least two each; they are two voices when the groups' medians lie
+    more than :data:`VOICE_SEPARATION_ST` apart with a gap of at least half
+    that distance between the groups (see :data:`VOICE_SEPARATION_ST`).
+    """
+    pitches = sorted(
+        f0 for spans in utterances if (f0 := _median(_span_f0(f) for f in spans)) is not None
+    )
+    found: tuple[float, float, float] | None = None
+    for split in range(2, len(pitches) - 1):
+        low, high = statistics.median(pitches[:split]), statistics.median(pitches[split:])
+        distance = _semitones(high, low)
+        gap = _semitones(pitches[split], pitches[split - 1])
+        separate = distance > VOICE_SEPARATION_ST and 2 * gap >= distance
+        if separate and (found is None or gap > found[0]):
+            found = (gap, low, high)
+    return None if found is None else (found[1], found[2])
+
+
+@dataclass(frozen=True)
+class _Baselines:
+    """What one speaker's utterances are measured against.
+
+    ``markup`` is the baseline of the utterance-level ``<prosody>``, the
+    words' offsets and voice quality. ``emotion`` is the classifier's (empty
+    when there is none: the rule-based classifier then abstains).
+    ``profile`` is what a prosody profile is matched against (``None``:
+    no baseline); ``use_profile`` whether the profile applies.
+    """
+
+    markup: SpeakerBaseline
+    emotion: SpeakerBaseline
+    profile: list[SpanFeatures] | None
+    use_profile: bool
+
+
+_REMEDY = (
+    "Pass calibration_audio (recordings of the speaker's usual speech, such as their "
+    "earlier turns) to assess them."
+)
+_SEVERAL_REMEDY = (
+    "To assess them, convert this speaker's words on their own with calibration_audio "
+    "(recordings of their usual speech, such as their earlier turns)."
+)
+
+
+def _speaker_prefix(speaker: str | None, several: bool) -> str:
+    """How notes name a speaker: nothing when the words are one speaker's."""
+    if not several:
+        return ""
+    if speaker is None:
+        return "Words without a speaker label: "
+    return f"Speaker {speaker!r}: "
+
+
+def _without_baseline(classifier: EmotionClassifier) -> str:
+    """What having no speaker baseline means for *classifier*'s emotion, as a
+    clause for notes (``""`` for a classifier that does not use a baseline)."""
+    if isinstance(classifier, RuleBasedEmotionClassifier):
+        fixed = (
+            classifier.baseline_f0, classifier.baseline_intensity,
+            classifier.baseline_rate, classifier.baseline_f0_spread,
+        )
+        if all(value is None for value in fixed):
+            return ", and no emotion was estimated from them"
+        return ", and the emotion classifier used only the baseline it was constructed with"
+    if isinstance(classifier, BaselineAwareEmotionClassifier):
+        return ", and the emotion classifier got no baseline to compare with"
+    return ""
+
+
+def _no_baseline_note(measured: int, emotion: str, several: bool = False) -> str:
+    """Why a speaker with *measured* utterances and no calibration speech has
+    no baseline; *emotion* is the :func:`_without_baseline` clause. With
+    *several* speakers, calibration_audio is not used at all, so the remedy
+    is to convert the speaker's words on their own."""
+    remedy = _SEVERAL_REMEDY if several else _REMEDY
+    if measured == 1:
+        missing = "" if several else " without calibration_audio"
+        return (
+            f"No speaker baseline: a single utterance{missing} has nothing to compare its "
+            f"pitch, loudness and rate with, so they were not marked{emotion}. {remedy}"
+        )
+    levels = "" if measured < MIN_BASELINE_UTTERANCES else ", at different levels"
+    source = "their own utterances" if several else "the recording"
+    missing = "" if several else "without calibration_audio, "
+    return (
+        f"No speaker baseline: {missing}the speaker's usual pitch and loudness come from "
+        f"{source}, which needs at least {MIN_BASELINE_UTTERANCES} utterances, most of "
+        f"them at a similar level; this one has {measured}{levels}. Pitch, loudness and "
+        f"rate were marked only relative to one another{emotion}. {remedy}"
+    )
+
+
+def _voices_note(voices: tuple[float, float], labelled: bool, emotion: str) -> str:
+    low, high = voices
+    whose = "under one speaker label" if labelled else "and the words carry no speaker labels"
+    return (
+        f"The utterances' pitch falls into two groups (about {low:.0f} Hz and {high:.0f} Hz), "
+        f"as from two voices, {whose}: no speaker baseline could be measured, so overall "
+        f"pitch, loudness and rate were not marked{emotion}. Pass words with speaker labels "
+        "(speaker diarization), or each speaker's words on their own."
+    )
 
 
 def _checked_profile(profile: object) -> ProsodyProfile:
@@ -878,6 +1021,11 @@ class _Assembly(NamedTuple):
     matches: list[ProfileMatch]
     #: Human-readable notes on output that was changed to fit the spec.
     notes: list[str]
+    #: Human-readable notes on what could not be assessed (no speaker
+    #: baseline, several voices, unpunctuated text), for
+    #: :attr:`ConversionResult.warnings <prosody_protocol.audio_to_iml.ConversionResult>`.
+    #: :meth:`IMLAssembler.assemble` does not warn about them.
+    info: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -934,9 +1082,11 @@ class IMLAssembler:
         ``<prosody>`` carrying its measurements (spec Section 4:
         ``f0_mean``, ``f0_range``, ``f0_contour``, ``intensity_mean``,
         ``intensity_range``, ``speech_rate``, ``duration_ms``, ``jitter``,
-        ``shimmer``, ``hnr``). To keep nesting within two levels, an
-        emphasized word in an utterance-level ``<prosody>`` steps out of
-        it and carries the utterance's attributes itself.
+        ``shimmer``, ``hnr``; no ``duration_ms`` for a span over an hour).
+        The markup is otherwise the same as without them, so the text a
+        reader sees does not change. To keep nesting within two levels, an
+        emphasized word inside an utterance-level ``<prosody>`` carries no
+        measurements.
     min_emotion_confidence:
         Utterances whose emotion is classified with lower confidence carry no
         ``emotion`` or ``confidence`` attribute. ``0.0`` keeps every label.
@@ -1005,6 +1155,11 @@ class IMLAssembler:
             separates tokens with one space. Closing and terminal
             punctuation tokens (``,``, ``?``, ``)``) attach to the token
             before them, opening ones (``(``, ``“``) to the token after.
+            Words with a ``speaker`` label start a new utterance where the
+            label changes; each utterance carries it as ``speaker_id``, and
+            each speaker is measured against their own baseline (spec 6.2).
+            Without sentence punctuation, pauses of
+            :data:`UTTERANCE_SPLIT_PAUSE_MS` or more end utterances.
         features:
             Prosodic features per word span (as returned by
             :meth:`ProsodyAnalyzer.analyze` for *alignments*).
@@ -1013,7 +1168,8 @@ class IMLAssembler:
             at least 200 ms long becomes a ``<pause>``; where none was
             detected, a gap of 200 ms or more between word timings does.
         language:
-            Optional BCP-47 language tag.
+            Optional BCP 47 language tag (``en_US`` is read as ``en-US``);
+            anything else raises :class:`ValueError`.
         reference_features:
             Features of the same speaker talking neutrally (e.g. calibration
             speech, recorded with the same setup). They define the speaker
@@ -1032,6 +1188,16 @@ class IMLAssembler:
             against the same baseline: the reference features, or the
             recording's typical utterances, or none.
 
+            The reference features and the profile describe one speaker:
+            when the words carry several speaker labels, each speaker is
+            measured against their own utterances and the profile is not
+            applied. A speaker's utterances whose pitch falls into two
+            clearly separate groups (:data:`VOICE_SEPARATION_ST`), as from
+            two voices without speaker labels, get no baseline at all: no
+            utterance-level offsets, no emotion and no profile match.
+            :class:`~prosody_protocol.audio_to_iml.AudioToIML` reports all
+            of this in ``ConversionResult.warnings``.
+
         Returns
         -------
         IMLDocument
@@ -1042,6 +1208,8 @@ class IMLAssembler:
             A silence longer than :data:`MAX_PAUSE_MS` was written as a
             pause of that length.
         """
+        if language is not None:
+            language = normalize_language_tag(language)
         assembly = self._assemble(
             alignments, features, pauses, language, reference_features=reference_features
         )
@@ -1057,9 +1225,12 @@ class IMLAssembler:
         language: str | None = None,
         *,
         reference_features: Sequence[SpanFeatures] | None = None,
+        check_punctuation: bool = True,
     ) -> _Assembly:
-        """:meth:`assemble`, also returning the profile mappings that matched
-        and notes on what was changed to fit the spec."""
+        """:meth:`assemble`, also returning the profile mappings that matched,
+        notes on what was changed to fit the spec, and notes on what could
+        not be assessed. *check_punctuation* notes when the words have no
+        sentence punctuation (not wanted for placeholder tokens)."""
         paired = _pair_features(alignments, features)
         words = [
             _Word(text=a.word.strip(), alignment=a, features=f)
@@ -1068,7 +1239,7 @@ class IMLAssembler:
         ]
         if not words:
             empty = IMLDocument(utterances=(Utterance(),), version="0.1.0", language=language)
-            return _Assembly(empty, [], [])
+            return _Assembly(empty, [], [], [])
 
         _mark_spacing(words)
         boundary_pauses = _resolve_pauses(words, pauses)
@@ -1077,35 +1248,66 @@ class IMLAssembler:
         group_spans = [
             [f for i in indices if (f := words[i].features) is not None] for _, indices in groups
         ]
-        profile_baseline: list[SpanFeatures] | None
-        if reference_features:
-            baseline = SpeakerBaseline.from_features(reference_features)
-            emotion_baseline = baseline
-            profile_baseline = list(reference_features)
-        else:
-            baseline = SpeakerBaseline.from_utterances(group_spans)
-            typical = _typical_utterances(group_spans, baseline)
-            emotion_baseline = baseline if typical is not None else SpeakerBaseline()
-            profile_baseline = (
-                None if typical is None else [f for i in typical for f in group_spans[i]]
+        group_speakers = [words[indices[0]].alignment.speaker for _, indices in groups]
+        speakers = list(dict.fromkeys(group_speakers))  # in order of appearance
+        several = len(speakers) > 1
+        info: list[str] = []
+        if check_punctuation and not _is_punctuated(words) and any(boundary_pauses):
+            info.append(
+                "The words have no sentence punctuation, so utterances were split at pauses "
+                f"of {UTTERANCE_SPLIT_PAUSE_MS / 1000:g} s or more instead of at sentence ends "
+                "(a sentence with a long hesitation may be split, and sentences spoken "
+                "without a pause joined). Ask the speech recognizer for punctuation (such as "
+                "Deepgram's punctuate or smart_format, or Google's enableAutomaticPunctuation) "
+                "for one utterance per sentence."
+            )
+        if several:
+            labels = ", ".join("no label" if s is None else repr(s) for s in speakers)
+            if reference_features:
+                info.append(
+                    f"calibration_audio describes one speaker, but the words have {len(speakers)} "
+                    f"speakers ({labels}), so each was measured against their own utterances "
+                    "instead. To use it, convert that speaker's words on their own."
+                )
+            if self._profile is not None:
+                info.append(
+                    f"The prosody profile describes one speaker, but the words have "
+                    f"{len(speakers)} speakers ({labels}), so it was not applied. To apply it, "
+                    "convert that speaker's words on their own."
+                )
+        plans: dict[str | None, _Baselines] = {}
+        for speaker in speakers:
+            own = [
+                spans
+                for spans, s in zip(group_spans, group_speakers, strict=True)
+                if s == speaker
+            ]
+            plans[speaker] = self._baselines(
+                own,
+                None if several else reference_features,
+                labelled=speaker is not None,
+                prefix=_speaker_prefix(speaker, several),
+                info=info,
+                several=several,
             )
 
         utterances: list[Utterance] = []
         matches: list[ProfileMatch] = []
         applier = ProfileApplier()
-        for index, ((leading_pause, indices), spans) in enumerate(
-            zip(groups, group_spans, strict=True)
+        for index, ((leading_pause, indices), spans, speaker) in enumerate(
+            zip(groups, group_spans, group_speakers, strict=True)
         ):
+            plan = plans[speaker]
             builder = _UtteranceBuilder(
                 [words[i] for i in indices],
                 boundary_pauses[indices[0]: indices[-1]],
-                baseline,
+                plan.markup,
                 self._include_extended,
             )
-            emotion, confidence = self._classify(spans, emotion_baseline)
+            emotion, confidence = self._classify(spans, plan.emotion)
             extra: tuple[tuple[str, str], ...] = ()
-            if self._profile is not None:
-                observed = categorize_features(spans, pauses, baseline=profile_baseline)
+            if self._profile is not None and plan.use_profile:
+                observed = categorize_features(spans, pauses, baseline=plan.profile)
                 mapping = applier.match(self._profile, observed)
                 if mapping is not None:
                     emotion, confidence = applier.apply(
@@ -1129,6 +1331,7 @@ class IMLAssembler:
                 children=builder.build(leading_pause),
                 emotion=emotion if confident else None,
                 confidence=confidence if confident else None,
+                speaker_id=speaker,
                 extra_attributes=extra,
             ))
 
@@ -1137,7 +1340,40 @@ class IMLAssembler:
             version="0.1.0",
             language=language,
         )
-        return _Assembly(document, matches, notes)
+        return _Assembly(document, matches, notes, info)
+
+    def _baselines(
+        self,
+        utterances: list[list[SpanFeatures]],
+        reference_features: Sequence[SpanFeatures] | None,
+        *,
+        labelled: bool,
+        prefix: str,
+        info: list[str],
+        several: bool = False,
+    ) -> _Baselines:
+        """The baselines of one speaker's *utterances*; adds to *info* what they lack."""
+        emotion = _without_baseline(self._classifier)
+        voices = _separate_voices(utterances)
+        if voices is not None:
+            unused = "" if self._profile is None else " The prosody profile was not applied."
+            info.append(prefix + _voices_note(voices, labelled, emotion) + unused)
+            return _Baselines(SpeakerBaseline(), SpeakerBaseline(), None, use_profile=False)
+        if reference_features:
+            baseline = SpeakerBaseline.from_features(reference_features)
+            return _Baselines(baseline, baseline, list(reference_features), use_profile=True)
+        baseline = SpeakerBaseline.from_utterances(utterances)
+        typical = _typical_utterances(utterances, baseline)
+        if typical is None:
+            measured = sum(
+                1 for spans in utterances
+                if any(_span_f0(f) is not None or _span_intensity(f) is not None for f in spans)
+            )
+            if measured:
+                info.append(prefix + _no_baseline_note(measured, emotion, several))
+            return _Baselines(baseline, SpeakerBaseline(), None, use_profile=True)
+        profile = [f for i in typical for f in utterances[i]]
+        return _Baselines(baseline, baseline, profile, use_profile=True)
 
     def _classify(
         self, spans: list[SpanFeatures], baseline: SpeakerBaseline

@@ -353,6 +353,51 @@ class TestEmotionInference:
         assert entry.emotion_label == "surprised"
 
 
+class TestConfidence:
+    """The utterance confidence used to be 0.5 + the session's pitch and
+    volume range (0.5 to 0.9, under a 0.95 cap it never reached): a quiet
+    session guessed as "calm" got confidence 0.9, a flat one "neutral" 0.5."""
+
+    @pytest.mark.parametrize(
+        ("volume", "breathiness", "pitch_step", "label"),
+        [(0.2, 0.0, 40, "calm"), (0.5, 0.0, 0, "neutral"), (0.9, 0.0, 30, "joyful"),
+         (0.4, 0.8, 30, "sad")],
+    )
+    def test_guessed_labels_are_not_stated_in_the_iml(
+        self, bridge: MavisBridge, volume: float, breathiness: float, pitch_step: int,
+        label: str,
+    ) -> None:
+        events = [
+            PhonemeEvent("a", start_ms=i * 120, duration_ms=100, volume=volume,
+                         breathiness=breathiness, pitch_hz=120 + i * pitch_step)
+            for i in range(8)
+        ]
+        entry = bridge.phoneme_events_to_entry(events, "hello there friend", "s1", consent=True)
+        assert (entry.emotion_label, entry.annotator) == (label, "model")
+        utterance = IMLParser().parse(entry.iml).utterances[0]
+        assert (utterance.emotion, utterance.confidence) == (None, None)
+        assert IMLValidator().validate(entry.iml).valid
+
+    def test_given_labels_are_stated_with_full_confidence(
+        self, bridge: MavisBridge, sample_events: list[PhonemeEvent]
+    ) -> None:
+        """A label the caller gives is an assertion, whatever the session's range."""
+        flat = [PhonemeEvent("a", start_ms=i * 120, volume=0.5) for i in range(4)]
+        for events in (sample_events, flat, flat[:1]):
+            entry = bridge.phoneme_events_to_entry(events, "the SUN", "s1", emotion_label="sad")
+            utterance = IMLParser().parse(entry.iml).utterances[0]
+            assert (utterance.emotion, utterance.confidence) == ("sad", 1.0)
+
+    def test_guessed_label_with_a_human_annotator_is_still_not_stated(
+        self, bridge: MavisBridge, sample_events: list[PhonemeEvent]
+    ) -> None:
+        entry = bridge.phoneme_events_to_entry(sample_events, "hi", "s1", annotator="human")
+        assert IMLParser().parse(entry.iml).utterances[0].emotion is None
+
+    def test_no_range_based_confidence_remains(self) -> None:
+        assert not hasattr(MavisBridge, "_compute_confidence")
+
+
 # ---------------------------------------------------------------------------
 # Dataset export tests
 # ---------------------------------------------------------------------------
@@ -656,6 +701,22 @@ class TestExportAtomicity:
         assert (out / "README.md").read_text() == "keep me too"
         assert not [p for p in out.iterdir() if p.name.startswith(".export")]
 
+    @pytest.mark.parametrize("text", ["[" * 100_000, '{"audio_file": ' + "9" * 5000 + "}"])
+    def test_overwrite_survives_hostile_earlier_entries(
+        self, bridge: MavisBridge, sample_events: list[PhonemeEvent], tmp_path: Path, text: str
+    ) -> None:
+        """An earlier entry nested too deeply to parse raised RecursionError
+        out of export_dataset(overwrite=True); it is replaced like any other."""
+        out = tmp_path / "ds"
+        (out / "entries").mkdir(parents=True)
+        (out / "entries" / "junk.json").write_text(text)
+        dataset = bridge.export_dataset(
+            [{"events": sample_events, "transcript": "new", "session_id": "n1"}],
+            out, consent=True, overwrite=True,
+        )
+        assert [e.id for e in dataset.entries] == ["mavis_n1"]
+        assert sorted(p.name for p in (out / "entries").iterdir()) == ["mavis_n1.json"]
+
     def test_re_export_in_place(
         self, bridge: MavisBridge, sample_events: list[PhonemeEvent], tmp_path: Path
     ) -> None:
@@ -742,7 +803,7 @@ class TestWordAlignment:
             events, "the SUN", "session_001", emotion_label="joyful"
         )
         assert entry.iml == (
-            '<utterance emotion="joyful" confidence="0.86">'
+            '<utterance emotion="joyful" confidence="1.0">'
             '<prosody pitch="-29%" volume="-4dB">the</prosody> '
             '<prosody pitch="+14%" volume="+1dB">SUN</prosody></utterance>'
         )
@@ -776,13 +837,26 @@ class TestWordAlignment:
                 sample_events, "the SUN is RISING", "s1", phonemes_per_word=[2, 3, 2]
             )
 
-    def test_zero_pitch_offset_has_a_sign(self, bridge: MavisBridge) -> None:
-        events = [
+    def test_baseline_values_are_omitted(self, bridge: MavisBridge) -> None:
+        """A word that stands out in volume only used to carry pitch="+0%",
+        and one that stands out in pitch only volume="+0dB" (spec 6.1: values
+        equal to the speaker's baseline SHOULD be omitted)."""
+        loud = [
             PhonemeEvent("a", start_ms=0, volume=0.2, pitch_hz=200.0),
             PhonemeEvent("b", start_ms=300, volume=0.9, pitch_hz=200.0),
         ]
-        iml = bridge.phoneme_events_to_entry(events, "soft LOUD", "s1").iml
-        assert 'pitch="+0%"' in iml
+        iml = bridge.phoneme_events_to_entry(loud, "soft LOUD", "s1").iml
+        assert iml == (
+            '<utterance><prosody volume="-9dB">soft</prosody> '
+            '<prosody volume="+4dB">LOUD</prosody></utterance>'
+        )
+        assert IMLValidator().validate(iml).issues == []
+        high = [
+            PhonemeEvent("a", start_ms=i * 120, duration_ms=100, volume=0.2, pitch_hz=120 + i * 40)
+            for i in range(8)
+        ]
+        iml = bridge.phoneme_events_to_entry(high, "hello there friend", "s1").iml
+        assert "dB" not in iml and "+0%" not in iml
         assert IMLValidator().validate(iml).issues == []
 
 

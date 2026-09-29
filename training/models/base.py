@@ -10,7 +10,7 @@ from typing import Any
 import joblib
 import numpy as np
 
-from ..portable import FORMAT, FORMAT_VERSION, write_model
+from ..portable import FORMAT, FORMAT_VERSION, feature_stats, write_model
 
 #: Formats :meth:`BaseModel.export` can write.
 EXPORT_FORMATS = ("json", "pickle")
@@ -28,6 +28,8 @@ class BaseModel(ABC):
     """
 
     feature_names: list[str]
+    #: Mean and spread of the training features (set by train; see _record_feature_stats).
+    _feature_stats: dict[str, list[float]] | None = None
 
     @abstractmethod
     def train(self, X: np.ndarray, y: np.ndarray) -> dict[str, Any]:
@@ -57,8 +59,12 @@ class BaseModel(ABC):
         raise NotImplementedError(f"{type(self).__name__} has no JSON export")
 
     def _portable_header(self, classes: list[str]) -> dict[str, Any]:
-        """The fields every portable model file starts with."""
-        return {
+        """The fields every portable model file starts with.
+
+        Includes ``feature_stats`` when the model recorded them in training
+        (models trained before they existed have none).
+        """
+        header: dict[str, Any] = {
             "format": FORMAT,
             "format_version": FORMAT_VERSION,
             "model_class": type(self).__name__,
@@ -66,6 +72,17 @@ class BaseModel(ABC):
             "classes": classes,
             "feature_names": list(self.feature_names),
         }
+        if self._feature_stats is not None:
+            header["feature_stats"] = self._feature_stats
+        return header
+
+    def _record_feature_stats(self, X: np.ndarray) -> None:
+        """Remember the mean and spread of each column of the training matrix *X*.
+
+        Exported as ``feature_stats`` (see :mod:`training.portable`), so that
+        a user of the model can tell inputs unlike the training data.
+        """
+        self._feature_stats = feature_stats(X)
 
     def _check_features(self, X: np.ndarray) -> None:
         """Name the columns of the training matrix *X*, or check they match the names."""

@@ -27,7 +27,7 @@ from lxml import etree
 
 from prosody_protocol import parser as parser_module
 from prosody_protocol import validator as validator_module
-from prosody_protocol.exceptions import ConversionError, IMLParseError
+from prosody_protocol.exceptions import ConversionError, IMLParseError, IMLValidationError
 from prosody_protocol.models import (
     Emphasis,
     IMLDocument,
@@ -1064,3 +1064,140 @@ class TestXMLSecurity:
             server.shutdown()
             server.server_close()
         assert hits == []
+
+
+# ---------------------------------------------------------------------------
+# Serialization: numbers as written, utterances apart, invalid numbers refused
+# ---------------------------------------------------------------------------
+
+
+class TestNumbersKeepTheirForm:
+    """A parse/serialize round trip is byte-stable for valid numbers."""
+
+    @pytest.mark.parametrize(
+        "iml",
+        [
+            '<utterance emotion="calm" confidence="1">x</utterance>',
+            '<utterance emotion="calm" confidence="0.870">x</utterance>',
+            '<utterance emotion="calm" confidence="1e-1">x</utterance>',
+            '<utterance><prosody f0_mean="220" intensity_mean="72" intensity_range="15" '
+            'speech_rate="5" jitter="1.20" shimmer="4.50" hnr="15">x</prosody></utterance>',
+            '<utterance><prosody f0_mean="220.12345678901234567890" hnr="-0">x</prosody>'
+            "</utterance>",
+        ],
+    )
+    def test_round_trip_is_byte_stable(self, parser: IMLParser, iml: str) -> None:
+        # f0_mean="220" used to come back as "220.0", confidence="1" as "1.0".
+        assert _round_trip(parser, iml) == iml
+
+    def test_surrounding_whitespace_is_dropped(self, parser: IMLParser) -> None:
+        iml = '<utterance emotion="calm" confidence=" 0.5 ">x</utterance>'
+        assert _round_trip(parser, iml) == (
+            '<utterance emotion="calm" confidence="0.5">x</utterance>'
+        )
+
+    def test_parsed_numbers_are_ordinary_floats(self, parser: IMLParser) -> None:
+        import copy
+        import pickle
+
+        doc = parser.parse('<utterance emotion="calm" confidence="1">x</utterance>')
+        confidence = doc.utterances[0].confidence
+        assert confidence == 1.0 and isinstance(confidence, float)
+        assert doc == IMLDocument(utterances=(
+            Utterance(children=("x",), emotion="calm", confidence=1.0),
+        ))
+        for copied in (pickle.loads(pickle.dumps(doc)), copy.deepcopy(doc), copy.copy(doc)):
+            assert copied == doc
+            assert parser.to_iml_string(copied) == parser.to_iml_string(doc)
+
+    def test_built_floats_are_written_as_before(self, parser: IMLParser) -> None:
+        doc = IMLDocument(utterances=(
+            Utterance(children=(Prosody(children=("x",), f0_mean=220.0),), emotion="calm",
+                      confidence=0.87),
+        ))
+        assert parser.to_iml_string(doc) == (
+            '<utterance emotion="calm" confidence="0.87"><prosody f0_mean="220.0">x</prosody>'
+            "</utterance>"
+        )
+
+
+class TestUtterancesStayApart:
+    def test_tag_stripped_text_keeps_sentences_apart(self, parser: IMLParser) -> None:
+        # "First one.Second one!" once a consumer stripped the tags (spec 6.2).
+        from prosody_protocol.text_to_iml import TextToIML
+
+        doc = TextToIML().predict_document("First one. Second one!")
+        xml = parser.to_iml_string(doc)
+        assert "".join(etree.fromstring(xml.encode()).itertext()) == "First one. Second one!"
+        assert parser.parse(xml) == doc
+
+    def test_written_with_a_space(self, parser: IMLParser) -> None:
+        iml = "<iml><utterance>One.</utterance><utterance>Two.</utterance></iml>"
+        assert _round_trip(parser, iml) == (
+            "<iml><utterance>One.</utterance> <utterance>Two.</utterance></iml>"
+        )
+        assert IMLValidator().validate(_round_trip(parser, iml)).issues == []
+
+
+def _one(node: Utterance) -> IMLDocument:
+    return IMLDocument(utterances=(node,))
+
+
+class TestInvalidNumbersAreNotWritten:
+    """Numeric fields built in code are checked when the document is written."""
+
+    @pytest.mark.parametrize(
+        ("doc", "rule", "field"),
+        [
+            (_one(Utterance(children=("hi",), emotion="calm", confidence=float("nan"))), "V4",
+             "Utterance.confidence"),
+            (_one(Utterance(children=("hi",), emotion="calm", confidence=5.0)), "V4",
+             "Utterance.confidence"),
+            (_one(Utterance(children=("hi",), emotion="calm", confidence=-1.0)), "V4",
+             "Utterance.confidence"),
+            (_one(Utterance(children=("a", Pause(duration=-5), "b"))), "V6", "Pause.duration"),
+            (_one(Utterance(children=("a", Pause(duration=MAX_INTEGER + 1)))), "V6",
+             "Pause.duration"),
+            (_one(Utterance(children=("a", Pause(duration=2.5)))), "V6",  # type: ignore[arg-type]
+             "Pause.duration"),
+            (_one(Utterance(children=(Prosody(children=("x",), f0_mean=-1.0),))), "V27",
+             "Prosody.f0_mean"),
+            (_one(Utterance(children=(Prosody(children=("x",), hnr=float("inf")),))), "V27",
+             "Prosody.hnr"),
+            (_one(Utterance(children=(Prosody(children=("x",), duration_ms=0),))), "V27",
+             "Prosody.duration_ms"),
+            (_one(Utterance(children=(Prosody(children=("x",), jitter=-0.5),))), "V27",
+             "Prosody.jitter"),
+        ],
+    )
+    def test_raises_instead_of_writing_invalid_iml(
+        self, parser: IMLParser, doc: IMLDocument, rule: str, field: str
+    ) -> None:
+        # to_iml_string used to write confidence="nan", duration="-5", ...
+        with pytest.raises(IMLValidationError, match=field) as info:
+            parser.to_iml_string(doc)
+        assert [issue.rule for issue in info.value.issues] == [rule]
+
+    def test_valid_built_values_are_written(self, parser: IMLParser) -> None:
+        doc = _one(Utterance(
+            children=("a", Pause(duration=MAX_INTEGER), Prosody(children=("x",), hnr=-3.0)),
+            emotion="calm", confidence=0.0,
+        ))
+        xml = parser.to_iml_string(doc)
+        assert IMLValidator().validate(xml).valid
+        assert parser.parse(xml) == doc
+
+    def test_zero_duration_is_a_missing_duration(self, parser: IMLParser) -> None:
+        # The parser's value for <pause/>, so that invalid input stays invalid.
+        doc = _one(Utterance(children=("a", Pause(duration=0), "b")))
+        assert parser.to_iml_string(doc) == "<utterance>a<pause/>b</utterance>"
+
+    def test_numpy_numbers(self, parser: IMLParser) -> None:
+        np = pytest.importorskip("numpy")
+        doc = _one(Utterance(
+            children=("a", Pause(duration=np.int64(300))), emotion="calm",
+            confidence=np.float64(0.5),
+        ))
+        assert parser.to_iml_string(doc) == (
+            '<utterance emotion="calm" confidence="0.5">a<pause duration="300"/></utterance>'
+        )

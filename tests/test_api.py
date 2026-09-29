@@ -23,6 +23,7 @@ import io
 import json
 import operator
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -45,6 +46,7 @@ pytest.importorskip("parselmouth")
 from fastapi.testclient import TestClient
 from starlette.responses import PlainTextResponse
 
+from prosody_protocol import IMLParser, Prosody
 from prosody_protocol.exceptions import IMLValidationError
 from prosody_protocol.server import _worker
 from prosody_protocol.server.app import app, create_app
@@ -178,10 +180,12 @@ class TestHealth:
         ).get("/v1/health").json()["limits"]
         assert limits == {
             "max_upload_bytes": 3 * 1024 * 1024,
+            "max_json_bytes": 24 * 1234 + 65536,
             "max_text_chars": 1234,
             "max_words_chars": 5678,
             "max_synth_seconds": 45.0,
             "max_audio_seconds": 600.0,
+            "job_timeout_s": 900.0,
             "rate_limit_per_minute": 0,
         }
 
@@ -550,6 +554,26 @@ class TestAudioToIMLEndpoint:
         assert resp.status_code == 200, resp.text
         assert "language=" not in resp.json()["iml"]
 
+    @pytest.mark.parametrize("where", ["data", "params"])
+    def test_posix_locale_language_is_read_as_bcp47(self, client: TestClient, where: str) -> None:
+        """en_US is en-US, as in the SDK and the CLI."""
+        resp = client.post(
+            "/v1/convert/audio-to-iml",
+            files={"audio": ("speech.wav", SPEECH_WAV.read_bytes(), "audio/wav")},
+            **{where: {"language": "en_US"}},
+        )
+        assert resp.status_code == 200, resp.text
+        assert 'language="en-US"' in resp.json()["iml"]
+
+    def test_same_language_in_both_forms_does_not_conflict(self, client: TestClient) -> None:
+        resp = client.post(
+            "/v1/convert/audio-to-iml",
+            files={"audio": ("speech.wav", SPEECH_WAV.read_bytes(), "audio/wav")},
+            data={"language": "en_US"},
+            params={"language": "en-us"},
+        )
+        assert resp.status_code == 200, resp.text
+
     def test_invalid_language_returns_422(self, client: TestClient) -> None:
         with open(SPEECH_WAV, "rb") as f:
             resp = client.post(
@@ -653,11 +677,13 @@ class TestAudioToIMLFields:
         data = resp.json()
         assert data["transcript_source"] == "words"
         assert data["plain_text"] == "I told you to call me yesterday."
-        assert data["warnings"] == []
+        # A single utterance without calibration: only the missing baseline is noted.
+        assert [w for w in data["warnings"] if "speaker baseline" not in w] == []
         assert data["profile_matches"] == []
         # The emphasised word and the 600 ms pause are marked.
         assert "<emphasis" in data["iml"] and "told" in data["iml"]
-        assert '<pause duration="6' in data["iml"]
+        # The 600 ms gap between "you" and "to", as measured.
+        assert 550 <= int(re.findall(r'<pause duration="(\d+)"', data["iml"])[0]) <= 650
 
     def test_words_as_a_file(self, client: TestClient) -> None:
         """curl -F words=@speech.whisper.json sends the words as a file part."""
@@ -794,7 +820,7 @@ class TestAudioToIMLFields:
         http = make_client()
         resp = post_speech(http, words="not json")
         assert resp.status_code == 422
-        assert http.app.state.jobs._pool is None  # type: ignore[attr-defined]
+        assert http.app.state.jobs.worker_pids() == []  # type: ignore[attr-defined]
 
     def test_overlapping_words_are_rejected_before_analysis(self) -> None:
         """A few KB of words that each span the whole recording used to take a
@@ -809,7 +835,7 @@ class TestAudioToIMLFields:
         [error] = resp.json()["detail"]
         assert error["loc"] == ["body", "words"]
         assert "may overlap by at most 500 ms" in error["msg"]
-        assert http.app.state.jobs._pool is None  # type: ignore[attr-defined]
+        assert http.app.state.jobs.worker_pids() == []  # type: ignore[attr-defined]
 
     def test_profile_emotion_xml_cannot_hold_is_rejected_up_front(self) -> None:
         """It used to fail only when the mapping applied, after the analysis,
@@ -820,7 +846,107 @@ class TestAudioToIMLFields:
         assert resp.status_code == 400, resp.text
         assert resp.json()["error"] == "profile_error"
         assert "XML does not allow" in resp.json()["detail"]
-        assert http.app.state.jobs._pool is None  # type: ignore[attr-defined]
+        assert http.app.state.jobs.worker_pids() == []  # type: ignore[attr-defined]
+
+    def test_calibration_sets_the_baseline(self, client: TestClient) -> None:
+        """REST had no way to send calibration audio, so a single utterance
+        never got an overall pitch or loudness."""
+        raised = AUDIO_FIXTURES / "speech_raised.wav"
+        words = json.dumps(json.loads(
+            (AUDIO_FIXTURES / "speech_raised.json").read_text()
+        )["words"])
+        files: list[tuple[str, Any]] = [("audio", ("raised.wav", raised.read_bytes()))]
+        before = upload_dirs()
+        plain = client.post("/v1/convert/audio-to-iml", files=files, data={"words": words})
+        calibration = AUDIO_FIXTURES / "speech_calibration.wav"
+        calibrated = client.post(
+            "/v1/convert/audio-to-iml",
+            files=[*files, ("calibration", ("calm.wav", calibration.read_bytes()))],
+            data={"words": words},
+        )
+        assert upload_dirs() == before
+        assert plain.status_code == calibrated.status_code == 200, calibrated.text
+        assert 'pitch="+' not in plain.json()["iml"]
+        assert any("speaker baseline" in w for w in plain.json()["warnings"])
+        assert not any("speaker baseline" in w for w in calibrated.json()["warnings"])
+        # The whole utterance is higher than the speaker's calm voice.
+        utterance = IMLParser().parse(calibrated.json()["iml"]).utterances[0]
+        [child] = utterance.children
+        assert isinstance(child, Prosody) and child.pitch and child.pitch.startswith("+")
+
+    def test_several_calibration_recordings(self, client: TestClient) -> None:
+        """Earlier turns of a conversation can be the baseline together."""
+        raised = AUDIO_FIXTURES / "speech_raised.wav"
+        words = json.dumps(json.loads(
+            (AUDIO_FIXTURES / "speech_raised.json").read_text()
+        )["words"])
+        before = upload_dirs()
+        resp = client.post(
+            "/v1/convert/audio-to-iml",
+            files=[
+                ("audio", ("raised.wav", raised.read_bytes())),
+                ("calibration", ("turn1.wav", (AUDIO_FIXTURES / "speech_calibration.wav")
+                                 .read_bytes())),
+                ("calibration", ("turn2.wav", SPEECH_WAV.read_bytes())),
+            ],
+            data={"words": words},
+        )
+        assert resp.status_code == 200, resp.text
+        assert upload_dirs() == before
+        utterance = IMLParser().parse(resp.json()["iml"]).utterances[0]
+        [child] = utterance.children
+        assert isinstance(child, Prosody) and child.pitch and child.pitch.startswith("+")
+
+    def test_unusable_calibration_is_named_in_the_error(self, client: TestClient) -> None:
+        silence = (AUDIO_FIXTURES / "silence_1s.wav").read_bytes()
+        resp = client.post(
+            "/v1/convert/audio-to-iml",
+            files=[("audio", ("a.wav", SPEECH_WAV.read_bytes())),
+                   ("calibration", ("quiet.wav", silence))],
+        )
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["error"] == "audio_processing_error"
+        assert "'quiet.wav'" in resp.json()["detail"]
+        assert tempfile.gettempdir() not in resp.json()["detail"]
+
+    def test_skipped_calibration_is_named_in_the_warning(self, client: TestClient) -> None:
+        """Warnings, like errors, name the client's files, not server paths."""
+        silence = (AUDIO_FIXTURES / "silence_1s.wav").read_bytes()
+        resp = client.post(
+            "/v1/convert/audio-to-iml",
+            files=[("audio", ("a.wav", SPEECH_WAV.read_bytes())),
+                   ("calibration", ("quiet.wav", silence)),
+                   ("calibration", ("turn1.wav", SPEECH_WAV.read_bytes()))],
+            data={"words": speech_words_json()},
+        )
+        assert resp.status_code == 200, resp.text
+        warnings = resp.json()["warnings"]
+        skipped = [w for w in warnings if "were not used" in w]
+        assert skipped and "calibration 'quiet.wav'" in skipped[0], warnings
+        assert not any(tempfile.gettempdir() in w or "upload" in w for w in warnings), warnings
+
+    def test_empty_calibration_counts_as_absent(self, client: TestClient) -> None:
+        resp = post_speech(client, words=speech_words_json(), calibration="")
+        assert resp.status_code == 200, resp.text
+
+    def test_calibration_must_be_a_file(self) -> None:
+        http = make_client()
+        resp = post_speech(http, calibration="calm.wav")
+        assert resp.status_code == 422
+        assert resp.json()["detail"][0]["loc"] == ["body", "calibration"]
+        assert http.app.state.jobs.worker_pids() == []  # type: ignore[attr-defined]
+
+    def test_calibration_recordings_are_limited(self) -> None:
+        http = make_client()
+        calibration = ("calm.wav", SPEECH_WAV.read_bytes())
+        resp = http.post(
+            "/v1/convert/audio-to-iml",
+            files=[("audio", ("a.wav", SPEECH_WAV.read_bytes())),
+                   *[("calibration", calibration)] * 6],
+        )
+        assert resp.status_code == 422
+        assert "At most 5 calibration recordings" in resp.json()["detail"][0]["msg"]
+        assert http.app.state.jobs.worker_pids() == []  # type: ignore[attr-defined]
 
     def test_example_files(self, client: TestClient) -> None:
         """The examples/README.md curl command."""
@@ -1011,7 +1137,9 @@ class TestOpenAPISpec:
             "multipart/form-data"
         ]["schema"]["$ref"]
         body = spec["components"]["schemas"][body_ref.rsplit("/", 1)[1]]
-        assert set(body["properties"]) == {"audio", "language", "words", "transcript", "profile"}
+        assert set(body["properties"]) == {
+            "audio", "language", "words", "transcript", "profile", "calibration"
+        }
 
     def test_audio_response_declares_profile_matches(self, client: TestClient) -> None:
         schemas = client.get("/openapi.json").json()["components"]["schemas"]
@@ -1054,6 +1182,47 @@ class TestErrorHandling:
             data = resp.json()
             assert "valid" in data
             assert "issues" in data
+
+    def test_form_field_over_starlettes_part_limit_is_text_too_large(
+        self, client: TestClient
+    ) -> None:
+        """A words text field over 1 MiB used to get Starlette's 400
+        {"detail": "Part exceeded maximum size of 1024KB."}, without an error code."""
+        words = json.dumps(
+            [{"word": "\u65e5" * 400_000, "start_ms": 0, "end_ms": 500}], ensure_ascii=False
+        )
+        # Under PP_MAX_WORDS_CHARS (1,000,000 characters), over 1 MiB of UTF-8.
+        assert len(words) < 1_000_000 and len(words.encode()) > 1024 * 1024
+        resp = post_speech(client, words=words)
+        assert resp.status_code == 413, resp.text
+        assert resp.json()["error"] == "text_too_large"
+        assert "send it as a file" in resp.json()["detail"]
+
+    def test_unparsable_body_has_an_error_code(self, client: TestClient) -> None:
+        """JSON nested too deeply used to get {"detail": "There was an error parsing the body"}."""
+        body = '{"iml": "<utterance/>", "x": ' + "[" * 100_000 + "]" * 100_000 + "}"
+        resp = client.post(
+            "/v1/validate", content=body, headers={"content-type": "application/json"}
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "invalid_body"
+        assert "cannot be parsed" in resp.json()["detail"]
+
+    def test_unknown_paths_and_methods_have_error_codes(self, client: TestClient) -> None:
+        resp = client.get("/v1/nothing-here")
+        assert (resp.status_code, resp.json()) == (
+            404, {"error": "not_found", "detail": "Not Found"}
+        )
+        resp = client.get("/v1/validate")
+        assert resp.status_code == 405
+        assert resp.json() == {"error": "method_not_allowed", "detail": "Method Not Allowed"}
+        assert resp.headers["allow"] == "POST"
+
+    def test_schema_errors_have_an_error_code(self, client: TestClient) -> None:
+        resp = client.post("/v1/validate", json={})
+        assert resp.status_code == 422
+        assert resp.json()["error"] == "invalid_request"
+        assert resp.json()["detail"][0]["loc"] == ["body", "iml"]
 
     def test_unexpected_error_returns_json_500(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -1143,6 +1312,90 @@ class TestUploadSizeLimit:
         )
         assert resp.status_code == 200
         assert resp.json()["valid"] is True
+
+
+def junk_json_body(size: int) -> bytes:
+    """A valid /v1/validate body of about *size* bytes, mostly empty objects in an extra key.
+
+    The kind of body that used to cost about 25 times its size in memory
+    (and seconds of event loop time) before any field was checked.
+    """
+    count = max(0, (size - 64) // 3)
+    return b'{"iml":"<utterance>x</utterance>","x":[' + b",".join([b"{}"] * count) + b"]}"
+
+
+class TestJSONSizeLimit:
+    """JSON requests get PP_MAX_JSON_BYTES, far below the upload limit."""
+
+    def test_default_is_derived_from_the_text_limit(self) -> None:
+        assert Settings().max_json_bytes == 24 * 100_000 + 65536
+        assert Settings(max_text_chars=10).max_json_bytes == 24 * 10 + 65536
+        assert Settings(max_json_bytes=5000).json_body_limit == 5000
+        # The upload limit applies to every request.
+        assert Settings(max_upload_size_mb=1, max_text_chars=10**6).json_body_limit == 2**20
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize(
+        "path", ["/v1/validate", "/v1/convert/iml-to-ssml", "/v1/convert/iml-to-prompt",
+                 "/v1/convert/text-to-iml", "/v1/synthesize"],
+    )
+    def test_json_body_over_the_limit_is_413(self, path: str, chunked: bool) -> None:
+        """A 3 MB body used to be parsed in full (the limit was PP_MAX_UPLOAD_MB, 50 MB)."""
+        body = junk_json_body(3 * 1024 * 1024)
+        headers = {"content-type": "application/json"}
+        with make_client() as http:
+            resp = http.post(path, content=chunks(body) if chunked else body, headers=headers)
+        assert resp.status_code == 413, resp.text
+        assert resp.json()["error"] == "payload_too_large"
+        assert "PP_MAX_JSON_BYTES" in resp.json()["detail"]
+        assert str(24 * 100_000 + 65536) in resp.json()["detail"]
+
+    def test_limit_follows_the_setting(self) -> None:
+        body = junk_json_body(5000)
+        assert make_client(max_json_bytes=len(body)).post(
+            "/v1/validate", content=body, headers={"content-type": "application/json"}
+        ).status_code == 200
+        resp = make_client(max_json_bytes=len(body) - 1).post(
+            "/v1/validate", content=body, headers={"content-type": "application/json"}
+        )
+        assert resp.status_code == 413
+
+    @pytest.mark.parametrize("content_type", ["text/plain", "application/x-www-form-urlencoded"])
+    def test_every_non_multipart_body_is_limited(self, content_type: str) -> None:
+        resp = make_client(max_json_bytes=1000).post(
+            "/v1/convert/audio-to-iml", content=b"x" * 2000, headers={"content-type": content_type}
+        )
+        assert resp.status_code == 413
+        assert "PP_MAX_JSON_BYTES" in resp.json()["detail"]
+
+    def test_uploads_keep_the_upload_limit(self) -> None:
+        body, content_type = multipart_body("audio", "big.wav", b"\x00" * (3 * 1024 * 1024))
+        resp = make_client().post(
+            "/v1/convert/audio-to-iml", content=body, headers={"content-type": content_type}
+        )
+        # Read and analysed (it is not audio), not refused for its size.
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["error"] == "audio_processing_error"
+
+    def test_two_fields_of_escaped_text_at_the_text_limit_fit(self) -> None:
+        """json.dumps escapes non-ASCII: an emoji is 12 bytes. The default fits both fields."""
+        text = "\U0001F600" * 1000
+        body = json.dumps({"text": text, "context": text}).encode()
+        assert len(body) > 24_000
+        resp = make_client(max_text_chars=1000).post(
+            "/v1/convert/text-to-iml", content=body, headers={"content-type": "application/json"}
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_environment_variable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PP_MAX_JSON_BYTES", "4096")
+        assert Settings().max_json_bytes == 4096
+        monkeypatch.setenv("PP_MAX_JSON_BYTES", "")
+        assert Settings().max_json_bytes == 24 * 100_000 + 65536
+        for bad in ("0", "lots", "-5"):
+            monkeypatch.setenv("PP_MAX_JSON_BYTES", bad)
+            with pytest.raises(ValueError, match="PP_MAX_JSON_BYTES"):
+                Settings()
 
 
 class TestTextLimit:
@@ -1359,6 +1612,39 @@ class TestSettings:
             Settings(**{field: value})  # type: ignore[arg-type]
 
 
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_empty_host_means_loopback(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """PP_HOST= (e.g. PP_HOST: ${PP_HOST} in a compose file, unset) used to bind
+        every interface: uvicorn takes an empty host as all of them."""
+        monkeypatch.setenv("PP_HOST", value)
+        assert Settings().host == "127.0.0.1"
+        assert Settings(host=value).host == "127.0.0.1"
+        monkeypatch.setenv("PP_HOST", " 0.0.0.0 ")
+        assert Settings().host == "0.0.0.0"
+
+    def test_run_with_empty_host_binds_loopback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        uvicorn = pytest.importorskip("uvicorn")
+        hosts: list[str] = []
+        monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: hosts.append(kwargs["host"]))
+        monkeypatch.setenv("PP_HOST", "")
+        from prosody_protocol.server import run
+
+        run()
+        run(host="")
+        run(host=" ")
+        assert hosts == ["127.0.0.1"] * 3
+
+    def test_stt_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert Settings().stt_model == "base"
+        monkeypatch.setenv("PP_STT_MODEL", " large-v3 ")
+        assert Settings().stt_model == "large-v3"
+        monkeypatch.setenv("PP_STT_MODEL", "")
+        assert Settings().stt_model == "base"
+        with pytest.raises(ValueError, match="PP_STT_MODEL"):
+            Settings(stt_model=3)  # type: ignore[arg-type]
+
     def test_run_uses_host_port_and_debug(self, monkeypatch: pytest.MonkeyPatch) -> None:
         uvicorn = pytest.importorskip("uvicorn")
         calls: list[dict[str, Any]] = []
@@ -1404,6 +1690,167 @@ class TestJobRunner:
 
         try:
             assert asyncio.run(scenario()) == 5
+        finally:
+            runner.shutdown()
+
+    @staticmethod
+    async def until(condition: Any, timeout: float = 60.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not condition():
+            assert time.monotonic() < deadline, "timed out"
+            await asyncio.sleep(0.05)
+
+    def test_a_dead_worker_fails_only_its_own_job(self) -> None:
+        """Killing the worker used to fail every running and queued job with a 500."""
+        runner = JobRunner(max_workers=1, max_queued=1)
+
+        async def scenario() -> tuple[BaseException | None, object]:
+            running = asyncio.ensure_future(runner.run(time.sleep, 60))
+            await self.until(lambda: runner.running == 1)
+            queued = asyncio.ensure_future(runner.run(operator.add, 2, 3))
+            await asyncio.sleep(0.2)
+            [pid] = runner.worker_pids()
+            os.kill(pid, 9)
+            failed, result = await asyncio.gather(running, queued, return_exceptions=True)
+            return failed, result
+
+        try:
+            failed, result = asyncio.run(scenario())
+        finally:
+            runner.shutdown()
+        assert result == 5, result
+        assert isinstance(failed, APIError)
+        assert failed.status_code == 500
+        assert "exited unexpectedly (killed by SIGKILL" in failed.detail
+
+    def test_other_workers_keep_running(self) -> None:
+        runner = JobRunner(max_workers=2)
+
+        async def scenario() -> list[object]:
+            slow = asyncio.ensure_future(runner.run(time.sleep, 2))
+            await self.until(lambda: runner.running == 1)
+            return await asyncio.gather(slow, runner.run(os._exit, 3), return_exceptions=True)
+
+        try:
+            slow, crashed = asyncio.run(scenario())
+        finally:
+            runner.shutdown()
+        assert slow is None  # time.sleep's result: the job finished.
+        assert isinstance(crashed, APIError) and "exit status 3" in crashed.detail
+
+    def test_worker_killed_while_idle_is_replaced_quietly(self) -> None:
+        runner = JobRunner(max_workers=1)
+        try:
+            assert asyncio.run(runner.run(operator.add, 1, 1)) == 2
+            [pid] = runner.worker_pids()
+            os.kill(pid, 9)
+            deadline = time.monotonic() + 30
+            while pid in runner.worker_pids():
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            assert asyncio.run(runner.run(operator.add, 2, 3)) == 5
+            assert runner.worker_pids() != [pid]
+        finally:
+            runner.shutdown()
+
+    def test_cancelled_request_stops_its_job(self) -> None:
+        """A cancelled request used to leave its job running to the end."""
+        runner = JobRunner(max_workers=1, max_queued=0)
+
+        async def scenario() -> None:
+            async def request() -> None:
+                with runner.admit():
+                    await runner.run(time.sleep, 30)
+
+            task = asyncio.ensure_future(request())
+            await self.until(lambda: runner.running == 1)
+            [pid] = runner.worker_pids()
+            started = time.monotonic()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            # The worker was killed, so its place frees long before 30 s.
+            await self.until(lambda: runner.admitted == 0 and runner.running == 0, 10.0)
+            assert time.monotonic() - started < 10.0
+            assert pid not in runner.worker_pids()
+            # The next job gets a fresh worker.
+            with runner.admit():
+                assert await runner.run(operator.add, 2, 3) == 5
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            runner.shutdown()
+
+    def test_client_that_goes_away_stops_its_job(self) -> None:
+        runner = JobRunner(max_workers=1, max_queued=0)
+        checks: list[bool] = []
+
+        async def gone() -> bool:
+            checks.append(runner.running == 1)
+            return runner.running == 1  # the client leaves once the job has started
+
+        async def scenario() -> None:
+            started = time.monotonic()
+            with pytest.raises(APIError) as excinfo, runner.admit():
+                await runner.run(time.sleep, 30, is_disconnected=gone)
+            assert excinfo.value.status_code == 499
+            assert excinfo.value.error == "client_closed_request"
+            await self.until(lambda: runner.admitted == 0 and runner.running == 0, 10.0)
+            assert time.monotonic() - started < 10.0
+            assert checks and checks[-1]
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            runner.shutdown()
+
+    def test_client_that_stays_gets_the_result(self) -> None:
+        runner = JobRunner(max_workers=1)
+
+        async def connected() -> bool:
+            return False
+
+        async def scenario() -> None:
+            with runner.admit():
+                assert await runner.run(
+                    operator.mul, 6, 7, is_disconnected=connected
+                ) == 42
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            runner.shutdown()
+
+    def test_job_over_the_time_limit_is_stopped(self) -> None:
+        runner = JobRunner(max_workers=1, job_timeout_s=0.5)
+
+        async def scenario() -> None:
+            started = time.monotonic()
+            with pytest.raises(APIError) as excinfo, runner.admit():
+                await runner.run(time.sleep, 30)
+            assert excinfo.value.status_code == 504
+            assert excinfo.value.error == "job_timeout"
+            assert "PP_JOB_TIMEOUT_S" in excinfo.value.detail
+            assert time.monotonic() - started < 10.0
+            # Its worker was replaced; a quick job still runs.
+            with runner.admit():
+                assert await runner.run(operator.add, 1, 1) == 2
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            runner.shutdown()
+
+    def test_exceptions_keep_the_worker_traceback(self) -> None:
+        runner = JobRunner(max_workers=1)
+        try:
+            with pytest.raises(ZeroDivisionError) as excinfo:
+                asyncio.run(runner.run(operator.truediv, 1, 0))
+            # Logged with the request's traceback by the internal_error handler.
+            remote = str(excinfo.value.__cause__)
+            assert "Traceback" in remote and "ZeroDivisionError: division by zero" in remote
+            assert asyncio.run(runner.run(operator.add, 2, 3)) == 5
         finally:
             runner.shutdown()
 
@@ -1496,6 +1943,59 @@ class TestWhisperInWorkers:
         loads = (tmp_path / "loads.log").read_text().splitlines()
         assert len(loads) == 1, loads
 
+    def test_model_follows_the_setting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The server always loaded "base"; PP_STT_MODEL now chooses the model."""
+        (tmp_path / "whisper.py").write_text(FAKE_WHISPER)
+        monkeypatch.syspath_prepend(str(tmp_path))
+        application = create_app(Settings(rate_limit_per_minute=0, stt_model="large-v3"))
+        with TestClient(application, raise_server_exceptions=False) as http:
+            resp = post_speech(http)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["transcript_source"] == "whisper"
+        [load] = (tmp_path / "loads.log").read_text().splitlines()
+        assert load.endswith(" large-v3")
+
+    @pytest.mark.parametrize(
+        ("broken", "status", "error"),
+        [
+            ("load_model", 503, "speech_recognition_unavailable"),
+            ("transcribe", 500, "speech_recognition_failed"),
+        ],
+    )
+    def test_whisper_failures_are_server_errors(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        broken: str,
+        status: int,
+        error: str,
+    ) -> None:
+        """A model that cannot be downloaded used to be a 400 audio_processing_error,
+        which tells the client its upload was bad."""
+        fake = FAKE_WHISPER + (
+            "\n\ndef load_model(name):\n    raise OSError('no network')\n"
+            if broken == "load_model"
+            else "\n\ndef _fail(self, audio, **options):\n    raise OSError('no network')\n"
+            "\n\n_Model.transcribe = _fail\n"
+        )
+        (tmp_path / "whisper.py").write_text(fake)
+        monkeypatch.syspath_prepend(str(tmp_path))
+        application = create_app(Settings(rate_limit_per_minute=0, max_concurrent_jobs=1))
+        with TestClient(application, raise_server_exceptions=False) as http:
+            resp = post_speech(http)
+            # Words need no speech recognition, so they still work.
+            ok = post_speech(http, words=speech_words_json())
+        assert resp.status_code == status, resp.text
+        assert resp.json()["error"] == error
+        assert "no network" in resp.json()["detail"]
+        assert "tmp" not in resp.json()["detail"].replace(str(tmp_path), "")
+        if status == 503:
+            assert resp.headers["retry-after"] == "60"
+            assert "Send the words" in resp.json()["detail"]
+        assert ok.status_code == 200, ok.text
+
 
 @pytest.fixture(scope="module")
 def live_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
@@ -1534,6 +2034,41 @@ def live_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
             proc.wait()
 
 
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port: int = sock.getsockname()[1]
+    return port
+
+
+class TestServerEntryPoint:
+    def test_empty_pp_host_binds_loopback(self, tmp_path: Path) -> None:
+        """PP_HOST= used to make the server listen on every interface."""
+        pytest.importorskip("uvicorn")
+        port = free_port()
+        log_path = tmp_path / "server.log"
+        env = {**os.environ, "PP_HOST": "", "PP_PORT": str(port)}
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "prosody_protocol.server"],
+                stdout=log, stderr=subprocess.STDOUT, env=env,
+            )
+        try:
+            deadline = time.monotonic() + 60
+            while "Uvicorn running on" not in log_path.read_text():
+                if proc.poll() is not None or time.monotonic() > deadline:
+                    pytest.fail("the server did not start:\n" + log_path.read_text())
+                time.sleep(0.2)
+            assert f"Uvicorn running on http://127.0.0.1:{port}" in log_path.read_text()
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
 class TestLiveServer:
     """Behaviour that only a real HTTP server shows."""
 
@@ -1547,6 +2082,38 @@ class TestLiveServer:
             )
         assert resp.status_code == 413
         assert resp.json()["error"] == "payload_too_large"
+
+    def test_json_floods_are_cut_off_and_health_stays_responsive(
+        self, live_server: str
+    ) -> None:
+        """Three 9 MB JSON bodies of empty objects used to be parsed in full on
+        the event loop (a GB of memory each at 48 MB), stalling /v1/health."""
+        body = junk_json_body(9 * 1024 * 1024)
+        statuses: list[int] = []
+
+        def flood(chunked: bool) -> None:
+            with httpx.Client(trust_env=False, timeout=120) as http:
+                resp = http.post(
+                    f"{live_server}/v1/convert/iml-to-ssml",
+                    content=chunks(body) if chunked else body,
+                    headers={"content-type": "application/json"},
+                )
+            statuses.append(resp.status_code)
+
+        senders = [threading.Thread(target=flood, args=(i % 2 == 0,)) for i in range(4)]
+        for sender in senders:
+            sender.start()
+        latencies = []
+        with httpx.Client(trust_env=False, timeout=60) as http:
+            while any(sender.is_alive() for sender in senders):
+                start = time.monotonic()
+                assert http.get(f"{live_server}/v1/health").status_code == 200
+                latencies.append(time.monotonic() - start)
+                time.sleep(0.05)
+        for sender in senders:
+            sender.join()
+        assert statuses == [413] * 4
+        assert max(latencies, default=0.0) < 1.0, latencies
 
     def test_health_responsive_during_long_conversion(
         self, live_server: str, tmp_path: Path

@@ -53,11 +53,10 @@ extra names what to install:
 
 ```text
 $ prosody-protocol from-audio examples/speech.wav --words examples/speech.whisper.json
-error: from-audio needs the 'audio' extra (numpy is not installed): pip install 'prosody-protocol[audio]'
+error: from-audio needs the 'audio' extra (numpy is not installed): pip install "prosody-protocol[audio] @ git+https://github.com/kase1111-hash/Prosody-Protocol"
 ```
 
-The package is not on PyPI yet, so install the extra from GitHub or a clone
-instead (`pip install -e ".[audio]"`).
+In a clone, `pip install -e ".[audio]"` does the same.
 
 ## validate
 
@@ -267,8 +266,8 @@ Where the words come from, in order of preference:
 
 | Option | Effect |
 |--------|--------|
-| `--words FILE` | word timings JSON from any recognizer: openai-whisper (and faster-whisper, WhisperX), the OpenAI transcription API's `verbose_json`, Deepgram, AssemblyAI, Google Cloud Speech-to-Text, or a list of `{word, start_ms, end_ms}` records. The format is detected. Words may overlap by at most 500 ms. |
-| `--transcript TEXT`, `--transcript-file FILE` | the text without timings: prosody is described for the utterance as a whole |
+| `--words FILE` | word timings JSON from any recognizer: openai-whisper (and faster-whisper, WhisperX), the OpenAI transcription API's `verbose_json`, Deepgram, AssemblyAI, Google Cloud Speech-to-Text, or a list of `{word, start_ms, end_ms}` records (optionally with `speaker`). The format is detected. Speaker labels from diarization are kept: a new utterance starts where the speaker changes, with its `speaker_id`, and each speaker is measured against their own voice. One speaker's words may overlap by at most 500 ms. |
+| `--transcript TEXT`, `--transcript-file FILE` | the text without timings: one utterance, no pauses or word-level markup, and overall delivery only with `--calibration`; without it, little beyond the text |
 | `--stt auto` (default) | with neither: Whisper transcribes the audio if the `whisper` extra is installed; otherwise each stretch of speech is a `[speech]` placeholder, with a warning |
 | `--stt whisper` | require Whisper when neither words nor a transcript are given (without it: exit 2 and an install hint) |
 | `--stt none` | never transcribe: placeholders |
@@ -280,8 +279,8 @@ Other options:
 |--------|--------|
 | `--language TAG` | BCP 47 language tag, e.g. `en-US` (`en_US` is accepted as `en-US`). Labels the output and is passed to Whisper. |
 | `--profile FILE` | the speaker's prosody profile (JSON, spec Section 7). Notes on standard error say which utterances it set. |
-| `--calibration AUDIO` | a recording of the same speaker talking neutrally, used as the baseline for pitch, loudness and emotion |
-| `--extended` | add the measurements (`f0_mean`, `jitter`, ...) to every word |
+| `--calibration AUDIO` | a recording of the same speaker talking as usual (for example an earlier turn), used as the baseline for pitch, loudness, rate, emotion and the profile. Repeat it for several recordings (such as several earlier turns); each is analyzed once. Not used when the words carry several speaker labels. |
+| `--extended` | add the measurements (`f0_mean`, `jitter`, ...) to the words; the markup and the text are otherwise the same |
 | `--min-confidence F` | leave out emotions below this confidence (default 0.5) |
 | `--json` | print `{iml, plain_text, transcript_source, warnings, profile_matches}` |
 | `--prompt` | print the annotated transcript for an LLM (as `to-prompt`) |
@@ -291,15 +290,27 @@ prosody-protocol from-audio examples/speech.wav --words examples/speech.whisper.
 ```
 
 ```xml
-<iml version="0.1.0" language="en-US"><utterance>I never said<pause duration="660"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
+<iml version="0.1.0" language="en-US"><utterance>I never said<pause duration="610"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
 ```
+
+and, on standard error:
+
+```text
+warning: No speaker baseline: a single utterance without calibration_audio has nothing to compare its pitch, loudness and rate with, so they were not marked, and no emotion was estimated from them. Pass calibration_audio (recordings of the speaker's usual speech, such as their earlier turns) to assess them.
+```
+
+Warnings say what degraded the output or could not be assessed: no speaker
+baseline, `[speech]` placeholders, a transcript without timings, words
+without sentence punctuation, word timings that do not match the audio, two
+voices without speaker labels, and more. The
+[API reference](API.md#conversion-warnings) lists them.
 
 ```bash
 prosody-protocol from-audio examples/speech.wav --words examples/speech.whisper.json --prompt
 ```
 
 ```text
-I never said [pause 0.7s] she **stole** (much higher pitch, falling) my money (falling).
+I never said [pause 0.6s] she **stole** (much higher pitch, falling) my money.
 ```
 
 ```bash
@@ -308,24 +319,27 @@ prosody-protocol from-audio examples/speech.wav --words examples/speech.whisper.
 
 ```json
 {
-  "iml": "<iml version=\"0.1.0\"><utterance>I never said<pause duration=\"660\"/> she <emphasis level=\"strong\"><prosody pitch=\"+47%\" pitch_contour=\"fall\">stole</prosody></emphasis> my <prosody pitch_contour=\"fall\">money.</prosody></utterance></iml>",
+  "iml": "<iml version=\"0.1.0\"><utterance>I never said<pause duration=\"610\"/> she <emphasis level=\"strong\"><prosody pitch=\"+47%\" pitch_contour=\"fall\">stole</prosody></emphasis> my <prosody pitch_contour=\"fall\">money.</prosody></utterance></iml>",
   "plain_text": "I never said she stole my money.",
   "transcript_source": "words",
-  "warnings": [],
+  "warnings": [
+    "No speaker baseline: a single utterance without calibration_audio has nothing to compare its pitch, loudness and rate with, so they were not marked, and no emotion was estimated from them. Pass calibration_audio (recordings of the speaker's usual speech, such as their earlier turns) to assess them."
+  ],
   "profile_matches": []
 }
 ```
 
-The utterance has no emotion: one sentence without `--calibration` gives the
-rule-based estimator no usual voice to compare with, so it abstains.
-`--min-confidence 0` shows what it would otherwise say:
+The utterance has no emotion and no overall pitch or loudness: one sentence
+without `--calibration` gives the rule-based estimator no usual voice to
+compare with, so it abstains, as the warning says. `--min-confidence 0`
+shows what it would otherwise say:
 
 ```bash
 prosody-protocol from-audio examples/speech.wav --words examples/speech.whisper.json --min-confidence 0
 ```
 
 ```xml
-<iml version="0.1.0"><utterance emotion="neutral" confidence="0.0">I never said<pause duration="660"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
+<iml version="0.1.0"><utterance emotion="neutral" confidence="0.0">I never said<pause duration="610"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
 ```
 
 Without timings, or without any transcript:
@@ -336,10 +350,17 @@ prosody-protocol from-audio examples/speech.wav --stt none
 ```
 
 ```text
+warning: The transcript has no word timings, so only the utterance as a whole was measured: pauses, emphasis and word-level pitch or loudness cannot be placed, and a transcript of several sentences is one utterance. Its overall pitch, loudness, rate and emotion are assessed only against a speaker baseline, which a single utterance gets from calibration_audio. For word-level markup, pass word timings (words=), such as a speech recognizer's word timestamps.
+warning: No speaker baseline: a single utterance without calibration_audio has nothing to compare its pitch, loudness and rate with, so they were not marked, and no emotion was estimated from them. Pass calibration_audio (recordings of the speaker's usual speech, such as their earlier turns) to assess them.
 <iml version="0.1.0"><utterance>I never said she stole my money.</utterance></iml>
 warning: No transcript (stt='none'): each stretch of speech is a '[speech]' placeholder. For real words, give word timings (words) or a transcript, or install 'prosody-protocol[whisper]'.
-<iml version="0.1.0"><utterance>[speech]<pause duration="660"/> <prosody pitch_contour="rise-fall">[speech]</prosody></utterance></iml>
+warning: No speaker baseline: without calibration_audio, the speaker's usual pitch and loudness come from the recording, which needs at least 3 utterances, most of them at a similar level; this one has 2. Pitch, loudness and rate were marked only relative to one another, and no emotion was estimated from them. Pass calibration_audio (recordings of the speaker's usual speech, such as their earlier turns) to assess them.
+<iml version="0.1.0"><utterance><prosody pitch_contour="rise-fall">[speech]</prosody></utterance> <utterance><pause duration="610"/><prosody pitch_contour="rise-fall">[speech]</prosody></utterance></iml>
 ```
+
+A transcript without timings adds little without `--calibration`: nothing
+can be placed on the words, and the sentence as a whole has nothing to be
+compared with.
 
 With a prosody profile (see the
 [quick start](quickstart.md#apply-a-prosody-profile)):
@@ -352,8 +373,8 @@ prosody-protocol from-audio examples/monotone.wav --words examples/monotone.deep
 note: prosody profile 'example_user' set utterance 1 to 'calm' (confidence 0.61; matched pitch_contour=flat)
 note: prosody profile 'example_user' set utterance 2 to 'calm' (confidence 0.62; matched pitch_contour=flat)
 note: prosody profile 'example_user' set utterance 3 to 'calm' (confidence 0.61; matched pitch_contour=flat)
-note: prosody profile 'example_user' set utterance 4 to 'joyful' (confidence 0.60; matched pitch_contour=flat, rate=fast)
-<iml version="0.1.0"><utterance emotion="calm" confidence="0.61" x-profile="pitch_contour=flat">I read the list.</utterance><utterance emotion="calm" confidence="0.62" x-profile="pitch_contour=flat"><pause duration="310"/>The room is booked.</utterance><utterance emotion="calm" confidence="0.61" x-profile="pitch_contour=flat"><pause duration="300"/>I have the slides.</utterance><utterance emotion="joyful" confidence="0.6" x-profile="pitch_contour=flat rate=fast"><pause duration="310"/><prosody rate="170%">And we got the grant!</prosody></utterance></iml>
+note: prosody profile 'example_user' set utterance 4 to 'joyful' (confidence 0.61; matched pitch_contour=flat, rate=fast)
+<iml version="0.1.0"><utterance emotion="calm" confidence="0.61" x-profile="pitch_contour=flat">I read the list.</utterance> <utterance emotion="calm" confidence="0.62" x-profile="pitch_contour=flat"><pause duration="310"/>The room is booked.</utterance> <utterance emotion="calm" confidence="0.61" x-profile="pitch_contour=flat"><pause duration="300"/>I have the slides.</utterance> <utterance emotion="joyful" confidence="0.61" x-profile="pitch_contour=flat rate=fast"><pause duration="290"/><prosody rate="165%">And we got the grant!</prosody></utterance></iml>
 ```
 
 The `note:` lines go to standard error (they are left out with `--json`,
@@ -369,7 +390,7 @@ error: cannot read nope.wav: No such file or directory
 $ echo '[{"word":"hi","start_ms":0,"end_ms":4000},{"word":"there","start_ms":100,"end_ms":4100}]' | prosody-protocol from-audio examples/speech.wav --words -
 error: words[1] ('there', 100-4100 ms) starts 3900 ms before words[0] ('hi', 0-4000 ms) ends; word timings may overlap by at most 500 ms (the words of one speaker, one after another)
 $ prosody-protocol from-audio examples/speech.wav --stt whisper
-error: from-audio --stt whisper needs the 'whisper' extra (openai-whisper is not installed): pip install 'prosody-protocol[whisper]', or give the words with --words or --transcript
+error: from-audio --stt whisper needs the 'whisper' extra (openai-whisper is not installed): pip install "prosody-protocol[whisper] @ git+https://github.com/kase1111-hash/Prosody-Protocol", or give the words with --words or --transcript
 ```
 
 with exit status 2, 1 and 2.
@@ -419,54 +440,90 @@ To play it at once, write to standard output:
 ```text
 prosody-protocol benchmark DATASET_DIR [--save REPORT.json] [--baseline REPORT.json]
     [--tolerance F] [--threshold METRIC=VALUE]... [--max-samples N]
-    [--stt {auto,whisper,none}] [--language TAG]
+    [--calibration AUDIO] [--words-from {auto,timings,transcript,stt}]
+    [--stt {auto,whisper,none}]
+    [--abstention-label LABEL] [--language TAG]
 ```
 
 Loads a dataset with `DatasetLoader` (see the
 [quick start](quickstart.md#datasets-and-benchmarks) for the format), runs
 `AudioToIML` on every recording and scores the output against the labels
-(`Benchmark`). The converter gets no word timings, so without the `whisper`
-extra the text is `[speech]` placeholders and only emotion, pauses and
-validity are scored.
+(`Benchmark`). What the converter gets besides the audio is set by
+`--words-from`:
+
+| `--words-from` | The converter gets |
+|----------------|--------------------|
+| `auto` (default) | the entry's word timings (`metadata.word_timings`, any format `--words` reads) when it has them; otherwise nothing when Whisper can find the words (`--stt` is not `none` and the `whisper` extra is installed), since recognized words carry timings; otherwise the entry's transcript |
+| `timings` | the word timings when the entry has them, otherwise nothing (speech recognition, see `--stt`) |
+| `transcript` | always the transcript |
+| `stt` | nothing: Whisper, or `[speech]` placeholders without it |
+
+Pauses and pitch contours can only be scored where the converter has word
+timings, given or from Whisper; a bare transcript places no pauses, and
+outputs that are only placeholders are left out of those metrics.
 
 | Option | Effect |
 |--------|--------|
 | `--save REPORT.json` | save the report (its directory must exist) |
-| `--baseline REPORT.json` | fail when a metric, or a per-class F1, is worse than this saved report by more than the tolerance |
+| `--baseline REPORT.json` | fail when a metric, or a per-class F1, is worse than this saved report by more than the tolerance, or was measured there but not in this run |
 | `--tolerance F` | allowed drop against the baseline (default 0.01) |
-| `--threshold METRIC=VALUE` | a limit, repeatable: minimums for `emotion_accuracy`, `emotion_f1_macro`, `pitch_accuracy`, `pitch_coverage`, `pause_f1`, `validity_rate`; maximums for `confidence_ece`, `failure_rate` (default 0, so any failed conversion fails) |
+| `--threshold METRIC=VALUE` | a limit, repeatable: minimums for `emotion_accuracy`, `emotion_coverage`, `emotion_f1_macro`, `pitch_accuracy`, `pitch_coverage`, `pause_f1`, `validity_rate`; maximums for `confidence_ece`, `failure_rate` (default 0, so any failed conversion fails). An `emotion_accuracy` limit without an `emotion_coverage` limit counts entries without an emotion as wrong (likewise `pitch_accuracy` and `pitch_coverage`) |
 | `--max-samples N` | evaluate only the first N entries |
+| `--calibration AUDIO` | a recording of the speakers talking as usual, used as the baseline for every entry (repeat for several). Without one, an entry that is a single utterance gets no emotion; tests/fixtures/benchmarks/training_synthetic.json was made with `--stt none --calibration tests/fixtures/datasets/training_synthetic/audio/synth_001.wav` |
+| `--abstention-label LABEL` | score an output without an emotion as LABEL (such as `neutral`); by default it is an abstention, which lowers `emotion_coverage` and counts as a miss in the per-class F1, but is left out of `emotion_accuracy` |
 | `--stt`, `--language` | as for `from-audio` |
 
-It prints a summary, then `Passed` or `FAILED:` with the reasons, and exits
-1 on any failure. Unknown metrics, a missing dataset directory and an
-unwritable `--save` path are rejected (exit 2) before the run. With the
-small test dataset of a clone:
+It prints a summary (where the words came from, then the metrics), then
+`Passed` or `FAILED:` with the reasons, and exits 1 on any failure. A
+baseline that scored abstentions differently (reports saved before
+`--abstention-label` existed counted them as `neutral`) is itself a
+failure, and its emotion metrics are not compared. Unknown metrics, a
+missing dataset directory and an unwritable `--save` path are rejected
+(exit 2) before the run. With the small test dataset of a clone, whose
+entries have transcripts but no word timings:
 
 ```text
 $ prosody-protocol benchmark tests/fixtures/datasets/sample --stt none --save report.json
-warning: No transcript (stt='none'): each stretch of speech is a '[speech]' placeholder. For real words, give word timings (words) or a transcript, or install 'prosody-protocol[whisper]'.
+warning: The transcript has no word timings, so only the utterance as a whole was measured: pauses, emphasis and word-level pitch or loudness cannot be placed, and a transcript of several sentences is one utterance. Its overall pitch, loudness, rate and emotion are assessed only against a speaker baseline, which a single utterance gets from calibration_audio. For word-level markup, pass word timings (words=), such as a speech recognizer's word timestamps.
+warning: No speaker baseline: a single utterance without calibration_audio has nothing to compare its pitch, loudness and rate with, so they were not marked, and no emotion was estimated from them. Pass calibration_audio (recordings of the speaker's usual speech, such as their earlier turns) to assess them.
 Benchmark of sample: 3 entries, 0 failed conversions, 0.1 s
-  emotion_accuracy  0.3333
-  emotion_f1_macro  0.1667
+  words from        transcripts 3
+  emotion_accuracy  n/a
+  emotion_coverage  0.0000
+  emotion_f1_macro  0.0000
   confidence_ece    n/a
   pitch_accuracy    n/a
   pitch_coverage    n/a
   pause_f1          n/a
   validity_rate     1.0000
   failure_rate      0.0000
-  emotion_f1        joyful 0.00, neutral 0.50, uncertain 0.00
+  emotion_f1        joyful 0.00, neutral 0.00, uncertain 0.00
 Saved the report to report.json
 Passed
 $ prosody-protocol benchmark tests/fixtures/datasets/sample --stt none --baseline report.json --threshold emotion_accuracy=0.7
 ...
 FAILED:
-  emotion_accuracy = 0.3333 < threshold 0.7000
+  emotion_accuracy = 0.0000 < threshold 0.7000 (over all entries: those without an emotion count as wrong; add an emotion_coverage threshold to score only the entries with one)
+$ prosody-protocol benchmark tests/fixtures/datasets/sample --stt none --abstention-label neutral
+...
+  words from        transcripts 3
+  emotion_accuracy  0.3333
+  emotion_coverage  1.0000
+  emotion_f1_macro  0.1667
+...
+  emotion_f1        joyful 0.00, neutral 0.50, uncertain 0.00
+  (an output without an emotion counts as 'neutral')
+Passed
 ```
 
-`n/a` marks a metric with nothing to compare (here the dataset has no
-pitch contours or pauses). Three entries measure nothing; the fixture only
-shows that the pipeline runs.
+(`...` marks lines left out.) `n/a` marks a metric with nothing to compare
+(here the dataset has no pitch contours or pauses, and no output carries
+an emotion). Every output abstains: each entry is a single sentence
+without calibration audio. Three entries measure nothing; the fixture only
+shows that the pipeline runs. The repository's own regression check,
+`tests/fixtures/benchmarks/training_synthetic.json`, is a saved report of
+this kind for the 10-clip `training_synthetic` fixture, made with a
+calibration recording (`tests/fixtures/benchmarks/make_baselines.py`).
 
 ## serve
 
@@ -475,11 +532,9 @@ prosody-protocol serve [--host HOST] [--port PORT]
 ```
 
 Runs the REST API with uvicorn (the `api` extra). The host defaults to
-`$PP_HOST`, or 127.0.0.1 when `PP_HOST` is unset, and the port to
-`$PP_PORT` or 8000; `--port 0` picks a free port. A set but empty
-`PP_HOST` binds every interface, so leave it unset to stay on loopback.
-The other settings (upload size, rate limit, worker processes, ...) are
-`PP_*` environment variables, listed in the
+`$PP_HOST`, or 127.0.0.1 when `PP_HOST` is unset or empty, and the port to
+`$PP_PORT` or 8000; `--port 0` picks a free port. The other settings (upload and JSON body size, rate limit, worker
+processes, Whisper model, ...) are `PP_*` environment variables, listed in the
 [API reference](API.md#configuration).
 
 ```bash
@@ -506,8 +561,8 @@ error: max_queued_jobs (PP_MAX_QUEUED_JOBS) must be an integer >= 0, got -1
 
 A server that cannot start (for example, because the port is in use) prints
 uvicorn's log line and `error: the server could not start (see the log
-above)`, exit status 1. `python -m prosody_protocol.server` runs the same
-server.
+above)`, exit status 1. `python -m prosody_protocol.server` takes the same
+options and reports errors the same way.
 
 ## doctor
 
@@ -530,21 +585,22 @@ prosody-protocol 0.1.0a3 (Python 3.11.15)
           enables: validate, to-text, to-ssml, to-prompt, from-text
 [missing] audio analysis (numpy, praat-parselmouth)
           enables: from-audio, benchmark, synthesize
-          install: pip install 'prosody-protocol[audio]'
+          install: pip install "prosody-protocol[audio] @ git+https://github.com/kase1111-hash/Prosody-Protocol"
 [missing] speech recognition (openai-whisper)
           enables: from-audio transcribes audio given without --words or --transcript (otherwise each stretch of speech is a [speech] placeholder)
-          install: pip install 'prosody-protocol[whisper]' (pulls in PyTorch)
+          install: pip install "prosody-protocol[whisper] @ git+https://github.com/kase1111-hash/Prosody-Protocol" (pulls in PyTorch)
 [ok     ] speech synthesis (espeak-ng at /usr/bin/espeak-ng)
           enables: synthesize speaks IML (otherwise it renders a tone preview, not speech)
 [ok     ] audio decoding (ffmpeg at /usr/bin/ffmpeg)
           enables: from-audio reads OGG/Opus, WebM, M4A and other formats besides WAV, AIFF, FLAC and MP3
 [missing] REST API (fastapi, uvicorn, python-multipart)
           enables: serve
-          install: pip install 'prosody-protocol[api]'
+          install: pip install "prosody-protocol[api] @ git+https://github.com/kase1111-hash/Prosody-Protocol"
 [missing] training baselines (scikit-learn)
           enables: the training/ scripts of a source checkout
-          install: pip install 'prosody-protocol[ml]'
+          install: pip install "prosody-protocol[ml] @ git+https://github.com/kase1111-hash/Prosody-Protocol"
 ```
 
-Until the package is on PyPI, install an extra from GitHub or a clone (see
+The `install:` lines install from GitHub, since the package is not on PyPI
+yet; in a clone, `pip install -e ".[audio]"` and so on do the same (see
 [Install](quickstart.md#install)).

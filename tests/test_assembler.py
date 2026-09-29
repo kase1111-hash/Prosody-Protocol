@@ -8,10 +8,12 @@ exact IML produced from hand-made features.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import wave
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -22,8 +24,9 @@ from prosody_protocol.assembler import (
     PROFILE_ATTRIBUTE,
     IMLAssembler,
     ProfileMatch,
+    _Assembly,
 )
-from prosody_protocol.emotion_classifier import SpeakerBaseline
+from prosody_protocol.emotion_classifier import RuleBasedEmotionClassifier, SpeakerBaseline
 from prosody_protocol.exceptions import ProfileError
 from prosody_protocol.models import (
     ChildNode,
@@ -114,6 +117,34 @@ def _sentence(text: str, start_ms: int = 0, f0: float = 120.0, db: float = 65.0)
         (w, start_ms + i * 300, start_ms + i * 300 + 250, f0, db)
         for i, w in enumerate(text.split())
     ]
+
+
+_EXTENDED_FIELDS = (
+    "f0_mean", "f0_range", "f0_contour", "intensity_mean", "intensity_range", "speech_rate",
+    "duration_ms", "jitter", "shimmer", "hnr",
+)
+
+
+def _without_extended(children: Sequence[ChildNode]) -> list[ChildNode]:
+    """*children* with the extended attributes removed, and <prosody> elements
+    that had nothing else unwrapped (adjacent text joined)."""
+    out: list[ChildNode] = []
+    for child in children:
+        parts: list[ChildNode] = [child]
+        if isinstance(child, Prosody):
+            inner = _without_extended(child.children)
+            bare = dataclasses.replace(
+                child, children=tuple(inner), **dict.fromkeys(_EXTENDED_FIELDS)
+            )
+            parts = inner if bare == Prosody(children=tuple(inner)) else [bare]
+        elif isinstance(child, Emphasis):
+            parts = [dataclasses.replace(child, children=tuple(_without_extended(child.children)))]
+        for part in parts:
+            if isinstance(part, str) and out and isinstance(out[-1], str):
+                out[-1] += part
+            else:
+                out.append(part)
+    return out
 
 
 def _nodes(children: Sequence[ChildNode]) -> list[ChildNode]:
@@ -260,7 +291,7 @@ class TestUtteranceGrouping:
         assert [u.children for u in doc.utterances] == [("Hello.",), ("World.",)]
 
     def test_long_pause_splits_unpunctuated_text(self, assembler: IMLAssembler) -> None:
-        """Without punctuation, a pause >= 1000 ms splits -- and is kept."""
+        """Without punctuation, a long pause splits -- and is kept."""
         alignments = [
             _make_alignment("Before", 0, 400),
             _make_alignment("after", 1500, 1900),
@@ -286,10 +317,9 @@ class TestUtteranceGrouping:
     def test_pause_after_sentence_end_starts_next_utterance(self) -> None:
         words = _sentence("Are you okay?") + [("Yes.", 3850, 4100, 120, 65)]
         doc = _assemble(words)
-        assert _xml(doc) == (
-            '<iml version="0.1.0"><utterance>Are you okay?</utterance>'
-            '<utterance><pause duration="3000"/>Yes.</utterance></iml>'
-        )
+        assert [u.children for u in doc.utterances] == [
+            ("Are you okay?",), (Pause(duration=3000), "Yes."),
+        ]
 
     def test_abbreviations_and_initials_do_not_split(self) -> None:
         doc = _assemble(_sentence("I met Dr. Smith and J. Doe at 5 p.m. in the U.S. office."))
@@ -337,6 +367,176 @@ class TestUtteranceGrouping:
 # ---------------------------------------------------------------------------
 
 
+    def test_half_second_pause_splits_unpunctuated_text(self) -> None:
+        """Unpunctuated sentences with ordinary gaps (0.5-1 s) used to run
+        together into one utterance, silently; shorter pauses do not split."""
+        words = (
+            _sentence("i checked the schedule")
+            + _sentence("the train leaves at nine", 1800)
+            + _sentence("we should get there", 3250 + 400)  # 400 ms after "nine"
+        )
+        assembly = IMLAssembler()._assemble(
+            [_make_alignment(*w[:3]) for w in words], _features(words), []
+        )
+        assert [_plain(IMLDocument((u,))) for u in assembly.document.utterances] == [
+            "i checked the schedule", "the train leaves at nine we should get there",
+        ]
+        [note] = [n for n in assembly.info if "no sentence punctuation" in n]
+        assert "0.5 s" in note
+
+    def test_no_punctuation_note_for_punctuated_or_placeholder_text(self) -> None:
+        words = _sentence("I checked it.") + _sentence("The train left.", 1800)
+        assembly = IMLAssembler()._assemble(
+            [_make_alignment(*w[:3]) for w in words], _features(words), []
+        )
+        assert not [n for n in assembly.info if "punctuation" in n]
+        bare = [(w[0].rstrip("."), *w[1:]) for w in words]
+        assembly = IMLAssembler()._assemble(
+            [_make_alignment(*w[:3]) for w in bare], _features(bare), [],
+            check_punctuation=False,
+        )
+        assert not [n for n in assembly.info if "punctuation" in n]
+
+
+# ---------------------------------------------------------------------------
+# Speakers and baselines
+# ---------------------------------------------------------------------------
+
+
+def _spoken(words: Sequence[Word], speaker: str | None) -> list[WordAlignment]:
+    return [WordAlignment(w[0], w[1], w[2], speaker) for w in words]
+
+
+def _assembly(
+    turns: Sequence[tuple[Sequence[Word], str | None]],
+    assembler: IMLAssembler | None = None,
+    **kwargs: Any,
+) -> _Assembly:
+    alignments = [a for words, speaker in turns for a in _spoken(words, speaker)]
+    features = [f for words, _ in turns for f in _features(words)]
+    return (assembler or IMLAssembler())._assemble(alignments, features, [], **kwargs)
+
+
+def _call(labelled: bool) -> list[tuple[list[Word], str | None]]:
+    """Three turns each of a low voice (120 Hz) and a high voice (220 Hz)."""
+    turns: list[tuple[list[Word], str | None]] = []
+    for i in range(6):
+        low = i % 2 == 0
+        words = _sentence("okay that sounds good.", i * 2000, 120 if low else 220, 65)
+        turns.append((words, ("A" if low else "B") if labelled else None))
+    return turns
+
+
+class TestSpeakers:
+    def test_speaker_change_starts_an_utterance(self) -> None:
+        assembly = _assembly([(_sentence("yes i know"), "A"), (_sentence("right", 1000), "B")])
+        utterances = assembly.document.utterances
+        assert [(u.speaker_id, _plain(IMLDocument((u,)))) for u in utterances] == [
+            ("A", "yes i know"), ("B", "right"),
+        ]
+
+    def test_each_speaker_has_their_own_baseline(self) -> None:
+        """Against one baseline for both, the high voice was 'much higher'."""
+        assembly = _assembly(_call(labelled=True), IMLAssembler(_Fixed("angry", 0.9)))
+        assert [u.speaker_id for u in assembly.document.utterances] == ["A", "B"] * 3
+        assert not [n for u in assembly.document.utterances for n in _nodes(u.children)
+                    if isinstance(n, Prosody) and n.pitch]
+        assert all(u.emotion == "angry" for u in assembly.document.utterances)
+        assert not [n for n in assembly.info if "baseline" in n or "voices" in n]
+
+    def test_two_voices_without_labels_have_no_baseline(self) -> None:
+        """The high voice's calm sentences used to be 'fearful' with pitch="+93%"."""
+        recorder = _BaselineRecorder()
+        assembly = _assembly(_call(labelled=False), IMLAssembler(recorder))
+        utterances = assembly.document.utterances
+        assert recorder.baselines == [SpeakerBaseline()] * 6
+        assert not [n for u in utterances for n in _nodes(u.children)
+                    if isinstance(n, Prosody) and n.pitch]
+        [note] = assembly.info
+        assert "(about 120 Hz and 220 Hz), as from two voices" in note
+        assert "the emotion classifier got no baseline to compare with" in note
+        default = _assembly(_call(labelled=False), IMLAssembler(min_emotion_confidence=0.0))
+        assert [(u.emotion, u.confidence) for u in default.document.utterances] == [
+            ("neutral", 0.0)
+        ] * 6
+        [note] = default.info
+        assert "and no emotion was estimated" in note
+
+    def test_notes_do_not_claim_abstention_for_a_classifier_without_baseline(self) -> None:
+        """A classifier that does not use the baseline (a trained model, say)
+        still labels the utterances; the notes used to say no emotion was
+        estimated."""
+        plain = IMLAssembler(_Fixed("angry", 0.9))
+        one = _assembly([(_sentence("I see."), None)], plain)
+        assert [u.emotion for u in one.document.utterances] == ["angry"]
+        [note] = one.info
+        assert note.startswith("No speaker baseline") and "emotion" not in note
+        voices = _assembly(_call(labelled=False), plain)
+        assert [u.emotion for u in voices.document.utterances] == ["angry"] * 6
+        [note] = voices.info
+        assert "two voices" in note and "emotion" not in note
+        fixed = IMLAssembler(RuleBasedEmotionClassifier(baseline_f0=120.0))
+        [note] = _assembly([(_sentence("I see."), None)], fixed).info
+        assert "used only the baseline it was constructed with" in note
+
+    @pytest.mark.parametrize(
+        ("semitones", "two_voices"),
+        [
+            ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], False),  # ever more excited: no gap
+            ([0, 0.5, 1, 5, 5.5, 6], False),  # two groups, but only 5 semitones apart
+            ([0, 0.5, 1, 1.5, 9, 9.5], True),
+        ],
+    )
+    def test_two_voices_need_two_distant_groups(
+        self, semitones: list[float], two_voices: bool
+    ) -> None:
+        turns = [
+            (_sentence("okay then.", i * 2000, 120 * 2 ** (st / 12), 65), None)
+            for i, st in enumerate(semitones)
+        ]
+        assembly = _assembly(turns)
+        assert bool([n for n in assembly.info if "two voices" in n]) is two_voices
+
+    def test_one_outlier_is_not_a_second_voice(self) -> None:
+        turns = [(_sentence("okay then.", i * 2000, f0, 65), None)
+                 for i, f0 in enumerate([120, 122, 118, 121, 240])]
+        assert not [n for n in _assembly(turns).info if "two voices" in n]
+
+    def test_calibration_and_profile_describe_one_speaker(self) -> None:
+        reference = _features(_sentence("this is how I sound.", f0=120))
+        assembler = IMLAssembler(_Fixed("angry", 0.9), profile=SPIKE_PROFILE)
+        assembly = _assembly(_call(labelled=True), assembler, reference_features=reference)
+        assert any(n.startswith("calibration_audio describes one speaker") for n in assembly.info)
+        assert any(n.startswith("The prosody profile describes one speaker") for n in assembly.info)
+        assert assembly.matches == []
+
+    def test_baseline_advice_with_several_speakers_does_not_ask_for_calibration(self) -> None:
+        """calibration_audio is set aside for several speakers: don't tell users to pass it."""
+        turns = [(_sentence("yes i know"), "A"), (_sentence("right then.", 1000), "B")]
+        reference = _features(_sentence("this is how I sound.", f0=120))
+        assembly = _assembly(turns, reference_features=reference)
+        notes = [n for n in assembly.info if "No speaker baseline" in n]
+        assert len(notes) == 2, assembly.info
+        for note in notes:
+            assert note.startswith(("Speaker 'A': ", "Speaker 'B': ")), note
+            assert "without calibration_audio" not in note
+            assert "convert this speaker's words on their own with calibration_audio" in note
+
+    def test_no_baseline_is_noted(self) -> None:
+        one = _assembly([(_sentence("I see."), None)])
+        assert [n[:60] for n in one.info] == [
+            "No speaker baseline: a single utterance without calibration_"
+        ]
+        two = _assembly([(_sentence("I see."), None), (_sentence("Fine.", 2000), None)])
+        assert any("this one has 2." in n for n in two.info)
+        calibrated = _assembly(
+            [(_sentence("I see."), None)], reference_features=_features(_sentence("so it is."))
+        )
+        assert calibrated.info == []
+        per_speaker = _assembly(_call(labelled=True)[:3])  # A, B, A
+        assert [n.split(":")[0] for n in per_speaker.info] == ["Speaker 'A'", "Speaker 'B'"]
+
+
 class TestPauseInsertion:
     def test_gap_produces_pause_element(self, assembler: IMLAssembler) -> None:
         """A 500ms gap between words should produce a <pause> element."""
@@ -366,6 +566,17 @@ class TestPauseInsertion:
         doc = _assemble(words, pauses=[PauseInterval(320, 880)])
         assert doc.utterances[0].children == ("one", Pause(duration=560), " two.")
 
+    def test_silences_at_one_boundary_add_up(self) -> None:
+        """Untranscribed speech (an 'um') between two silences is not pause."""
+        words: list[Word] = [("one", 0, 300, 120, 65), ("two.", 1500, 1800, 120, 65)]
+        doc = _assemble(words, pauses=[PauseInterval(300, 700), PauseInterval(1000, 1500)])
+        assert doc.utterances[0].children == ("one", Pause(duration=900), " two.")
+
+    def test_overlapping_silences_count_once(self) -> None:
+        words: list[Word] = [("one", 0, 300, 120, 65), ("two.", 1100, 1400, 120, 65)]
+        doc = _assemble(words, pauses=[PauseInterval(300, 800), PauseInterval(600, 1100)])
+        assert doc.utterances[0].children == ("one", Pause(duration=800), " two.")
+
     def test_silence_before_and_after_speech_is_not_a_pause(self) -> None:
         words = _sentence("one two three.", start_ms=1000)
         doc = _assemble(words, pauses=[PauseInterval(0, 1000), PauseInterval(1850, 3000)])
@@ -377,10 +588,10 @@ class TestPauseInsertion:
 
     def test_pause_before_punctuation_moves_after_it(self) -> None:
         words: list[Word] = [
-            ("Wait", 0, 300, 120, 65), (",", 900, 900, 120, 65), ("what", 900, 1200, 120, 65),
+            ("Wait", 0, 300, 120, 65), (",", 900, 900, 120, 65), ("what?", 900, 1200, 120, 65),
         ]
         doc = _assemble(words)
-        assert doc.utterances[0].children == ("Wait,", Pause(duration=600), " what")
+        assert doc.utterances[0].children == ("Wait,", Pause(duration=600), " what?")
 
     def test_silence_before_final_punctuation_is_trailing_silence(self) -> None:
         """With nothing after the '?', the gap is silence after the last word."""
@@ -668,35 +879,40 @@ class TestEmphasis:
             volume="+18dB",
         )
 
-    def test_emphasized_word_steps_out_of_utterance_prosody(
-        self, validator: IMLValidator
-    ) -> None:
-        """Inside a shouted utterance, an emphasized word used to lose its pitch,
-        volume and contour: <emphasis><prosody> would have been three deep."""
+    def test_final_contour_of_emphasized_word_is_kept(self, validator: IMLValidator) -> None:
+        """The rise of a question on an emphasized last word cannot go inside the
+        utterance's <prosody> (<emphasis><prosody> would be three deep). The word
+        stands alone with exactly the utterance's attributes plus its contour, so
+        the pieces still describe one delivery; its own offset used to be added
+        to the utterance's (+96%, next to +48%)."""
         question = _sentence("You did what?", 5000, 265, 80)
         question[2] = ("what?", 5600, 5850, 350, 88, {"f0_contour": _contour(280, 420)})
         doc = _assemble(CALM + question, assembler=IMLAssembler(min_emotion_confidence=1.0))
-        assert _xml(doc).endswith(
-            '<utterance><pause duration="450"/>'
-            '<prosody pitch="+48%" volume="+18dB">You did</prosody> <emphasis level="strong">'
-            '<prosody pitch="+96%" pitch_contour="rise-sharp" volume="+26dB">what?</prosody>'
-            "</emphasis></utterance></iml>"
+        assert doc.utterances[-1].children == (
+            Pause(duration=450),
+            Prosody(children=("You did",), pitch="+48%", volume="+18dB"),
+            " ",
+            Emphasis(level="strong", children=(Prosody(
+                children=("what?",), pitch="+48%", volume="+18dB", pitch_contour="rise-sharp",
+            ),)),
         )
         assert not [i for i in validator.validate(_xml(doc)).issues if i.severity != "info"]
 
-    def test_step_out_splits_the_utterance_prosody(self, validator: IMLValidator) -> None:
+    def test_emphasized_word_stays_inside_the_utterance_prosody(
+        self, validator: IMLValidator
+    ) -> None:
+        """An emphasized word louder than its shouted utterance used to step out
+        of the utterance's <prosody> and split it in three, so readers saw the
+        utterance's delivery three times, piecewise, and no overall delivery."""
         loud = _sentence("I said no way.", 5000, 265, 80)
-        loud[2] = ("no", 5600, 5850, 265, 92)
+        loud[2] = ("no", 5600, 5850, 265, 92, {"f0_contour": _contour(250, 300)})
         doc = _assemble(CALM + loud)
         assert doc.utterances[-1].children[1:] == (
-            Prosody(children=("I said",), pitch="+48%", volume="+18dB"),
-            " ",
-            Emphasis(
-                level="strong",
-                children=(Prosody(children=("no",), pitch="+48%", volume="+30dB"),),
+            Prosody(
+                children=("I said ", Emphasis(level="strong", children=("no",)), " way."),
+                pitch="+48%",
+                volume="+18dB",
             ),
-            " ",
-            Prosody(children=("way.",), pitch="+48%", volume="+18dB"),
         )
         assert _plain(doc).endswith("I said no way.")
         assert not [i for i in validator.validate(_xml(doc)).issues if i.severity != "info"]
@@ -893,20 +1109,36 @@ class TestExtendedAttrs:
             "+42%", "+7dB", 170.0, 72.0,
         )
 
-    def test_emphasized_word_in_utterance_prosody_keeps_extended(
+    def test_extended_attributes_do_not_change_the_markup(
         self, assembler_extended: IMLAssembler
     ) -> None:
-        """Such words used to become a bare <emphasis> without measurements."""
+        """With measurements, an emphasized word in a shouted utterance used to
+        step out of the utterance's <prosody> (to hold them in a <prosody> of
+        its own), which split the utterance-level delivery into pieces: the
+        text a reader saw changed with include_extended. Now the markup is the
+        same, with the measurements added; the emphasized word inside the
+        utterance's <prosody> goes without them (they would nest three deep)."""
         loud: list[Word] = [(*w, RESEARCH) for w in _sentence("I said no now.", 5000, 265, 80)]
         loud[2] = ("no", 5600, 5850, 265, 92, RESEARCH)
-        doc = _assemble(CALM + loud, assembler=assembler_extended)
-        emphasis = doc.utterances[-1].children[3]
-        assert isinstance(emphasis, Emphasis)
-        inner = emphasis.children[0]
-        assert isinstance(inner, Prosody)
-        assert (inner.pitch, inner.volume, inner.intensity_mean, inner.jitter) == (
-            "+48%", "+30dB", 92.0, 1.23,
-        )
+        extended = _assemble(CALM + loud, assembler=assembler_extended)
+        plain = _assemble(CALM + loud)
+        assert [_without_extended(u.children) for u in extended.utterances] == [
+            list(u.children) for u in plain.utterances
+        ]
+        wrapper = extended.utterances[-1].children[-1]
+        assert isinstance(wrapper, Prosody)
+        assert (wrapper.pitch, wrapper.volume) == ("+48%", "+18dB")
+        assert Emphasis(level="strong", children=("no",)) in wrapper.children
+        said = wrapper.children[0]
+        assert isinstance(said, Prosody) and said.jitter == 1.23
+
+    def test_no_duration_for_a_span_over_an_hour(self) -> None:
+        """A word timing ending days later became duration_ms="2999999386",
+        invalid IML (V27); a span over an hour is not a word."""
+        words: list[Word] = [("never", 614, 3_000_000_000, 120, 65)]
+        doc = _assemble(words, assembler=IMLAssembler(include_extended=True))
+        assert "duration_ms" not in _xml(doc)
+        assert IMLValidator().validate(_xml(doc)).valid
 
     def test_no_extended_by_default(self, assembler: IMLAssembler) -> None:
         words: list[Word] = [(*w, RESEARCH) for w in _sentence("so steady.")]
@@ -1130,7 +1362,7 @@ class TestProfiles:
             _make_features(w[0], w[1], w[2], w[3], w[4], **(w[5] if len(w) > 5 else {}))
             for w in words
         ]
-        doc, matches, _ = assembler._assemble(alignments, features, [])
+        doc, matches, *_ = assembler._assemble(alignments, features, [])
         assert len(doc.utterances) == 2
         assert matches == [ProfileMatch(
             utterance=1,
@@ -1151,7 +1383,7 @@ class TestProfiles:
     def test_abstention_applies_after_the_profile(self) -> None:
         """A profile adjusts the classifier's estimate; it cannot make up confidence."""
         assembler = IMLAssembler(_Fixed("neutral", 0.1), profile=SPIKE_PROFILE)
-        doc, matches, _ = assembler._assemble(
+        doc, matches, *_ = assembler._assemble(
             [_make_alignment(w[0], w[1], w[2]) for w in _spiked()], _features(_spiked()), []
         )
         utterance = doc.utterances[0]
@@ -1171,7 +1403,7 @@ class TestProfiles:
 
     def test_no_match_leaves_the_classification(self) -> None:
         assembler = IMLAssembler(_Fixed("angry", 0.6), profile=SPIKE_PROFILE)
-        doc, matches, _ = assembler._assemble(
+        doc, matches, *_ = assembler._assemble(
             [_make_alignment(w[0], w[1], w[2]) for w in _sentence("I see.")],
             _features(_sentence("I see.")),
             [],
@@ -1195,7 +1427,7 @@ class TestProfiles:
         """The spec 7.1 example: monotone, fast speech from this speaker is excitement."""
         profile = ProfileLoader().load(PROFILES_DIR / "autism_spectrum.json")
         words = _flat_fast("I just got the new keyboard.")
-        doc, matches, _ = IMLAssembler(_Fixed("angry", 0.63), profile=profile)._assemble(
+        doc, matches, *_ = IMLAssembler(_Fixed("angry", 0.63), profile=profile)._assemble(
             [_make_alignment(w[0], w[1], w[2]) for w in words],
             [_make_features(w[0], w[1], w[2], w[3], w[4], **w[5]) for w in words],  # type: ignore[misc]
             [],

@@ -440,6 +440,9 @@ class TestEmotionCues:
             "Oh great, another meeting.",
             "Yeah right, like that will work.",
             "Just what I needed today.",
+            "That's just perfect, thanks.",
+            "Oh, that's just wonderful.",
+            "oh yeah, that's just so really great.",
         ],
     )
     def test_sarcasm_cues(self, predictor: TextToIML, text: str) -> None:
@@ -649,14 +652,39 @@ class TestEdgeCases:
             "!",
             "\u201ea ",  # quotes that are never closed
             '"a"',  # quotes in a text without spaces
+            "just ",  # a sarcasm-frame opener that was also a filler word
+            "oh so ",
+            "oh really so yeah ",
+            "Oh, that's just ",
         ],
     )
     def test_long_input_takes_linear_time(self, predictor: TextToIML, unit: str) -> None:
-        """Each of these was quadratic: 200 KB took from 20 s to several minutes."""
+        """Each of these was quadratic: 200 KB took from 20 s to several minutes
+        ("just just ...": about 3.5 minutes)."""
         text = unit * (200_000 // len(unit))
         start = time.perf_counter()
         doc = predictor.predict_document(text)
         assert time.perf_counter() - start < 5.0
+        assert IMLParser().to_plain_text(doc) == text.strip()
+
+    @pytest.mark.parametrize("unit", ["just ", "oh so ", "Oh, that's just "])
+    def test_long_context_takes_linear_time(self, predictor: TextToIML, unit: str) -> None:
+        """The context is scored for cues too (the REST route accepts 100,000
+        characters in each field)."""
+        context = unit * (200_000 // len(unit))
+        start = time.perf_counter()
+        predictor.predict("Fine.", context=context)
+        assert time.perf_counter() - start < 5.0
+
+    def test_one_megabyte(self, predictor: TextToIML) -> None:
+        units = [
+            "just just just great. ", "Oh, that's just so really great. ", "not sure ",
+            "Well... ", "I LOVE it! ", "Are you coming?! ", "\u201cso ", "e.g. 5 p.m. ",
+        ]
+        text = "".join(units) * (1_000_000 // len("".join(units)))
+        start = time.process_time()
+        doc = predictor.predict_document(text)
+        assert time.process_time() - start < 20.0
         assert IMLParser().to_plain_text(doc) == text.strip()
 
     def test_predict_document_round_trip(self, predictor: TextToIML) -> None:

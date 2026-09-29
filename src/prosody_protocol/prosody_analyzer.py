@@ -8,10 +8,14 @@ Each recording is analysed once: the pitch track, intensity contour,
 glottal pulses and harmonicity are computed for the whole file and then
 sliced per word, so the cost grows linearly with the length of the audio.
 
-Silence is judged relative to the recording itself: a frame is silent when
-it is far below the file's speech level (or close to its noise floor), and
-frames of exact digital silence are always silent. Intensity statistics
-ignore silent frames.
+Audio is analysed as mono at no more than 16 kHz, whatever its sample rate
+and channels (see MAX_SAMPLE_RATE_HZ).
+
+Silence is judged relative to the speech around it: a frame is silent when
+it is far below the loudest voiced sound near it (or, away from speech,
+below the file's speech level; or close to the noise floor), and frames of
+exact digital silence are always silent. Intensity statistics ignore silent
+frames.
 
 Pitch is tracked in two passes (after Hirst 2011): a first pass over a wide
 range (40-800 Hz) finds the speaker's median F0, and the second searches
@@ -123,6 +127,28 @@ _EXCURSION_PADDING_S = 0.1
 # many samples each).
 MIN_SAMPLE_RATE_HZ = 4000.0
 
+# Audio is analysed as mono at no more than this rate: faster audio is
+# resampled to it as it is read (as ffmpeg decodes to it), a few seconds at a
+# time, so the memory and time an analysis takes grow with the length of the
+# audio alone, not with its sample rate or number of channels (a 29 MB FLAC
+# of ten minutes at 192 kHz stereo took 2.8 GB and four minutes). Prosody
+# lies well below its 8 kHz Nyquist frequency: F0 is tracked up to 1200 Hz,
+# and loudness, syllables, and the glottal pulses that jitter, shimmer and
+# HNR are measured on are carried by the harmonics below 5 kHz. Measured on
+# the same speech at 44.1/48 kHz and resampled: F0 within 0.1 %, intensity
+# within 0.5 dB, speech rate within 1 %, pauses unchanged; HNR 1-3 dB
+# higher where the noise above 8 kHz is removed; jitter and shimmer of most
+# words within a few tenths and a few points (more where voicing is
+# irregular). It is also the rate of speech recognisers such as Whisper.
+MAX_SAMPLE_RATE_HZ = 16_000.0
+# Such audio is read in blocks of about this many samples (all channels),
+# and no shorter than _MIN_READ_BLOCK_S; each block is resampled with
+# _RESAMPLE_PADDING_S of audio on either side, so that its edges match
+# resampling the whole file to within a few steps of 16-bit audio.
+_READ_BLOCK_SAMPLES = 1 << 20
+_MIN_READ_BLOCK_S = 1.0
+_RESAMPLE_PADDING_S = 0.05
+
 # Hop between analysis frames (pitch, intensity, silence), in seconds.
 FRAME_STEP_S = 0.01
 
@@ -130,8 +156,8 @@ FRAME_STEP_S = 0.01
 INTENSITY_MIN_PITCH_HZ = 100.0
 
 # A frame is silent when its level is more than this many dB below the
-# file's speech level (the 99th percentile of frame levels), as with the
-# silence threshold of Praat's "To TextGrid (silences)".
+# speech around it (see _AudioAnalysis.silent_frames), as with the silence
+# threshold of Praat's "To TextGrid (silences)".
 DEFAULT_SILENCE_THRESHOLD_DB = 25.0
 
 # Silent stretches shorter than this are not reported as pauses. The spec
@@ -156,14 +182,28 @@ _FFMPEG_FORMATS = (
     "ogg", "matroska", "webm", "mov", "mp4", "m4a", "3gp", "3g2", "mj2",
     "mp3", "aac", "flac", "wav", "aiff", "caf", "amr", "au", "w64",
 )
-# ffmpeg decodes to 16 kHz mono: ample for prosody, which lies well below
-# 8 kHz, and a third of the memory of 48 kHz Opus.
-_FFMPEG_SAMPLE_RATE = 16_000
+# ffmpeg decodes to mono at the analysis rate (see MAX_SAMPLE_RATE_HZ).
+_FFMPEG_SAMPLE_RATE = int(MAX_SAMPLE_RATE_HZ)
 # Decoding a whole hour of audio takes ffmpeg about ten seconds.
 _FFMPEG_TIMEOUT_S = 300.0
 
 _SPEECH_LEVEL_PERCENTILE = 99.0
 _NOISE_FLOOR_PERCENTILE = 5.0
+# The speech level around a frame is that of the loudest voiced frame within
+# this many seconds of it (a syllable or so: the vowels next to a consonant
+# or closure, or the words either side of a short pause), never above the
+# file's speech level. Voiced frames count when they are no more than the
+# silence threshold plus _VOICED_SPEECH_MARGIN_DB below the file's speech
+# level: about as far down as Praat's pitch tracker finds voicing at all
+# (its silence threshold, 3 % of the peak amplitude, lies about 30 dB down).
+# Frames with no such voicing this near are judged against the file's speech
+# level. A louder passage elsewhere in the file -- a shout, a laugh, a second
+# speaker -- then no longer turns the weak sounds of quieter speech
+# (consonants, the onsets and ends of vowels) into silence: false pauses, a
+# speech rate counted over too little speaking time, and a level measured
+# only on the loudest frames.
+_LOCAL_SPEECH_S = 0.25
+_VOICED_SPEECH_MARGIN_DB = 5.0
 # In recordings whose noise floor lies above the relative threshold, frames
 # within this many dB of the noise floor are silent too ...
 _NOISE_MARGIN_DB = 6.0
@@ -375,13 +415,63 @@ def _looks_like_mp3(path: Path) -> bool:
     )
 
 
-def _header_duration(path: Path) -> float | None:
-    """Duration (s) from the file header alone, without reading the samples;
-    ``None`` when Praat cannot open the file as a long sound."""
+def _open_long_sound(path: Path) -> tuple[object, float, float, int] | None:
+    """Open *path* as a Praat LongSound, which reads the header and leaves
+    the samples on disk: the LongSound, its duration (s), sampling
+    frequency (Hz) and number of channels. ``None`` when Praat cannot open
+    the file that way (or reads no samples from it)."""
     try:
-        return float(call(call("Open long sound file", str(path)), "Get total duration"))
+        long_sound = call("Open long sound file", str(path))
+        duration = float(call(long_sound, "Get total duration"))
+        rate = float(call(long_sound, "Get sampling frequency"))
+        # LongSound has no query for its channels; a few samples tell.
+        first = call(long_sound, "Extract part", 0.0, min(duration, 0.001), "yes")
     except parselmouth.PraatError:
         return None
+    return long_sound, duration, rate, int(first.n_channels)
+
+
+def _read_in_blocks(
+    long_sound: object, duration_s: float, rate: float, channels: int, source: str
+) -> parselmouth.Sound:
+    """Read a LongSound as a mono Sound at no more than
+    :data:`MAX_SAMPLE_RATE_HZ`, a block at a time.
+
+    Each block is checked with :func:`_check_samples` (before resampling
+    can spread a damaged sample), mixed to mono, and resampled with
+    :data:`_RESAMPLE_PADDING_S` of audio on either side; its samples are
+    then read off at their times in the whole recording. So the samples at
+    the native rate are never all in memory, and the result matches reading
+    and resampling the whole file to within a few steps of 16-bit audio.
+    (Praat's long-sound reader starts FLAC one sample late: 23 us at
+    44.1 kHz.)
+    """
+    target = min(rate, MAX_SAMPLE_RATE_HZ)
+    count = max(1, int(round(duration_s * target)))
+    out: _FloatArray = np.empty(count, dtype=np.float64)
+    step = max(_MIN_READ_BLOCK_S, _READ_BLOCK_SAMPLES / (rate * channels))
+    per_block = max(1, int(step * target))  # output samples per block
+    for first in range(0, count, per_block):
+        last = min(count, first + per_block)
+        start, end = first / target, last / target
+        part = call(
+            long_sound, "Extract part",
+            max(0.0, start - _RESAMPLE_PADDING_S), min(duration_s, end + _RESAMPLE_PADDING_S),
+            "yes",
+        )
+        _check_samples(part.values, source)
+        if part.n_channels > 1:
+            part = part.convert_to_mono()
+        if target < rate:
+            part = part.resample(target)
+        # Sample i of the result lies at (i + 0.5) / target, as in a Sound
+        # read from a file; the block's samples lie on that grid, or (at
+        # the end of the file) within half a sample of it. Interpolating
+        # between them would filter out the upper frequencies.
+        values = part.values[0]
+        index = np.rint(np.arange(first, last) + 0.5 - part.x1 * target).astype(np.int64)
+        out[first:last] = values[np.clip(index, 0, values.size - 1)]
+    return parselmouth.Sound(out, sampling_frequency=target)
 
 
 def _check_duration(path: Path, duration_s: float, max_duration_s: float | None) -> None:
@@ -405,10 +495,16 @@ def _check_sound(sound: parselmouth.Sound, source: str) -> None:
         )
     if sound.duration < MIN_AUDIO_DURATION_S:
         raise AudioProcessingError(
-            f"Audio is too short to analyse ({sound.duration * 1000:.0f} ms; at least "
+            f"Audio is too short to analyze ({sound.duration * 1000:.0f} ms; at least "
             f"{MIN_AUDIO_DURATION_S * 1000:.0f} ms is needed): {source}"
         )
-    values = sound.values
+    _check_samples(sound.values, source)
+
+
+def _check_samples(values: npt.NDArray[np.float64], source: str) -> None:
+    """Raise :class:`AudioProcessingError` when *values* (channels x
+    samples) hold samples that are not finite or are larger than
+    :data:`MAX_SAMPLE_VALUE`."""
     block = 1 << 20  # check a million samples at a time, not a copy of the whole file
     for start in range(0, values.shape[-1], block):
         samples = values[..., start:start + block]
@@ -426,16 +522,20 @@ def _check_sound(sound: parselmouth.Sound, source: str) -> None:
 
 
 def _load_sound(audio_path: str | Path, max_duration_s: float | None = None) -> parselmouth.Sound:
-    """Read *audio_path* as a mono Sound.
+    """Read *audio_path* as a mono Sound sampled at no more than
+    :data:`MAX_SAMPLE_RATE_HZ`.
 
     Any failure to read it (missing file, directory, empty or non-audio
     file, or audio longer than *max_duration_s* seconds) raises
     :class:`AudioProcessingError`. The length limit is checked from the
-    file header, or while decoding, before the whole file is loaded. A
-    truncated file, whose header promises more samples than it holds, is
-    decoded by ffmpeg, which reads just the samples that are there (Praat
-    would pad it with silence); without ffmpeg it is an error. Whether the
-    audio can be analysed is checked by :func:`_check_sound`.
+    file header, or while decoding, before the whole file is loaded. Audio
+    sampled faster than :data:`MAX_SAMPLE_RATE_HZ`, or with more than one
+    channel, is resampled and mixed to mono as it is read, a block at a
+    time (see :func:`_read_in_blocks`). A truncated file, whose header
+    promises more samples than it holds, is decoded by ffmpeg, which reads
+    just the samples that are there (Praat would pad it with silence);
+    without ffmpeg it is an error. Whether the audio can be analysed is
+    checked by :func:`_check_sound`.
     """
     path = Path(audio_path)
     if not path.exists():
@@ -452,25 +552,43 @@ def _load_sound(audio_path: str | Path, max_duration_s: float | None = None) -> 
     if mp3 and shutil.which("ffmpeg") is not None:
         sound = _decode_with_ffmpeg(path, max_duration_s=max_duration_s)
     else:
-        if max_duration_s is not None:
-            header_duration = _header_duration(path)
-            if header_duration is not None:
-                _check_duration(path, header_duration, max_duration_s)
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("error", "File too small", parselmouth.PraatWarning)
-                sound = parselmouth.Sound(str(path))
-        except parselmouth.PraatWarning:
-            # Praat would pad the missing samples with silence; ffmpeg decodes
-            # only the samples that are there.
-            sound = _decode_with_ffmpeg(path, "the file is truncated", max_duration_s)
-        except Exception as exc:  # parselmouth.PraatError for formats Praat cannot read
-            sound = _decode_with_ffmpeg(path, _praat_message(exc).rstrip("."), max_duration_s)
+        sound = _read_with_praat(path, max_duration_s)
 
     _check_duration(path, float(sound.duration), max_duration_s)
     if sound.n_channels > 1:
         sound = sound.convert_to_mono()
+    if sound.sampling_frequency > MAX_SAMPLE_RATE_HZ and sound.duration >= MIN_AUDIO_DURATION_S:
+        # Only audio that Praat reads whole but cannot open as a long sound
+        # (too short a sound is left for _check_sound to reject).
+        loaded = sound
+        sound = _run_praat("resampling", lambda: loaded.resample(MAX_SAMPLE_RATE_HZ))
     return sound
+
+
+def _read_with_praat(path: Path, max_duration_s: float | None) -> parselmouth.Sound:
+    """Read *path* with Praat (WAV, AIFF, FLAC, MP3), or with ffmpeg when
+    Praat cannot read it or finds it truncated (see :func:`_load_sound`)."""
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", "File too small", parselmouth.PraatWarning)
+            # Opening an MP3 as a long sound warns that its times can be off
+            # by tens of milliseconds, as they can when it is read whole.
+            warnings.filterwarnings("ignore", "Time measurements in MP3", parselmouth.PraatWarning)
+            opened = _open_long_sound(path)
+            if opened is not None:
+                long_sound, duration, rate, channels = opened
+                _check_duration(path, duration, max_duration_s)
+                if rate > MAX_SAMPLE_RATE_HZ or channels > 1:
+                    return _read_in_blocks(long_sound, duration, rate, channels, str(path))
+            return parselmouth.Sound(str(path))
+    except AudioProcessingError:
+        raise
+    except parselmouth.PraatWarning:
+        # Praat would pad the missing samples with silence; ffmpeg decodes
+        # only the samples that are there.
+        return _decode_with_ffmpeg(path, "the file is truncated", max_duration_s)
+    except Exception as exc:  # parselmouth.PraatError for formats Praat cannot read
+        return _decode_with_ffmpeg(path, _praat_message(exc).rstrip("."), max_duration_s)
 
 
 def _checked_max_duration(max_duration_s: float | None) -> float | None:
@@ -625,6 +743,19 @@ def _classify_quality(
     return "modal"
 
 
+def _sliding_max(values: _FloatArray, half_width: int) -> _FloatArray:
+    """The largest of *values* within *half_width* samples of each sample.
+
+    Takes one pass per offset rather than a window view, so the memory used
+    is two copies of *values* whatever the width.
+    """
+    result: _FloatArray = np.array(values, dtype=np.float64)
+    for shift in range(1, min(half_width, values.size - 1) + 1):
+        np.maximum(result[shift:], values[:-shift], out=result[shift:])
+        np.maximum(result[:-shift], values[shift:], out=result[:-shift])
+    return result
+
+
 def _mean_level(levels: _FloatArray) -> float:
     """Mean of decibel *levels*, averaged as power."""
     return float(10.0 * np.log10(np.mean(10.0 ** (levels / 10.0))))
@@ -676,12 +807,16 @@ class _AudioAnalysis:
         """Flag the silent frames of the recording.
 
         A frame is silent when it is digital silence, or when its level is
-        more than *silence_threshold_db* below the speech level (99th
-        percentile of frame levels). In noisy recordings, whose noise floor
-        (5th percentile) lies above that threshold, unvoiced frames within
-        6 dB of the floor are silent too, provided they are at least 10 dB
-        below the speech level. With *absolute_threshold_db*, frames below
-        that level (dB, Praat's intensity scale) are silent instead.
+        more than *silence_threshold_db* below the speech around it: the
+        loudest voiced frame within 0.25 s, where one lies no more than
+        *silence_threshold_db* + 5 dB below the file's speech level (99th
+        percentile of frame levels), and otherwise the file's speech level.
+        The speech around a frame is never taken to be louder than the
+        file's. In noisy recordings, whose noise floor (5th percentile)
+        lies above that threshold, unvoiced frames within 6 dB of the floor
+        are silent too, provided they are at least 10 dB below the file's
+        speech level. With *absolute_threshold_db*, frames below that level
+        (dB, Praat's intensity scale) are silent instead.
         """
         _, levels, digital_silence = self._frames
         silent: _BoolArray = digital_silence.copy()
@@ -690,7 +825,8 @@ class _AudioAnalysis:
         elif not silent.all():
             speech = float(np.percentile(levels[~silent], _SPEECH_LEVEL_PERCENTILE))
             floor = float(np.percentile(levels, _NOISE_FLOOR_PERCENTILE))
-            silent |= levels < speech - silence_threshold_db
+            around = self._speech_around(speech, silence_threshold_db)
+            silent |= levels < around - silence_threshold_db
             noise = min(floor + _NOISE_MARGIN_DB, speech - _MIN_SPEECH_MARGIN_DB)
             silent |= (levels < noise) & ~self._frame_voicing
 
@@ -700,6 +836,24 @@ class _AudioAnalysis:
             if end - start < min_frames and (start > 0 or end < len(silent)):
                 silent[start:end] = True
         return silent
+
+    def _speech_around(self, speech: float, silence_threshold_db: float) -> _FloatArray:
+        """The speech level (dB) around each frame (see :meth:`silent_frames`):
+        that of the loudest voiced frame within :data:`_LOCAL_SPEECH_S`, of
+        those no more than *silence_threshold_db* plus
+        :data:`_VOICED_SPEECH_MARGIN_DB` below the file's level *speech*,
+        and at most *speech*; *speech* where none is that near."""
+        _, levels, digital_silence = self._frames
+        speaking = (
+            self._frame_voicing
+            & ~digital_silence
+            & (levels >= speech - silence_threshold_db - _VOICED_SPEECH_MARGIN_DB)
+        )
+        nearby = _sliding_max(
+            np.where(speaking, levels, -np.inf), int(round(_LOCAL_SPEECH_S / FRAME_STEP_S))
+        )
+        around: _FloatArray = np.where(np.isfinite(nearby), np.minimum(nearby, speech), speech)
+        return around
 
     @cached_property
     def _silent(self) -> _BoolArray:
@@ -1242,13 +1396,17 @@ def detect_pauses(
 
     Returns a :class:`PauseInterval` for every silent stretch of at least
     *min_pause_ms* milliseconds, including silence at the start and end.
-    Frames more than *silence_threshold_db* below the recording's speech
-    level are silent (see :meth:`ProsodyAnalyzer.detect_pauses`). Passing
+    Frames more than *silence_threshold_db* below the speech around them
+    are silent (see :meth:`ProsodyAnalyzer.detect_pauses`). Passing
     *rms_threshold_db* uses that absolute level (dB on Praat's intensity
-    scale) as the threshold instead.
+    scale) as the threshold instead. Like audio read from a file, *sound*
+    is analysed as mono at no more than :data:`MAX_SAMPLE_RATE_HZ`.
     """
     if sound.n_channels > 1:
         sound = sound.convert_to_mono()
+    if sound.sampling_frequency > MAX_SAMPLE_RATE_HZ and sound.duration >= MIN_AUDIO_DURATION_S:
+        given = sound
+        sound = _run_praat("resampling", lambda: given.resample(MAX_SAMPLE_RATE_HZ))
     return _AudioAnalysis(sound).pauses(min_pause_ms, silence_threshold_db, rms_threshold_db)
 
 
@@ -1262,7 +1420,11 @@ class ProsodyAnalyzer:
 
     Audio is read with Praat (WAV, AIFF, FLAC, MP3); other formats such as
     OGG/Opus, WebM and M4A are decoded with ffmpeg when it is on ``PATH``
-    (as is MP3 then, which ffmpeg reads more robustly). Every failure to
+    (as is MP3 then, which ffmpeg reads more robustly). It is analysed as
+    mono at no more than 16 kHz (:data:`MAX_SAMPLE_RATE_HZ`): channels are
+    averaged, and faster audio is resampled as it is read, so the memory
+    and time an analysis takes depend on the length of the audio, not on
+    its sample rate or channels. Every failure to
     read or analyse the audio raises
     :class:`~prosody_protocol.exceptions.AudioProcessingError`, including
     audio that cannot be analysed: sampled below 4 kHz, shorter than
@@ -1351,12 +1513,16 @@ class ProsodyAnalyzer:
     ) -> list[PauseInterval]:
         """Detect silent pauses in the audio.
 
-        Silence is relative to the recording: a 10 ms frame is silent when
-        its level is more than *silence_threshold_db* below the speech level
-        (99th percentile of frame levels), or, in noisy recordings, when it
-        is unvoiced and within 6 dB of the noise floor. Exact digital
-        silence is always silent. Clicks shorter than 30 ms do not interrupt
-        a pause.
+        Silence is relative to the speech around it: a 10 ms frame is
+        silent when its level is more than *silence_threshold_db* below the
+        loudest voiced sound within 0.25 s of it -- counting voiced sound no
+        more than *silence_threshold_db* + 5 dB below the recording's speech
+        level (99th percentile of frame levels) -- or, with no such sound
+        that near, below the recording's speech level; or, in noisy
+        recordings, when it is unvoiced and within 6 dB of the noise floor.
+        So quieter speech is judged against itself, not against a shout
+        elsewhere in the file. Exact digital silence is always silent.
+        Clicks shorter than 30 ms do not interrupt a pause.
 
         Returns
         -------

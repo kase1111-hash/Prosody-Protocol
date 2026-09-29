@@ -1,22 +1,22 @@
-"""Entry point for ``python -m prosody_protocol.server``."""
+"""Entry point for ``python -m prosody_protocol.server`` (the Docker image's command).
+
+The same as ``prosody-protocol serve``: invalid options or ``PP_*``
+settings, and a missing ``api`` extra, print a one-line ``error: ...`` and
+exit with status 2.
+"""
 
 from __future__ import annotations
 
-import argparse
+import sys
+from collections.abc import Sequence
 
-from . import run
 
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the REST API; returns the exit status."""
+    from ..cli import serve_main
 
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(
-        prog="python -m prosody_protocol.server",
-        description="Run the Prosody Protocol REST API.",
-    )
-    parser.add_argument("--host", help="bind address (default: $PP_HOST or 127.0.0.1)")
-    parser.add_argument("--port", type=int, help="port (default: $PP_PORT or 8000)")
-    args = parser.parse_args(argv)
-    run(host=args.host, port=args.port)
+    return serve_main(argv, prog="python -m prosody_protocol.server")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

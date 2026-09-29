@@ -187,6 +187,20 @@ class TestProsodyMapping:
         )
         assert 'volume="+6dB"' in ssml
 
+    @pytest.mark.parametrize(
+        ("volume", "ssml_volume"),
+        [("-0dB", "+0dB"), ("-0.0dB", "+0dB"), ("+0dB", "+0dB"), ("-0.00001dB", "+0dB"),
+         ("+2.5dB", "+2.5dB"), ("-3dB", "-3dB"), ("+0.0001dB", "+0.0001dB")],
+    )
+    def test_signed_zero_volume(
+        self, converter: IMLToSSML, volume: str, ssml_volume: str
+    ) -> None:
+        """"-0dB" (valid IML) used to become volume="+-0dB", which is not SSML."""
+        ssml = converter.convert(
+            f'<utterance>I <prosody volume="{volume}">said</prosody> so.</utterance>'
+        )
+        assert f'<prosody volume="{ssml_volume}">said</prosody>' in ssml
+
     def test_rate_mapped(self, converter: IMLToSSML) -> None:
         for rate in ("fast", "slow", "medium", "150%"):
             ssml = converter.convert(

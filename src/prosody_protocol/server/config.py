@@ -6,11 +6,34 @@ import ipaddress
 import math
 import os
 from dataclasses import dataclass, field
+from typing import overload
 
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 #: The highest TCP port number.
 MAX_PORT = 65_535
+
+#: The address the server binds to when PP_HOST is unset or empty.
+DEFAULT_HOST = "127.0.0.1"
+
+#: The Whisper model the server uses when PP_STT_MODEL is unset or empty.
+DEFAULT_STT_MODEL = "base"
+
+# A JSON request may carry two text fields (text-to-iml: ``text`` and
+# ``context``; iml-to-prompt: ``iml`` and ``instruction``). JSON encoders
+# that escape non-ASCII text (Python's json.dumps does by default) write a
+# character as up to 12 bytes (a surrogate pair, \uXXXX\uXXXX).
+_JSON_TEXT_FIELDS = 2
+_JSON_BYTES_PER_CHAR = 12
+_JSON_OVERHEAD_BYTES = 64 * 1024
+
+
+def default_max_json_bytes(max_text_chars: int) -> int:
+    """The PP_MAX_JSON_BYTES default: room for two escaped text fields of *max_text_chars*.
+
+    2,465,536 bytes for the default PP_MAX_TEXT_CHARS of 100,000.
+    """
+    return _JSON_TEXT_FIELDS * _JSON_BYTES_PER_CHAR * max_text_chars + _JSON_OVERHEAD_BYTES
 
 
 @dataclass
@@ -18,12 +41,18 @@ class Settings:
     """Application settings, configurable via environment variables.
 
     Environment variables:
-        PP_HOST: Server bind address (default "127.0.0.1")
+        PP_HOST: Server bind address (default "127.0.0.1"; set but empty also
+            means the default, never "all interfaces")
         PP_PORT: Server port, 1-65535 (default 8000)
         PP_DEBUG: Enable debug mode ("1" or "true")
         PP_CORS_ORIGINS: Comma-separated allowed origins (default: none, reject cross-origin)
         PP_MAX_UPLOAD_MB: Maximum request body size in megabytes, counted on the
             bytes actually received, so chunked uploads are limited too (default 50)
+        PP_MAX_JSON_BYTES: Maximum size, in bytes, of a request body that is not
+            multipart/form-data (the JSON endpoints), enforced like PP_MAX_UPLOAD_MB
+            before the body is parsed (default: 24 * PP_MAX_TEXT_CHARS + 65536,
+            room for two text fields of PP_MAX_TEXT_CHARS characters however
+            the client escapes them; 2465536 with the default text limit)
         PP_RATE_LIMIT: Requests per minute per client (default 60, 0 = unlimited).
             ``/v1/health`` is not rate limited.
         PP_TRUSTED_PROXIES: Comma-separated IP addresses or CIDR networks of
@@ -44,22 +73,34 @@ class Settings:
         PP_MAX_AUDIO_SECONDS: Maximum duration of an audio upload; longer audio
             is rejected before it is decoded in full, since a small compressed
             file can hold hours of audio (default 600)
+        PP_JOB_TIMEOUT_S: Longest time, in seconds, a worker process may spend
+            on one audio conversion or synthesis; the worker is then stopped
+            and the request gets a 504 job_timeout (default 900, room for
+            Whisper on a CPU with PP_MAX_AUDIO_SECONDS of audio)
         PP_MAX_CONCURRENT_JOBS: Audio conversions and syntheses run at the same
             time, each in its own worker process (default 2)
         PP_MAX_QUEUED_JOBS: Audio conversions and syntheses that may wait for a
             free worker; further requests are refused with 503 (default 8)
+        PP_STT_MODEL: The Whisper model audio-to-iml transcribes with, when the
+            server has the whisper extra and a request has neither ``words``
+            nor ``transcript``: a model name ("tiny", "small", "large-v3", ...)
+            or the path of a model checkpoint (default "base")
 
     Invalid values, from the environment or passed directly, raise
     :class:`ValueError` naming the setting and its variable.
     """
 
-    host: str = field(default_factory=lambda: os.getenv("PP_HOST", "127.0.0.1"))
+    host: str = field(default_factory=lambda: os.getenv("PP_HOST", "").strip() or DEFAULT_HOST)
     port: int = field(default_factory=lambda: _env_int("PP_PORT", 8000))
     debug: bool = field(
         default_factory=lambda: os.getenv("PP_DEBUG", "").lower() in ("1", "true")
     )
     cors_origins: list[str] = field(default_factory=lambda: _parse_cors())
     max_upload_size_mb: int = field(default_factory=lambda: _env_int("PP_MAX_UPLOAD_MB", 50))
+    #: ``None`` (PP_MAX_JSON_BYTES unset) is replaced by :func:`default_max_json_bytes`.
+    max_json_bytes: int | None = field(
+        default_factory=lambda: _env_int("PP_MAX_JSON_BYTES", None)
+    )
     rate_limit_per_minute: int = field(default_factory=lambda: _env_int("PP_RATE_LIMIT", 60))
     trusted_proxies: list[str] = field(default_factory=lambda: _env_list("PP_TRUSTED_PROXIES"))
     max_text_chars: int = field(default_factory=lambda: _env_int("PP_MAX_TEXT_CHARS", 100_000))
@@ -74,15 +115,32 @@ class Settings:
         default_factory=lambda: _env_float("PP_MAX_AUDIO_SECONDS", 600.0)
     )
     max_queued_jobs: int = field(default_factory=lambda: _env_int("PP_MAX_QUEUED_JOBS", 8))
+    job_timeout_s: float = field(default_factory=lambda: _env_float("PP_JOB_TIMEOUT_S", 900.0))
+    stt_model: str = field(
+        default_factory=lambda: os.getenv("PP_STT_MODEL", "").strip() or DEFAULT_STT_MODEL
+    )
 
     def __post_init__(self) -> None:
         # Fail at startup, not on the first request that needs the value.
+        for name, variable in (("host", "PP_HOST"), ("stt_model", "PP_STT_MODEL")):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(
+                    f"{name} ({variable}) must be a string, got {getattr(self, name)!r}"
+                )
+        # Empty means the default, as for every PP_* variable. For the host
+        # that matters: uvicorn binds every interface to an empty address.
+        self.host = self.host.strip() or DEFAULT_HOST
+        self.stt_model = self.stt_model.strip() or DEFAULT_STT_MODEL
         for name, (variable, minimum) in _INT_SETTINGS.items():
             value = getattr(self, name)
+            if name == "max_json_bytes" and value is None:
+                continue  # derived below, from the checked max_text_chars
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
                 raise ValueError(
                     f"{name} ({variable}) must be an integer >= {minimum}, got {value!r}"
                 )
+        if self.max_json_bytes is None:
+            self.max_json_bytes = default_max_json_bytes(self.max_text_chars)
         if self.port > MAX_PORT:
             raise ValueError(f"port (PP_PORT) must be at most {MAX_PORT}, got {self.port!r}")
         for name, variable in _DURATION_SETTINGS.items():
@@ -96,6 +154,16 @@ class Settings:
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_size_mb * 1024 * 1024
+
+    @property
+    def json_body_limit(self) -> int:
+        """The largest body of a request that is not multipart/form-data, in bytes.
+
+        ``max_json_bytes``, and never more than ``max_upload_bytes``, which
+        limits every request.
+        """
+        assert self.max_json_bytes is not None  # set by __post_init__
+        return min(self.max_json_bytes, self.max_upload_bytes)
 
     def trusted_proxy_networks(self) -> tuple[IPNetwork, ...]:
         """``trusted_proxies`` parsed as networks (a bare address is a /32 or /128)."""
@@ -115,6 +183,7 @@ class Settings:
 _INT_SETTINGS: dict[str, tuple[str, int]] = {
     "port": ("PP_PORT", 1),
     "max_upload_size_mb": ("PP_MAX_UPLOAD_MB", 1),
+    "max_json_bytes": ("PP_MAX_JSON_BYTES", 1),
     "rate_limit_per_minute": ("PP_RATE_LIMIT", 0),
     "max_text_chars": ("PP_MAX_TEXT_CHARS", 1),
     "max_words_chars": ("PP_MAX_WORDS_CHARS", 1),
@@ -124,10 +193,19 @@ _INT_SETTINGS: dict[str, tuple[str, int]] = {
 _DURATION_SETTINGS: dict[str, str] = {
     "max_synth_seconds": "PP_MAX_SYNTH_SECONDS",
     "max_audio_seconds": "PP_MAX_AUDIO_SECONDS",
+    "job_timeout_s": "PP_JOB_TIMEOUT_S",
 }
 
 
-def _env_int(name: str, default: int) -> int:
+@overload
+def _env_int(name: str, default: int) -> int: ...
+
+
+@overload
+def _env_int(name: str, default: None) -> int | None: ...
+
+
+def _env_int(name: str, default: int | None) -> int | None:
     raw = os.getenv(name, "").strip()
     if not raw:
         return default

@@ -37,7 +37,7 @@
     "language": {
       "type": "string",
       "description": "BCP-47 language tag.",
-      "pattern": "^[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)*$"
+      "pattern": "^[A-Za-z]{1,8}(-[A-Za-z0-9]{1,8})*$"
     },
     "audio_file": {
       "type": "string",

@@ -37,11 +37,13 @@ import math
 import random
 import re
 import warnings
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import cast
 
+from ._types import is_language_tag
 from .exceptions import DatasetError
 from .validator import IMLValidator, ValidationIssue, ValidationResult
 
@@ -54,7 +56,6 @@ _VALID_ANNOTATORS = frozenset({"human", "model", "hybrid"})
 _ISO_8601_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
 )
-_BCP47_RE = re.compile(r"[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)*")
 
 _REQUIRED_STR_FIELDS = (
     "id", "timestamp", "source", "language", "audio_file",
@@ -195,10 +196,7 @@ class DatasetLoader:
         meta: dict[str, object] = {}
         meta_file = path / "metadata.json"
         if meta_file.exists():
-            try:
-                loaded = json.loads(meta_file.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-                raise DatasetError(f"Cannot read metadata.json: {exc}") from exc
+            loaded = _read_json(meta_file, "metadata.json")
             if not isinstance(loaded, dict):
                 raise DatasetError("metadata.json must contain a JSON object")
             meta = loaded
@@ -348,7 +346,7 @@ class DatasetLoader:
 
         # language BCP-47 format.
         language = entry.get("language", "")
-        if isinstance(language, str) and language and not _BCP47_RE.fullmatch(language):
+        if isinstance(language, str) and language and not is_language_tag(language):
             issues.append(ValidationIssue(
                 severity="error",
                 rule="D6",
@@ -430,6 +428,7 @@ class DatasetLoader:
         seed: int = 42,
         *,
         group_by: str | None = "speaker_id",
+        stratify_by: str | None = None,
     ) -> tuple[list[DatasetEntry], list[DatasetEntry], list[DatasetEntry]]:
         """Split dataset entries into train/val/test sets.
 
@@ -450,6 +449,25 @@ class DatasetLoader:
         entries are split individually and a :class:`UserWarning` says so.
         ``group_by=None`` always splits entries individually.
 
+        With *stratify_by* (e.g. ``"emotion_label"``), each value of that
+        field is split by the ratios on its own, by the same rounding: a
+        label with at least as many entries as there are splits to fill
+        (three at 0.8/0.1/0.1) has at least one entry in each, so a rare
+        emotion is not left out of val or test. The overall sizes are the
+        sums of the per-label sizes, so they can differ a little from the
+        ratios (much when there are many rare labels). With *group_by*
+        whole groups are still kept together: each split first gets the
+        smallest group holding each value it lacks, and the other groups go
+        where their values are still missing. Sizes then follow the ratios
+        less closely than without stratification, especially with few
+        groups (a split cannot be smaller than the group it needs).
+
+        After splitting, a :class:`UserWarning` names the values of
+        *stratify_by* (without it, of ``emotion_label``) that are in the
+        training split but missing from a non-empty val or test split,
+        among those spread over enough entries (or groups) to be in every
+        split.
+
         Returns (train_entries, val_entries, test_entries).
         """
         ratios = (train, val, test)
@@ -468,6 +486,11 @@ class DatasetLoader:
             raise DatasetError(
                 f"Cannot group by '{group_by}'; expected one of {sorted(_GROUPABLE_FIELDS)}"
             )
+        if stratify_by is not None and stratify_by not in _GROUPABLE_FIELDS:
+            raise DatasetError(
+                f"Cannot stratify by '{stratify_by}'; expected one of "
+                f"{sorted(_GROUPABLE_FIELDS)}"
+            )
 
         entries = list(dataset.entries)
         wanted = sum(1 for ratio in ratios if ratio > 0)
@@ -485,8 +508,11 @@ class DatasetLoader:
 
         rng = random.Random(seed)
         rng.shuffle(groups)
-        targets = _split_sizes(len(entries), ratios)
-        parts = _assign_groups(groups, targets, ratios)
+        if stratify_by is None:
+            parts = _assign_groups(groups, _split_sizes(len(entries), ratios), ratios)
+        else:
+            parts = _assign_stratified(groups, ratios, stratify_by)
+        _warn_missing_values(parts, stratify_by or "emotion_label", stratify_by is None)
         train_set, val_set, test_set = ([e for g in part for e in g] for part in parts)
         return (train_set, val_set, test_set)
 
@@ -494,12 +520,7 @@ class DatasetLoader:
 
     @staticmethod
     def _read_entry(entry_file: Path) -> object:
-        try:
-            return json.loads(entry_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-            raise DatasetError(
-                f"Cannot read entry {entry_file.name}: {exc}"
-            ) from exc
+        return _read_json(entry_file, f"entry {entry_file.name}")
 
     def _check_entry(
         self,
@@ -554,6 +575,19 @@ class DatasetLoader:
             speaker_id=speaker_id if isinstance(speaker_id, str) else None,
             metadata=metadata if isinstance(metadata, dict) else {},
         )
+
+
+def _read_json(path: Path, what: str) -> object:
+    """The parsed JSON of *path*.
+
+    Raises DatasetError naming *what* when the file cannot be read, is not
+    UTF-8, or is not JSON -- including JSON nested too deeply to parse
+    (RecursionError) and integers too long to convert (ValueError).
+    """
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as exc:  # JSONDecodeError, UnicodeDecodeError
+        raise DatasetError(f"Cannot read {what}: {exc}") from exc
 
 
 def _describe(filename: str, issues: list[ValidationIssue]) -> list[str]:
@@ -629,6 +663,20 @@ def _assign_groups(
             placed[i].append(g)
             counts[i] += len(groups[g])
 
+    _fill_empty_splits(groups, placed, counts, targets, splits)
+    return [[groups[g] for g in sorted(part)] for part in placed]
+
+
+def _fill_empty_splits(
+    groups: list[list[DatasetEntry]],
+    placed: list[list[int]],
+    counts: list[int],
+    targets: list[int],
+    splits: list[int],
+) -> None:
+    """Give each split in *splits* that received nothing the smallest group
+    of the split that most exceeds its target (among splits holding at
+    least two groups)."""
     for i in splits:
         if placed[i]:
             continue
@@ -641,4 +689,114 @@ def _assign_groups(
         counts[donor] -= len(groups[smallest])
         placed[i].append(smallest)
         counts[i] += len(groups[smallest])
+
+
+def _assign_stratified(
+    groups: list[list[DatasetEntry]],
+    ratios: tuple[float, float, float],
+    field_name: str,
+) -> list[list[list[DatasetEntry]]]:
+    """Place whole groups so that each value of *field_name* is split by the ratios.
+
+    Every value's target sizes are :func:`_split_sizes` of its own count.
+    First, from the rarest value to the most common, each split meant to
+    hold a value (smallest split first) that has none of it yet receives the
+    smallest unplaced group holding it, so that a rare value reaches val and
+    test while their sizes stay small. Then the other groups (rarest values
+    first, larger groups first among equals, then in shuffled order) go
+    where they fit best: +1 for each entry whose value the split still lacks
+    (up to its target there) and -1 for each entry beyond that, weighted by
+    the value's rarity (``1 / count``), minus the fraction by which the
+    split would exceed its overall size; ties go to the split furthest below
+    its overall target, then to the earlier split. With one entry per group
+    every value meets its targets exactly. Afterwards an empty split with a
+    non-zero ratio takes a group as in :func:`_assign_groups`. Each split
+    keeps its groups in shuffled order.
+    """
+    values = [Counter(getattr(entry, field_name) for entry in group) for group in groups]
+    totals: Counter[object] = Counter()
+    for counter in values:
+        totals.update(counter)
+    value_targets = {value: _split_sizes(n, ratios) for value, n in totals.items()}
+    targets = [sum(sizes[k] for sizes in value_targets.values()) for k in range(3)]
+    value_counts = {value: [0, 0, 0] for value in totals}
+
+    placed: list[list[int]] = [[], [], []]
+    counts = [0, 0, 0]
+    splits = [k for k in range(3) if ratios[k] > 0]
+    unplaced = set(range(len(groups)))
+
+    def put(g: int, i: int) -> None:
+        placed[i].append(g)
+        counts[i] += len(groups[g])
+        unplaced.discard(g)
+        for value, n in values[g].items():
+            value_counts[value][i] += n
+
+    def rarest(g: int) -> int:
+        return min(totals[value] for value in values[g])
+
+    # 1. One group of each value into each split meant to have it.
+    holders: dict[object, list[int]] = {value: [] for value in totals}
+    for g, counter in enumerate(values):
+        for value in counter:
+            holders[value].append(g)
+    for value in sorted(totals, key=lambda v: (totals[v], repr(v))):
+        wanted = [k for k in splits if value_targets[value][k] > 0]
+        if len(holders[value]) < len(wanted):
+            continue  # it cannot be everywhere; step 2 places it
+        for k in sorted(wanted, key=lambda k: (targets[k], k)):
+            available = [g for g in holders[value] if g in unplaced]
+            if value_counts[value][k] == 0 and available:
+                put(min(available, key=lambda g: len(groups[g])), k)
+
+    # 2. The rest where they fit best.
+    def fit(g: int, k: int) -> float:
+        score = 0.0
+        for value, n in values[g].items():
+            fill = min(n, max(0, value_targets[value][k] - value_counts[value][k]))
+            score += (fill - (n - fill)) / totals[value]
+        # How far past its overall size the split would grow, as a fraction.
+        return score - max(0, counts[k] + len(groups[g]) - targets[k]) / max(targets[k], 1)
+
+    for g in sorted(unplaced, key=lambda g: (rarest(g), -len(groups[g]), g)):
+        put(g, max(splits, key=lambda k: (fit(g, k), targets[k] - counts[k], -k)))
+
+    _fill_empty_splits(groups, placed, counts, targets, splits)
     return [[groups[g] for g in sorted(part)] for part in placed]
+
+
+def _warn_missing_values(
+    parts: list[list[list[DatasetEntry]]], field_name: str, suggest: bool
+) -> None:
+    """Warn about values of *field_name* that are in the training split but
+    not in a non-empty val or test split, among those held by at least as
+    many groups as there are non-empty splits (so they could be in each)."""
+    filled = [part for part in parts if part]
+    groups_with: Counter[object] = Counter()
+    for part in parts:
+        for group in part:
+            groups_with.update({getattr(entry, field_name) for entry in group})
+    in_train = {getattr(entry, field_name) for group in parts[0] for entry in group}
+    problems: list[str] = []
+    for name, part in zip(("val", "test"), parts[1:], strict=True):
+        if not part:
+            continue
+        present = {getattr(entry, field_name) for group in part for entry in group}
+        missing = sorted(
+            repr(value) for value in in_train - present if groups_with[value] >= len(filled)
+        )
+        if missing:
+            problems.append(f"{name} lacks {', '.join(missing)}")
+    if problems:
+        hint = (
+            f"; pass stratify_by={field_name!r} to spread each value over the splits"
+            if suggest
+            else "; their entries' groups could not be spread further"
+        )
+        warnings.warn(
+            f"Some {field_name} values are in the training split but not in every "
+            f"evaluation split: {'; '.join(problems)}{hint}",
+            UserWarning,
+            stacklevel=3,
+        )

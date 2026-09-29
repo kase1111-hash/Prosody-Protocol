@@ -367,9 +367,10 @@ class TestAcceptanceCriteria:
         assert not (tmp_path / "export" / "model.joblib").exists()
 
         classifier = TrainedEmotionClassifier(tmp_path / "export")
-        label, confidence = classifier.classify([_span(f0=250.0, intensity=85.0)])
+        span = recording_features(emotion_dataset / "audio" / "angry_00.wav")
+        label, confidence = classifier.classify([span])
         assert label in _EMOTIONS
-        assert 0.0 <= confidence <= 1.0
+        assert 0.0 < confidence <= 1.0
 
     def test_configs_are_yaml_no_hardcoded_hyperparams(self, recwarn):
         """AC4: Configs are YAML, valid, and use only keys the pipeline honours."""
@@ -1266,6 +1267,51 @@ class TestPortableExport:
         with pytest.raises(FileNotFoundError, match=r"model\.joblib"):
             BaseModel.load(tmp_path)
 
+    @pytest.mark.parametrize("model_class", [SERModel, TextProsodyModel, PitchContourModel])
+    def test_exports_record_training_feature_stats(self, model_class):
+        X = np.array([[100.0, 1.0, 5.0], [120.0, np.nan, 5.0], [140.0, 3.0, 5.0]])
+        model = model_class(feature_names=["f0_mean", "jitter", "hnr"])
+        model.train(X, np.array(["a", "b", "a"]))
+        params = model.portable_params()
+        stats = params["feature_stats"]
+        np.testing.assert_allclose(stats["mean"], [120.0, 2.0, 5.0])
+        # NaN (unmeasured) values are left out; a constant feature has no spread.
+        np.testing.assert_allclose(stats["std"], [np.std([100.0, 120.0, 140.0]), 1.0, 0.0])
+        portable = PortableModel(params)
+        assert portable.has_feature_stats
+        z = portable.feature_z_scores([[160.0, np.nan, 50.0]])[0]
+        assert z[0] == pytest.approx(40.0 / np.std([100.0, 120.0, 140.0]))
+        assert np.isnan(z[1]) and np.isnan(z[2])
+
+    def test_older_exports_fall_back_to_the_scaler(self):
+        model = SERModel(feature_names=["f0_mean", "jitter"])
+        model.train(np.array([[100.0, 1.0], [140.0, 3.0]]), np.array(["a", "b"]))
+        params = model.portable_params()
+        del params["feature_stats"]
+        portable = PortableModel(params)
+        assert portable.has_feature_stats
+        np.testing.assert_allclose(portable.feature_z_scores([[180.0, 2.0]])[0], [3.0, 0.0])
+
+    def test_models_without_statistics_check_nothing(self):
+        model = TextProsodyModel(feature_names=["f0_mean"])
+        model.train(np.array([[1.0], [5.0]]), np.array(["a", "b"]))
+        params = model.portable_params()
+        del params["feature_stats"]
+        portable = PortableModel(params)
+        assert not portable.has_feature_stats
+        assert np.isnan(portable.feature_z_scores([[1000.0]])).all()
+
+    @pytest.mark.parametrize(
+        "stats",
+        [[1.0], {"mean": [1.0, 2.0]}, {"mean": [1.0], "std": [1.0]},
+         {"mean": [1.0, 2.0], "std": [1.0, -1.0]}],
+    )
+    def test_malformed_feature_stats_raise(self, stats):
+        model = SERModel(feature_names=["f0_mean", "jitter"])
+        model.train(np.array([[100.0, 1.0], [140.0, 3.0]]), np.array(["a", "b"]))
+        with pytest.raises(ValueError, match="feature_stats"):
+            PortableModel({**model.portable_params(), "feature_stats": stats})
+
 
 # ---------------------------------------------------------------------------
 # Using a trained model from the SDK
@@ -1341,6 +1387,46 @@ class TestTrainedEmotionClassifier:
         with pytest.raises(ValueError, match="not trained on SER features"):
             TrainedEmotionClassifier(tmp_path)
 
+    @pytest.mark.parametrize("tone", ["tone_gap_tone.wav", "tone_440hz.wav", "rising_pitch.wav"])
+    def test_abstains_on_input_unlike_the_training_data(self, export_dir, tone):
+        """Sine tones used to be labeled with near certainty (joyful 0.99)."""
+        from training.inference import TrainedEmotionClassifier
+
+        span = recording_features(FIXTURES / "audio" / tone)
+        classifier = TrainedEmotionClassifier(export_dir)
+        unusual = classifier.unusual_features([span])
+        assert unusual and all(abs(z) > 4.0 for z in unusual.values())
+        assert classifier.classify([span]) == ("neutral", 0.0)
+        # The check can be turned off, which gives the model's raw answer.
+        label, confidence = TrainedEmotionClassifier(export_dir, max_feature_z=None).classify(
+            [span]
+        )
+        assert label in _EMOTIONS and confidence > 0.0
+
+    def test_audio_to_iml_leaves_out_emotion_for_non_speech(self, export_dir):
+        from prosody_protocol import AudioToIML, IMLParser
+        from training.inference import TrainedEmotionClassifier
+
+        converter = AudioToIML(emotion_classifier=TrainedEmotionClassifier(export_dir))
+        iml = converter.convert(FIXTURES / "audio" / "tone_gap_tone.wav", transcript="Hello there")
+        utterance = IMLParser().parse(iml).utterances[0]
+        assert utterance.emotion is None and utterance.confidence is None
+
+    def test_in_distribution_input_is_not_unusual(self, export_dir, emotion_heldout):
+        from training.inference import TrainedEmotionClassifier
+
+        classifier = TrainedEmotionClassifier(export_dir)
+        for label in _EMOTIONS:
+            span = recording_features(emotion_heldout / "audio" / f"{label}_00.wav")
+            assert classifier.unusual_features([span]) == {}
+
+    @pytest.mark.parametrize("value", [0, -1.0, float("inf"), float("nan"), True, "4"])
+    def test_invalid_max_feature_z(self, export_dir, value):
+        from training.inference import TrainedEmotionClassifier
+
+        with pytest.raises(ValueError, match="max_feature_z"):
+            TrainedEmotionClassifier(export_dir, max_feature_z=value)
+
 
 # ---------------------------------------------------------------------------
 # Command line
@@ -1393,6 +1479,35 @@ class TestCommandLine:
         assert result.returncode == 1
         assert result.stderr.startswith("Error: Unknown model type 'wav2vec2'")
         assert "Traceback" not in result.stderr
+
+    def test_malformed_yaml_is_a_one_line_error(self, tmp_path, emotion_dataset):
+        """A YAML syntax error used to print a traceback."""
+        config = tmp_path / "bad.yaml"
+        config.write_text("task: [unclosed\n", encoding="utf-8")
+        result = _run_script(
+            "train.py", "--config", str(config), "--dataset", str(emotion_dataset),
+            "--output", str(tmp_path / "ckpt"),
+        )
+        assert result.returncode == 1
+        assert result.stderr.startswith(f"Error: {config} is not valid YAML: ")
+        assert "(line 2, column 1)" in result.stderr
+        assert result.stderr.count("\n") == 1, result.stderr
+
+    def test_malformed_checkpoint_config_is_a_one_line_error(self, tmp_path, emotion_dataset):
+        """evaluate.py and export.py read the checkpoint's copy of the config."""
+        from training.scripts.train import train
+
+        ckpt = tmp_path / "ckpt"
+        train(config_path=SER_CONFIG, dataset_dir=emotion_dataset, output_dir=ckpt)
+        (ckpt / "config.yaml").write_text("task: [unclosed\n", encoding="utf-8")
+        for script, *args in [
+            ("evaluate.py", "--checkpoint", str(ckpt), "--dataset", str(emotion_dataset)),
+            ("export.py", "--checkpoint", str(ckpt), "--output", str(tmp_path / "export")),
+        ]:
+            result = _run_script(script, *args)
+            assert result.returncode == 1, script
+            assert result.stderr.startswith("Error: "), (script, result.stderr)
+            assert "is not valid YAML" in result.stderr and "Traceback" not in result.stderr
 
 
 # ---------------------------------------------------------------------------

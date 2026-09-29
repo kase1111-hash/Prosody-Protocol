@@ -15,7 +15,7 @@ command line and a REST API that measure prosody in recordings, write and
 validate IML, and hand it to language models and speech synthesizers.
 
 **Status: alpha (0.1.0a3).** The specification is a draft (0.1.0-alpha).
-The SDK works end to end on the shipped examples and has about 2,500 tests,
+The SDK works end to end on the shipped examples and has about 3,000 tests,
 but it is not on PyPI yet, its emotion labels come from a rule-based
 heuristic, and its audio analysis has been validated on synthetic
 (espeak-ng) speech only. See [What is real and what is heuristic](#what-is-real-and-what-is-heuristic).
@@ -115,17 +115,16 @@ prosody-protocol 0.1.0a3 (Python 3.11.15)
           enables: from-audio, benchmark, synthesize
 [missing] speech recognition (openai-whisper)
           enables: from-audio transcribes audio given without --words or --transcript (otherwise each stretch of speech is a [speech] placeholder)
-          install: pip install 'prosody-protocol[whisper]' (pulls in PyTorch)
+          install: pip install "prosody-protocol[whisper] @ git+https://github.com/kase1111-hash/Prosody-Protocol" (pulls in PyTorch)
 [ok     ] speech synthesis (espeak-ng at /usr/bin/espeak-ng)
           enables: synthesize speaks IML (otherwise it renders a tone preview, not speech)
 ...
 ```
 
-The install hints that `doctor` and error messages print
-(`pip install 'prosody-protocol[whisper]'`) assume a PyPI release. Until
-there is one, add an extra with `pip install -e ".[whisper]"` in a clone,
-or with the `git+https` command above. Where the `prosody-protocol` script
-is not on your `PATH`, `python -m prosody_protocol` runs the same command.
+(Trimmed; the full list also covers ffmpeg, the REST API and the training
+baselines.) In a clone, `pip install -e ".[whisper]"` adds an extra as well.
+Where the `prosody-protocol` script is not on your `PATH`,
+`python -m prosody_protocol` runs the same command.
 
 ---
 
@@ -142,21 +141,30 @@ prosody-protocol from-audio examples/speech.wav --words examples/speech.whisper.
 ```
 
 ```xml
-<iml version="0.1.0"><utterance>I never said<pause duration="660"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
+<iml version="0.1.0"><utterance>I never said<pause duration="610"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
 ```
 
 The SDK measured the recording with Praat, found the stressed word and the
-pause, and wrote them as IML. It wrote no `emotion`: one sentence without a
-recording of the speaker's normal voice gives it nothing to compare with,
-and it leaves the label out rather than guess. For a language model, ask
-for the annotated transcript instead:
+pause (610 ms; the gap in the recording is 600 ms), and wrote them as IML.
+It wrote no `emotion` and no overall pitch or loudness for the sentence,
+and says why on standard error:
+
+```text
+warning: No speaker baseline: a single utterance without calibration_audio has nothing to compare its pitch, loudness and rate with, so they were not marked, and no emotion was estimated from them. Pass calibration_audio (recordings of the speaker's usual speech, such as their earlier turns) to assess them.
+```
+
+One sentence gives it nothing to compare the speaker's voice with, so it
+leaves those out rather than guess. `--calibration` (in Python,
+`calibration_audio=`, which also takes several recordings, such as the
+user's earlier turns) supplies the speaker's usual voice. For a language
+model, ask for the annotated transcript instead:
 
 ```bash
 prosody-protocol from-audio examples/speech.wav --words examples/speech.whisper.json --prompt
 ```
 
 ```text
-I never said [pause 0.7s] she **stole** (much higher pitch, falling) my money (falling).
+I never said [pause 0.6s] she **stole** (much higher pitch, falling) my money.
 ```
 
 The same in Python:
@@ -171,9 +179,12 @@ print(to_llm_context(result.document))
 ```
 
 ```text
-<iml version="0.1.0" language="en-US"><utterance>I never said<pause duration="660"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
-I never said [pause 0.7s] she **stole** (much higher pitch, falling) my money (falling).
+<iml version="0.1.0" language="en-US"><utterance>I never said<pause duration="610"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
+I never said [pause 0.6s] she **stole** (much higher pitch, falling) my money.
 ```
+
+`result.warnings` holds the same "No speaker baseline" note, and
+`convert()` issues it as a `UserWarning`.
 
 **Where the words come from.** The SDK measures *how* words were said; it
 needs to know *which* words and when. You have three options:
@@ -183,9 +194,13 @@ needs to know *which* words and when. You have three options:
   the OpenAI transcription API (`verbose_json`), Deepgram, AssemblyAI,
   Google Cloud Speech-to-Text, or a list of `{word, start_ms, end_ms}`
   records, and detects which it is. This is the recommended path: no model
-  download, and you keep the recognizer you already use.
-- **A transcript without timings** (`transcript=`, `--transcript`). Prosody
-  is then measured for the utterance as a whole.
+  download, and you keep the recognizer you already use. Speaker labels
+  from diarization are kept: each speaker's words become their own
+  utterances (`speaker_id`), measured against that speaker's voice.
+- **A transcript without timings** (`transcript=`, `--transcript`). Nothing
+  says where each word is, so no pauses, stresses or word-level pitch are
+  placed; the utterance's overall delivery is measured only against
+  calibration audio. Without calibration this adds little beyond the text.
 - **Built-in Whisper**, with the `whisper` extra. Without it and without
   words or a transcript, each stretch of speech becomes a `[speech]`
   placeholder and the result says so in its warnings.
@@ -219,7 +234,7 @@ An IML document is one `<utterance>`, or several wrapped in `<iml>`:
 |---------|------------|-------|
 | `<iml>` | `version`, `language` (BCP 47), `consent` (`explicit`, `implicit`, `none`), `processing` (`local`, `remote`, `hybrid`) | Optional wrapper; contains only utterances |
 | `<utterance>` | `emotion`, `confidence` (0.0-1.0, required with `emotion`), `speaker_id` | One spoken phrase or sentence |
-| `<prosody>` | `pitch` (`+15%`, `-2st`, `185Hz`), `pitch_contour` (`rise`, `fall`, `rise-fall`, `fall-rise`, `rise-sharp`, `fall-sharp`, `flat`), `volume` (`+6dB`), `rate` (`fast`, `medium`, `slow` or `150%`), `quality` (`modal`, `breathy`, `tense`, `creaky`, `whispery`, `harsh`) | Relative values are against the speaker's baseline |
+| `<prosody>` | `pitch` (`+15%`, `-2st`, `185Hz`), `pitch_contour` (`rise`, `fall`, `rise-fall`, `fall-rise`, `rise-sharp`, `fall-sharp`, `flat`), `volume` (`+6dB`), `rate` (`fast`, `medium`, `slow` or `150%`), `quality` (`modal`, `breathy`, `tense`, `creaky`, `whispery`, `harsh`) | Relative values are against the speaker's baseline; inside another `<prosody>`, against that one's level (spec 3.2) |
 | `<pause>` | `duration` (whole milliseconds, required) | Always empty: `<pause duration="800"/>` |
 | `<emphasis>` | `level` (`strong`, `moderate`, `reduced`; required) | Not directly inside another `<emphasis>` |
 | `<segment>` | `tempo` (`rushed`, `steady`, `drawn-out`), `rhythm` (`staccato`, `legato`, `syncopated`) | Only as a direct child of `<utterance>` |
@@ -421,9 +436,11 @@ Delivery: sounds calm (estimated, 61%; interpreted with the speaker's prosody pr
 Delivery: sounds calm (estimated, 62%; interpreted with the speaker's prosody profile).
 [pause 0.3s] I have the slides.
 Delivery: sounds calm (estimated, 61%; interpreted with the speaker's prosody profile).
-[pause 0.3s] And we got the grant!
-Delivery: overall much faster; sounds joyful (estimated, 60%; interpreted with the speaker's prosody profile).
+And we got the grant!
+Delivery: overall much faster; sounds joyful (estimated, 61%; interpreted with the speaker's prosody profile).
 ```
+
+(The last pause measures 290 ms; the transcript marks pauses from 300 ms.)
 
 Without the profile the same recording gets no emotion at all: the
 heuristic's best guess for every sentence is "neutral" below 0.5
@@ -473,7 +490,11 @@ A dataset is a directory with `metadata.json`, `entries/*.json` (see
 [schemas/dataset-entry.schema.json](schemas/dataset-entry.schema.json)) and
 `audio/`. `DatasetLoader` validates every entry when it loads it and never
 loads one without `"consent": true`. `Benchmark` scores any converter with a
-`convert(audio_path) -> str` method against a dataset:
+`convert(audio_path) -> str` method against a dataset. When `convert`
+takes them, as `AudioToIML`'s does, it gives the converter each entry's
+word timings (`metadata.word_timings`, in any format `load_word_timings`
+reads); for an entry without them, it lets the converter's Whisper find the
+words if installed, or else passes the transcript:
 
 ```python
 import json
@@ -481,7 +502,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from prosody_protocol import AudioToIML, Benchmark, DatasetLoader, load_word_timings
+from prosody_protocol import AudioToIML, Benchmark, DatasetLoader
 
 root = Path(tempfile.mkdtemp()) / "demo"
 (root / "entries").mkdir(parents=True)
@@ -499,30 +520,28 @@ entry = {
     "emotion_label": "neutral",
     "annotator": "human",
     "consent": True,
+    "metadata": {"word_timings": json.loads(Path("examples/speech.whisper.json").read_text(encoding="utf-8"))},
 }
 (root / "entries" / "speech_001.json").write_text(json.dumps(entry), encoding="utf-8")
 dataset = DatasetLoader().load(root, check_audio=True)
 
-
-class WithWords:
-    """A converter that uses known word timings instead of speech recognition."""
-
-    def convert(self, audio_path):
-        words = load_word_timings("examples/speech.whisper.json")
-        return AudioToIML().convert(audio_path, words=words)
-
-
-report = Benchmark(dataset, WithWords()).run()
-print(report.pause_f1, report.validity_rate, report.failure_rate)
+report = Benchmark(dataset, AudioToIML()).run()
+print(report.word_sources, report.pause_f1, report.validity_rate, report.failure_rate)
+print(report.emotion_accuracy, report.emotion_coverage)
 ```
 
 ```text
-1.0 1.0 0.0
+{'timings': 1, 'transcript': 0, 'stt': 0} 1.0 1.0 0.0
+None 0.0
 ```
 
-`prosody-protocol benchmark DATASET_DIR` runs the default `AudioToIML`
-(which needs the `whisper` extra to get real words from the audio) and
-exits 1 on failed conversions or on regressions against a saved report. [datasets/README.md](datasets/README.md) describes the
+An output without an emotion is an abstention: `emotion_accuracy` is
+measured over the entries that got one (here none, so `None`) and
+`emotion_coverage` says how many did; `abstention_label="neutral"` scores
+abstentions as "neutral" instead. `prosody-protocol benchmark DATASET_DIR`
+runs the default `AudioToIML` the same way (`--words-from`,
+`--abstention-label`) and exits 1 on failed conversions or on regressions
+against a saved report. [datasets/README.md](datasets/README.md) describes the
 format; `MavisBridge` exports sessions of the
 [Mavis](https://github.com/kase1111-hash/Mavis) vocal typing instrument as
 datasets. [training/README.md](training/README.md) trains three
@@ -550,7 +569,7 @@ ffmpeg. Interactive OpenAPI docs are at `/docs`.
 |----------|------|
 | `GET /v1/health` | Version, optional backends found (whisper, espeak-ng, ffmpeg) and limits |
 | `POST /v1/validate` | Validate IML: `{"iml": ...}` returns `{valid, issues}` |
-| `POST /v1/convert/audio-to-iml` | Multipart: `audio`, and optionally `words`, `transcript`, `profile`, `language` |
+| `POST /v1/convert/audio-to-iml` | Multipart: `audio`, and optionally `words`, `transcript`, `profile`, `language` and up to 5 `calibration` recordings |
 | `POST /v1/convert/text-to-iml` | `{"text": ..., "context": ...}` to predicted IML |
 | `POST /v1/convert/iml-to-ssml` | IML to SSML 1.1 |
 | `POST /v1/convert/iml-to-prompt` | IML to an annotated transcript, system prompt and chat messages |
@@ -562,11 +581,13 @@ curl -F audio=@examples/speech.wav -F words=@examples/speech.whisper.json \
 ```
 
 ```json
-{"iml":"<iml version=\"0.1.0\" language=\"en-US\"><utterance>I never said<pause duration=\"660\"/> she <emphasis level=\"strong\"><prosody pitch=\"+47%\" pitch_contour=\"fall\">stole</prosody></emphasis> my <prosody pitch_contour=\"fall\">money.</prosody></utterance></iml>","plain_text":"I never said she stole my money.","transcript_source":"words","warnings":[],"profile_matches":[]}
+{"iml":"<iml version=\"0.1.0\" language=\"en-US\"><utterance>I never said<pause duration=\"610\"/> she <emphasis level=\"strong\"><prosody pitch=\"+47%\" pitch_contour=\"fall\">stole</prosody></emphasis> my <prosody pitch_contour=\"fall\">money.</prosody></utterance></iml>","plain_text":"I never said she stole my money.","transcript_source":"words","warnings":["No speaker baseline: a single utterance without calibration_audio has nothing to compare its pitch, loudness and rate with, so they were not marked, and no emotion was estimated from them. Pass calibration_audio (recordings of the speaker's usual speech, such as their earlier turns) to assess them."],"profile_matches":[]}
 ```
 
-Uploads, text fields, audio length, synthesis length, rate limits and the
-number of worker processes are limited by `PP_*` environment variables.
+Repeat `-F calibration=@earlier.wav` for recordings of the speaker's
+earlier turns, to measure this one against them. Uploads, JSON bodies, text
+fields, audio length, synthesis length, rate limits, the number of worker
+processes and the Whisper model are set by `PP_*` environment variables.
 [docs/API.md](docs/API.md) documents the endpoints, errors and settings.
 
 ---
@@ -576,9 +597,9 @@ number of worker processes are limited by `PP_*` environment variables.
 | Part | What it is | How far it has been checked |
 |------|------------|-----------------------------|
 | Spec, parser, validator | IML 0.1.0-alpha; the validator implements the spec's rules (V1-V33) | Tested against every spec example, the XML Schema and hand-written edge cases |
-| Prosody measurement (`ProsodyAnalyzer`) | Praat, through parselmouth: F0, intensity, pauses, speech rate, jitter, shimmer, HNR | Synthetic espeak-ng speech with known timings and pitch; **no benchmark on real recordings yet** |
-| Markup (`AudioToIML`, `IMLAssembler`) | Rules on measured values relative to the speaker's own voice: pauses of 200 ms or more, emphasis, pitch contour, utterance-level shifts | Same as above |
-| Emotion labels | `RuleBasedEmotionClassifier`: deviations of pitch, loudness, rate and pitch movement from the speaker's baseline; labels only `neutral`, `calm`, `sad`, `angry`, `joyful`, `fearful` | A heuristic, not a trained model. It abstains (no `emotion`) below 0.5 confidence, needs calibration audio or at least three utterances of the same speaker, and cannot hear sarcasm or frustration |
+| Prosody measurement (`ProsodyAnalyzer`) | Praat, through parselmouth, on audio read as 16 kHz mono: F0, intensity, pauses (silence judged against the speech around it), speech rate, jitter, shimmer, HNR | Synthetic espeak-ng speech with known timings, pitch and levels; **no benchmark on real recordings yet** |
+| Markup (`AudioToIML`, `IMLAssembler`) | Rules on measured values relative to each speaker's own voice: pauses of 200 ms or more, emphasis, pitch contour, and utterance-level shifts when there is a speaker baseline (calibration audio, or several utterances of the speaker) | Same as above |
+| Emotion labels | `RuleBasedEmotionClassifier`: deviations of pitch, loudness, rate and pitch movement from the speaker's baseline; labels only `neutral`, `calm`, `sad`, `angry`, `joyful`, `fearful` | A heuristic, not a trained model. It abstains (no `emotion`) below 0.5 confidence, needs calibration audio or at least three utterances of the same speaker (`ConversionResult.warnings` says when it had neither), and cannot hear sarcasm or frustration. A committed benchmark on 10 synthetic clips catches regressions; it says nothing about real speech |
 | Speech recognition | None built in unless you install the `whisper` extra | Bring word timings from any recognizer |
 | `TextToIML` | Rules: punctuation, capitals, cue words, simple sarcasm idioms | A text heuristic; confidences between 0.5 and 0.8 |
 | `IMLToAudio` | espeak-ng (robotic but real speech); a tone preview without it | Pitch and rate mappings measured against espeak-ng |
@@ -595,9 +616,12 @@ Limits that follow from this:
   get explicit consent before collecting it, and process locally where you
   can. The SDK analyzes audio on your machine and sends nothing anywhere
   (the `whisper` extra downloads its model on first use).
-- For emotion labels on short recordings, pass a recording of the same
-  speaker talking normally (`calibration_audio=`, `--calibration`).
-  For better labels, plug in your own classifier
+- For delivery and emotion on a short recording, pass recordings of the
+  same speaker talking as usual, such as their earlier turns
+  (`calibration_audio=`, one file or several; `--calibration`; the REST
+  `calibration` field). In a conversation, give word timings with speaker
+  labels so that each speaker is measured against their own voice. For
+  better labels, plug in your own classifier
   (`AudioToIML(emotion_classifier=...)`).
 - The analysis is tuned on English synthetic speech. IML itself is
   language-agnostic; interpreting it is not.

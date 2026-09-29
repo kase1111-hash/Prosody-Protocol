@@ -26,7 +26,10 @@ USER appuser
 # PP_TRUSTED_PROXIES (set this behind a reverse proxy so rate limiting sees
 # client addresses), PP_MAX_TEXT_CHARS, PP_MAX_WORDS_CHARS,
 # PP_MAX_SYNTH_SECONDS, PP_MAX_AUDIO_SECONDS, PP_MAX_CONCURRENT_JOBS and
-# PP_MAX_QUEUED_JOBS. Allow roughly 200 MB of memory per concurrent job.
+# PP_MAX_QUEUED_JOBS, PP_JOB_TIMEOUT_S, PP_MAX_JSON_BYTES and PP_STT_MODEL. Allow roughly
+# 450 MB of memory per concurrent job (measured on 10 minutes of audio;
+# every recording is analyzed at 16 kHz mono, so the input rate does not
+# matter), plus the Whisper model if the whisper extra is installed.
 ENV PP_HOST=0.0.0.0
 ENV PP_PORT=8000
 ENV PP_MAX_UPLOAD_MB=50

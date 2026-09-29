@@ -940,6 +940,8 @@ python training/scripts/evaluate.py --checkpoint training/checkpoints/ser_v1 \
 | **IML Validity Rate** | % of generated IML that passes validation | 100% |
 | **Round-trip Fidelity** | Audio -> IML -> Audio prosodic similarity | Pearson r > 0.7 for F0 contour |
 
+> Note: round-trip fidelity was never implemented; see the correction under 0.1.0a1 in [CHANGELOG.md](CHANGELOG.md) for the metrics `Benchmark` has.
+
 ### 12.2 Benchmark Harness
 
 ```python

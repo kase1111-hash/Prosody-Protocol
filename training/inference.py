@@ -15,7 +15,10 @@ that :class:`~prosody_protocol.AudioToIML` produces::
 
 The classifier summarises the utterance's word features with the same
 function data preparation uses (:func:`training.features.feature_vector`),
-so the model sees the kind of input it was trained on.
+so the model sees the kind of input it was trained on. It abstains -- no
+emotion -- on utterances unlike anything in the training data, such as
+tones or other non-speech, instead of passing on the model's arbitrary but
+often near-certain answer for them.
 """
 
 from __future__ import annotations
@@ -27,6 +30,9 @@ from prosody_protocol import SpanFeatures
 
 from .features import SER_FEATURES, feature_vector, has_voiced_speech
 from .portable import PortableModel
+
+#: Default of ``TrainedEmotionClassifier(max_feature_z=...)``.
+DEFAULT_MAX_FEATURE_Z = 4.0
 
 
 class TrainedEmotionClassifier:
@@ -41,16 +47,34 @@ class TrainedEmotionClassifier:
         never runs code from the file. For a pickled checkpoint, use
         :meth:`from_checkpoint`.
 
+    max_feature_z:
+        How far outside its training data the model is trusted: an
+        utterance with any feature more than this many training standard
+        deviations from the training mean (see
+        :meth:`~training.portable.PortableModel.feature_z_scores`) gets
+        ``("neutral", 0.0)``. Default 4.0. ``None`` turns the check off.
+        Models without training statistics are not checked.
+
     The confidence :meth:`classify` returns is the model's probability for
     the label. It is not calibrated: a model trained on little data can be
     confidently wrong, especially on recordings unlike its training data
     (another microphone, another speaker). Utterances without voiced
-    speech get ``("neutral", 0.0)``, which
+    speech, and utterances far outside the training data (``max_feature_z``),
+    get ``("neutral", 0.0)``, which
     :class:`~prosody_protocol.assembler.IMLAssembler`'s confidence
     threshold turns into no emotion at all.
+
+    The features are absolute (Hz, dB), and the classifier does not use the
+    speaker baseline (``calibration_audio``) the rule-based classifier
+    judges against; see "Limits" in ``training/README.md``.
     """
 
-    def __init__(self, model: str | Path | PortableModel) -> None:
+    def __init__(
+        self,
+        model: str | Path | PortableModel,
+        *,
+        max_feature_z: float | None = DEFAULT_MAX_FEATURE_Z,
+    ) -> None:
         if not isinstance(model, PortableModel):
             model = PortableModel.load(model)
         unknown = [n for n in model.feature_names if n not in SER_FEATURES]
@@ -59,7 +83,16 @@ class TrainedEmotionClassifier:
                 f"The model was not trained on SER features: {unknown} are not among "
                 f"{list(SER_FEATURES)}"
             )
+        if max_feature_z is not None and not (
+            isinstance(max_feature_z, (int, float))
+            and not isinstance(max_feature_z, bool)
+            and 0 < max_feature_z < float("inf")
+        ):
+            raise ValueError(
+                f"max_feature_z must be a positive number or None, got {max_feature_z!r}"
+            )
         self.model = model
+        self.max_feature_z = max_feature_z
 
     @classmethod
     def from_checkpoint(cls, path: str | Path) -> TrainedEmotionClassifier:
@@ -91,13 +124,34 @@ class TrainedEmotionClassifier:
         proba = self.model.predict_proba(vector)[0]
         return {label: float(p) for label, p in zip(self.labels, proba, strict=True)}
 
+    def unusual_features(self, features: Sequence[SpanFeatures]) -> dict[str, float]:
+        """The features of an utterance that lie beyond ``max_feature_z``.
+
+        Maps each such feature to its signed z-score (training standard
+        deviations from the training mean). Empty when all features are
+        within range, when the check is off, or when the model has no
+        training statistics.
+        """
+        if self.max_feature_z is None or not has_voiced_speech(features):
+            return {}
+        vector = feature_vector(features, self.model.feature_names)
+        z_scores = self.model.feature_z_scores(vector)[0]
+        return {
+            name: round(float(z), 1)
+            for name, z in zip(self.model.feature_names, z_scores, strict=True)
+            if abs(z) > self.max_feature_z  # False for NaN
+        }
+
     def classify(self, features: list[SpanFeatures]) -> tuple[str, float]:
         """Classify the emotion of an utterance from its span features.
 
         Returns ``(label, confidence)`` with the confidence rounded to two
         decimals, or ``("neutral", 0.0)`` when the spans contain no voiced
-        speech.
+        speech or lie far outside the training data
+        (:meth:`unusual_features`).
         """
+        if self.unusual_features(features):
+            return ("neutral", 0.0)
         probabilities = self.probabilities(features)
         label = max(probabilities, key=lambda k: probabilities[k])
         if probabilities[label] == 0.0:

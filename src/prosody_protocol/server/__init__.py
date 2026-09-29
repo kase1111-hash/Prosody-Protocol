@@ -18,9 +18,11 @@ def run(host: str | None = None, port: int | None = None) -> None:
     """Start the API server with uvicorn.
 
     ``host`` and ``port`` default to the ``PP_HOST`` / ``PP_PORT``
-    environment variables (see :class:`prosody_protocol.server.config.Settings`).
-    A *port* outside 0-65535 raises :class:`ValueError`; 0 lets the system
-    choose a free port.
+    environment variables (see :class:`prosody_protocol.server.config.Settings`);
+    an empty *host* means the default too (never all interfaces, which is
+    what uvicorn makes of an empty address). A *port* outside 0-65535 raises
+    :class:`ValueError`; 0 lets the system choose a free port. Invalid
+    ``PP_*`` settings raise :class:`ValueError`.
     """
     try:
         import uvicorn
@@ -36,7 +38,7 @@ def run(host: str | None = None, port: int | None = None) -> None:
     settings = Settings()
     uvicorn.run(
         "prosody_protocol.server.app:app",
-        host=host or settings.host,
+        host=host.strip() if host and host.strip() else settings.host,
         port=settings.port if port is None else port,
         log_level="debug" if settings.debug else "info",
     )

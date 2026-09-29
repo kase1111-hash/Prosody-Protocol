@@ -32,7 +32,7 @@ written on a nested ``<prosody>`` so that its targets are unambiguously
 relative to the shifted pitch.
 
 ``vendor="espeak-ng"`` adapts the output to what espeak-ng 1.51 actually
-renders (measured by analysing its audio): pitch values are rescaled so the
+renders (measured by analyzing its audio): pitch values are rescaled so the
 realized F0 shift matches the IML value (espeak-ng applies relative pitch to
 an internal 0-100 parameter, which roughly halves it, and treats "185Hz" as a
 relative value; absolute values are resolved against the voice's measured
@@ -62,6 +62,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
+from ._types import normalize_language_tag
 from .exceptions import ConversionError, IMLParseError
 from .models import (
     ChildNode,
@@ -79,7 +80,6 @@ SSML_NAMESPACE = "http://www.w3.org/2001/10/synthesis"
 DEFAULT_LANGUAGE = "en-US"
 
 _ESPEAK_VENDORS = frozenset({"espeak-ng", "espeak"})
-_BCP47_RE = re.compile(r"[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*")
 
 # Characters XML 1.0 cannot carry (C0 controls other than tab/LF/CR, lone
 # surrogates, U+FFFE and U+FFFF).
@@ -252,8 +252,11 @@ def _iml_volume_to_ssml(volume: str) -> str:
     """
     m = _DB_RE.match(volume)
     if m is None:
-        return volume  # unrecognised format -- pass through unchanged
-    db = float(m.group(1))
+        return volume  # unrecognized format -- pass through unchanged
+    # Rounding keeps tiny values out of exponent notation ("1e-07"), and
+    # adding 0.0 turns -0.0 ("-0dB", valid IML) into 0.0, so that it is
+    # written "+0dB" rather than "+-0dB".
+    db = round(float(m.group(1)), 4) + 0.0
     # The W3C SSML spec defines these named levels:
     #   silent, x-soft, soft, medium, loud, x-loud
     # Map extreme values so engines without dB support still behave sensibly.
@@ -261,7 +264,7 @@ def _iml_volume_to_ssml(volume: str) -> str:
         return "x-soft"
     if db >= 20:
         return "x-loud"
-    # Standard +/-NdB is valid SSML; normalise the suffix to "dB".
+    # Standard +/-NdB is valid SSML; normalize the suffix to "dB".
     sign = "+" if db >= 0 else ""
     return f"{sign}{db:g}dB"
 
@@ -719,13 +722,8 @@ class IMLToSSML:
         speaker_voices: Mapping[str, str] | None = None,
         strict: bool = True,
     ) -> None:
-        if not _BCP47_RE.fullmatch(default_language):
-            raise ValueError(
-                f"default_language={default_language!r} is not a BCP 47 language tag "
-                '(e.g. "en-US")'
-            )
         self.vendor = vendor
-        self.default_language = default_language
+        self.default_language = normalize_language_tag(default_language, "default_language")
         self.speaker_voices: dict[str, str] = dict(speaker_voices or {})
         self.strict = strict
         self._parser = IMLParser()

@@ -5,6 +5,9 @@ gaps (some generated on the fly with noise floors, known jitter/shimmer or
 known syllable rates), synthetic voices with known F0, perturbation and
 breath noise, and espeak-ng speech whose word timings and pauses are
 recorded in JSON next to the WAV (see tests/generate_audio_fixtures.py).
+speech_levels.wav holds whole espeak-ng sentences at known levels (one
+sentence three times at the same tempo, -a 100, 40 and 25) with the pauses
+between them in speech_levels.json, which says how it was made.
 Tests that synthesise speech on the fly skip without espeak-ng.
 """
 
@@ -35,6 +38,7 @@ from prosody_protocol.prosody_analyzer import (
     WordAlignment,
     _classify_quality,
     _remove_octave_jumps,
+    _sliding_max,
     _smooth_runs,
     detect_pauses,
 )
@@ -58,6 +62,21 @@ def _write(path: Path, signal: Any, sr: int = SR, channels: int = 1) -> Path:
         wf.setsampwidth(2)
         wf.setframerate(sr)
         wf.writeframes(pcm.tobytes())
+    return path
+
+
+def _write_float(path: Path, signal: Any, sr: int = SR, dtype: str = "<f4") -> Path:
+    """Write a mono signal as a float WAV (32-bit, or 64-bit with
+    ``dtype="<f8"``), which holds samples beyond full scale (1.0) without
+    clipping."""
+    samples = np.asarray(signal, dtype=dtype)
+    data, width = samples.tobytes(), samples.dtype.itemsize
+    header = (
+        b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt "
+        + struct.pack("<IHHIIHH", 16, 3, 1, sr, sr * width, width, 8 * width)
+        + b"data" + struct.pack("<I", len(data))
+    )
+    path.write_bytes(header + data)
     return path
 
 
@@ -752,9 +771,12 @@ class TestPauseDetection:
         assert analyzer.detect_pauses(str(AUDIO_DIR / "loud_quiet.wav")) == []
 
     def test_silence_threshold_is_adjustable(self, analyzer: ProsodyAnalyzer) -> None:
-        """With a 15 dB threshold, the half 20 dB down counts as silence."""
+        """With a 12 dB threshold, the half 20 dB down counts as silence.
+        (Voiced sound within the threshold plus 5 dB of the speech level is
+        speech, and sets the level the sound around it is judged against: at
+        15 dB the tone 20.0-20.5 dB down would sit on that line.)"""
         pauses = analyzer.detect_pauses(
-            str(AUDIO_DIR / "loud_quiet.wav"), silence_threshold_db=15.0
+            str(AUDIO_DIR / "loud_quiet.wav"), silence_threshold_db=12.0
         )
         assert pauses == [PauseInterval(start_ms=500, end_ms=1000)]
 
@@ -805,6 +827,123 @@ class TestPauseDetection:
         sound = parselmouth.Sound(str(AUDIO_DIR / "tone_gap_tone.wav"))
         assert detect_pauses(sound, rms_threshold_db=-40.0) == [PauseInterval(500, 1300)]
         assert detect_pauses(sound) == [PauseInterval(500, 1300)]
+
+
+# ---------------------------------------------------------------------------
+# Quieter speech next to louder speech
+# ---------------------------------------------------------------------------
+
+
+def _sentences(truth: dict[str, Any]) -> list[WordAlignment]:
+    return [WordAlignment(s["text"], s["start_ms"], s["end_ms"]) for s in truth["sentences"]]
+
+
+class TestQuieterSpeech:
+    """Silence used to be judged against the loudest 1 % of the whole file,
+    so the weak sounds of speech 7-20 dB quieter than a louder passage
+    elsewhere (consonants, the onsets and ends of vowels) fell below the
+    line: false pauses, a speech rate counted over too little speaking time
+    (rate="145%" at an unchanged tempo), a level measured on the loudest
+    frames only, and words without F0."""
+
+    def test_pauses_match_ground_truth_at_every_level(self, analyzer: ProsodyAnalyzer) -> None:
+        """The same sentence at 0, -8 and -13 dB, a sentence 5 dB louder,
+        and 80 ms after it one 16 dB quieter than that: the pauses between
+        them, and none inside a sentence (there were three, of 210-280 ms)."""
+        truth = _truth("speech_levels")
+        pauses = analyzer.detect_pauses(AUDIO_DIR / "speech_levels.wav")
+        assert len(pauses) == len(truth["pauses"]), pauses
+        for found, expected in zip(pauses, truth["pauses"], strict=True):
+            assert abs(found.start_ms - expected["start_ms"]) <= 30
+            assert abs(found.end_ms - expected["end_ms"]) <= 30
+
+    def test_speech_rate_does_not_depend_on_level(self, analyzer: ProsodyAnalyzer) -> None:
+        """The -8 and -13 dB copies read 5 % and 14 % faster."""
+        truth = _truth("speech_levels")
+        features = analyzer.analyze(AUDIO_DIR / "speech_levels.wav", _sentences(truth))
+        reference = features[0].speech_rate
+        assert reference is not None
+        for sentence, f in zip(truth["sentences"], features, strict=True):
+            assert f.speech_rate is not None
+            expected = sentence["syllables"] / ((sentence["end_ms"] - sentence["start_ms"]) / 1000)
+            assert f.speech_rate == pytest.approx(expected, rel=0.1), sentence["text"]
+            if sentence["text"] == truth["sentences"][0]["text"]:
+                assert f.speech_rate == pytest.approx(reference, rel=0.03), sentence["amplitude"]
+
+    def test_level_differences_are_measured(self, analyzer: ProsodyAnalyzer) -> None:
+        """-8.2 and -12.8 dB read as -6.6 and -9.2 dB: only the loudest
+        frames of the quieter copies were measured."""
+        truth = _truth("speech_levels")
+        features = analyzer.analyze(AUDIO_DIR / "speech_levels.wav", _sentences(truth))
+        reference = features[0].intensity_mean
+        assert reference is not None
+        for sentence, f in zip(truth["sentences"], features, strict=True):
+            assert f.intensity_mean is not None
+            assert f.intensity_mean - reference == pytest.approx(sentence["level_db"], abs=1.0)
+
+    @pytest.mark.parametrize("gain_db", [10.0, 20.0])
+    def test_a_louder_passage_does_not_change_the_words(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path, gain_db: float
+    ) -> None:
+        """speech_pauses.wav followed by speech_raised.wav 10 or 20 dB up:
+        at +10 dB a false pause appeared inside 'told you' and every rate
+        rose by half; at +20 dB 'you', 'to' and 'me' lost F0 and intensity,
+        and the rest read at 9-11 syllables/s."""
+        truth = _truth("speech_pauses")
+        words = _words(truth)
+        first = parselmouth.Sound(str(AUDIO_DIR / "speech_pauses.wav")).values[0]
+        louder = parselmouth.Sound(str(AUDIO_DIR / "speech_raised.wav")).values[0]
+        signal = np.concatenate(
+            [first, _noise(SR // 2, -60.0, seed=5), louder * 10 ** (gain_db / 20)]
+        )
+        path = _write_float(tmp_path / "louder.wav", signal)
+        alone = analyzer.analyze(AUDIO_DIR / "speech_pauses.wav", words)
+        together = analyzer.analyze(path, words)
+        for a, b in zip(alone, together, strict=True):
+            assert b.f0_mean is not None and a.f0_mean is not None, b.text
+            # Praat's pitch tracker finds fewer voiced frames in speech far
+            # below the loudest in the file, so F0 rests on fewer frames.
+            assert b.f0_mean == pytest.approx(a.f0_mean, rel=0.08), b.text
+            assert b.intensity_mean == pytest.approx(a.intensity_mean, abs=0.5), b.text
+            assert b.speech_rate == pytest.approx(a.speech_rate, rel=0.05), b.text
+        end = truth["duration_ms"]
+        inner = [p for p in truth["pauses"] if p["start_ms"] > 0 and p["end_ms"] < end]
+        found = [p for p in analyzer.detect_pauses(path) if 0 < p.start_ms < end - 30]
+        assert abs(found[-1].start_ms - truth["words"][-1]["end_ms"]) <= 30  # into the gap
+        assert len(found[:-1]) == len(inner)
+        for got, expected in zip(found[:-1], inner, strict=True):
+            assert abs(got.start_ms - expected["start_ms"]) <= 30
+            assert abs(got.end_ms - expected["end_ms"]) <= 30
+
+    def test_long_pauses_stay_whole(self, analyzer: ProsodyAnalyzer, tmp_path: Path) -> None:
+        """A 1.2 s pause holding a breath-like noise 30 dB below the speech,
+        and a 1 s pause over a steady tone 30 dB down: far from the words,
+        silence is still judged against the file's speech level, so neither
+        splits the pause."""
+        words = _phonation(0.6, 120.0, seed=1), _phonation(0.6, 120.0, seed=2)
+        level = float(np.sqrt(np.mean(words[0] ** 2)))
+        breath = np.convolve(_noise(int(0.4 * SR), 0.0, seed=4), np.ones(8) / 8, "same")
+        breath *= np.hanning(breath.size) * level * 10 ** (-30 / 20) / np.std(breath)
+        gap = np.concatenate([np.zeros(int(0.4 * SR)), breath, np.zeros(int(0.4 * SR))])
+        signal = np.concatenate([np.zeros(SR // 4), words[0], gap, words[1], np.zeros(SR // 4)])
+        signal = signal + _noise(signal.size, -70.0)
+        pauses = analyzer.detect_pauses(_write(tmp_path / "breath.wav", signal))
+        inner = [p for p in pauses if p.start_ms > 0 and p.end_ms < 2650]
+        assert len(inner) == 1 and abs(inner[0].duration_ms - 1200) <= 60, pauses
+
+        signal = np.concatenate([np.zeros(SR // 4), words[0], np.zeros(SR), words[1]])
+        hum = _tone(signal.size / SR, 220.0, level * np.sqrt(2) * 10 ** (-30 / 20))
+        signal = signal + hum + _noise(signal.size, -70.0)
+        pauses = analyzer.detect_pauses(_write(tmp_path / "hum.wav", signal))
+        inner = [p for p in pauses if p.start_ms > 0 and p.end_ms < 2400]
+        assert len(inner) == 1 and abs(inner[0].duration_ms - 1000) <= 60, pauses
+
+    def test_sliding_max(self) -> None:
+        values = np.array([0.0, 5.0, 1.0, -np.inf, 2.0, 0.0, 0.0, 3.0])
+        assert list(_sliding_max(values, 1)) == [5, 5, 5, 2, 2, 2, 3, 3]
+        assert list(_sliding_max(values, 0)) == list(values)
+        assert list(_sliding_max(values, 20)) == [5] * 8
+        assert list(_sliding_max(np.array([7.0]), 3)) == [7.0]
 
 
 # ---------------------------------------------------------------------------
@@ -1355,6 +1494,134 @@ class TestMaxDuration:
 
     def test_no_limit_by_default(self) -> None:
         assert ProsodyAnalyzer().max_duration_s is None
+
+
+# ---------------------------------------------------------------------------
+# Sample rate and channels
+# ---------------------------------------------------------------------------
+
+
+def _fast_speech(path: Path, rate: int, channels: int) -> Path:
+    """speech_pauses.wav at *rate* with *channels* (the second one quieter),
+    over a full-band -70 dBFS noise floor, as 16-bit WAV or (by suffix) FLAC."""
+    speech = parselmouth.Sound(str(AUDIO_DIR / "speech_pauses.wav")).resample(rate).values[0]
+    rows = [speech * (1.0 - 0.3 * c) + _noise(speech.size, -70.0, seed=c) for c in range(channels)]
+    sound = parselmouth.Sound(np.array(rows), sampling_frequency=rate)
+    if path.suffix == ".flac":
+        sound.save(str(path), "FLAC")
+        return path
+    return _write(path, sound.values.T, sr=rate, channels=channels)
+
+
+class TestSampleRate:
+    """Audio used to be analysed at its own rate and channel count: a 29 MB
+    FLAC of ten minutes at 192 kHz stereo took 2.8 GB and four minutes. It
+    is now read as mono at no more than 16 kHz, a block at a time."""
+
+    @pytest.mark.parametrize(
+        ("rate", "channels", "suffix"),
+        [(22050, 1, ".wav"), (44100, 2, ".flac"), (48000, 1, ".wav"), (192000, 2, ".flac")],
+    )
+    def test_fast_audio_is_analysed_at_16_khz(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path, rate: int, channels: int, suffix: str
+    ) -> None:
+        path = _fast_speech(tmp_path / f"fast{suffix}", rate, channels)
+        analysis = prosody_analyzer._AudioAnalysis.from_path(path)
+        assert analysis.sound.sampling_frequency == SR
+        assert analysis.sound.n_channels == 1
+        truth = _truth("speech_pauses")
+        assert abs(analysis.duration_ms - truth["duration_ms"]) <= 1
+
+        # The measures match those of the 16 kHz original.
+        words = _words(truth)
+        original = analyzer.analyze(AUDIO_DIR / "speech_pauses.wav", words)
+        level = 0.0 if channels == 1 else 20 * np.log10(0.85)  # the channels' mean
+        for a, b in zip(original, analysis.features(words), strict=True):
+            assert b.f0_mean == pytest.approx(a.f0_mean, rel=0.01), b.text
+            assert b.intensity_mean is not None and a.intensity_mean is not None
+            assert b.intensity_mean - a.intensity_mean == pytest.approx(level, abs=0.5), b.text
+            assert b.speech_rate == pytest.approx(a.speech_rate, rel=0.05), b.text
+        found = analysis.pauses()
+        assert len(found) == len(truth["pauses"])
+        for got, expected in zip(found, truth["pauses"], strict=True):
+            assert abs(got.start_ms - expected["start_ms"]) <= 30
+            assert abs(got.end_ms - expected["end_ms"]) <= 30
+
+    def test_fast_audio_is_never_loaded_whole(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Praat reads it in blocks (here of 0.1 s), and the blocks join
+        seamlessly: the result is the whole file mixed and resampled at
+        once, to within a few steps of 16-bit audio (Praat's resampling
+        filter reaches across the whole file)."""
+        path = _fast_speech(tmp_path / "fast.wav", 48000, 2)
+        whole = parselmouth.Sound(str(path)).convert_to_mono().resample(SR).values[0]
+        monkeypatch.setattr(prosody_analyzer, "_READ_BLOCK_SAMPLES", 9600)
+        monkeypatch.setattr(prosody_analyzer, "_MIN_READ_BLOCK_S", 0.1)
+        loaded: list[str] = []
+        largest = [0]
+        real_sound, real_call = parselmouth.Sound, prosody_analyzer.call
+
+        def spy_sound(*args: Any, **kwargs: Any) -> Any:
+            loaded.append(str(args[0]) if args and isinstance(args[0], str) else "")
+            return real_sound(*args, **kwargs)
+
+        def spy_call(*args: Any) -> Any:
+            result = real_call(*args)
+            if len(args) > 1 and args[1] == "Extract part":
+                largest[0] = max(largest[0], result.values.size)
+            return result
+
+        monkeypatch.setattr(parselmouth, "Sound", spy_sound)
+        monkeypatch.setattr(prosody_analyzer, "call", spy_call)
+        sound = prosody_analyzer._load_sound(path)
+        assert str(path) not in loaded
+        # A block and its padding: (0.1 + 2 * 0.05) s of two channels at 48 kHz.
+        assert 0 < largest[0] <= 2 * 48000 * 0.2 + 4
+        assert sound.sampling_frequency == SR and sound.n_samples == whole.size
+        error = sound.values[0] - whole
+        assert np.abs(error).max() < 3e-4 and np.sqrt(np.mean(error**2)) < 3e-5
+
+    @pytest.mark.parametrize(("bad", "message"), [
+        (float("nan"), "not finite"), (1e6, "far beyond full scale"), (1e300, "far beyond"),
+    ])
+    def test_damaged_fast_audio_raises(self, tmp_path: Path, bad: float, message: str) -> None:
+        """Each block is checked before it is resampled, which would spread
+        a NaN over the block, or overflow 1e300 into infinity."""
+        signal = np.tile(_tone(1.0), 3)
+        signal[20000:20100] = bad
+        path = _write_float(tmp_path / "damaged.wav", signal, sr=48000, dtype="<f8")
+        with pytest.raises(AudioProcessingError, match=message):
+            prosody_analyzer._AudioAnalysis.from_path(path)
+
+    @pytest.mark.parametrize("ffmpeg_on_path", [True, False])
+    def test_truncated_fast_wav_is_not_padded_with_silence(
+        self, analyzer: ProsodyAnalyzer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        ffmpeg_on_path: bool,
+    ) -> None:
+        """The header promises 4.4 s of 48 kHz stereo; 2 s are there."""
+        data = _fast_speech(tmp_path / "fast.wav", 48000, 2).read_bytes()
+        path = tmp_path / "truncated.wav"
+        path.write_bytes(data[: 44 + 2 * 48000 * 2 * 2])
+        if not ffmpeg_on_path:
+            monkeypatch.setattr(shutil, "which", lambda name: None)
+            with pytest.raises(AudioProcessingError, match="truncated"):
+                analyzer.detect_pauses(path)
+            return
+        if shutil.which("ffmpeg") is None:
+            pytest.skip("ffmpeg not installed")
+        analysis = prosody_analyzer._AudioAnalysis.from_path(path)
+        assert analysis.duration_ms == 2000
+        assert analysis.sound.sampling_frequency == SR
+
+    def test_slow_audio_keeps_its_rate(self, analyzer: ProsodyAnalyzer, tmp_path: Path) -> None:
+        """Audio at 16 kHz or less is not resampled (8 kHz stays 8 kHz)."""
+        t = np.arange(8000) / 8000
+        signal = 0.3 * np.sin(2 * np.pi * 150 * t)
+        path = _write(tmp_path / "phone.wav", np.stack([signal, signal], axis=1), 8000, 2)
+        sound = prosody_analyzer._load_sound(path)
+        assert (sound.sampling_frequency, sound.n_channels) == (8000, 1)
+        assert np.abs(sound.values[0] - signal).max() < 1e-4
 
 
 # ---------------------------------------------------------------------------

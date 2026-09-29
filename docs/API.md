@@ -44,9 +44,10 @@ naming the extra:
 |-------------------------|-----------------|
 | `AudioToIML`, `ConversionResult`, `ProsodyAnalyzer`, `IMLToAudio`, `Benchmark`, `BenchmarkReport`, `MavisBridge`, `PhonemeEvent` | lxml only |
 
-Built-in speech recognition in `AudioToIML` also needs the `whisper` extra
-(openai-whisper, which pulls in PyTorch). `prosody_protocol.__version__`
-holds the version.
+`from prosody_protocol import *` works on any install: the names that need
+an extra are in `__all__` only when it is installed. Built-in speech
+recognition in `AudioToIML` also needs the `whisper` extra (openai-whisper,
+which pulls in PyTorch). `prosody_protocol.__version__` holds the version.
 
 ## IMLParser
 
@@ -59,7 +60,7 @@ IMLParser()
 | `parse(iml_string)` | `IMLDocument` | Parse an `<iml>` or bare `<utterance>` document |
 | `parse_file(path)` | `IMLDocument` | Parse a UTF-8 file (a byte order mark is allowed) |
 | `to_plain_text(doc)` | `str` | The words without markup: whitespace runs collapsed, no stray space before closing punctuation, utterances joined by one space |
-| `to_iml_string(doc)` | `str` | Serialize a document; a single utterance without document attributes is written as a bare `<utterance>` |
+| `to_iml_string(doc)` | `str` | Serialize a document; a single utterance without document attributes is written as a bare `<utterance>`, and utterances inside `<iml>` are separated by a space |
 
 The parser is lenient about attribute values, which it keeps, and strict
 about structure. It raises `IMLParseError` (with `.line` and `.column` when
@@ -73,10 +74,13 @@ extensions, unknown or namespaced attributes, invalid numeric values) are
 kept in `extra_attributes` and written back, so a round trip never turns an
 invalid document into a valid one.
 
-`to_iml_string` always writes well-formed XML without an XML declaration. A
-document built in code with a character XML forbids (such as `"\x1b"`) in
-text or an attribute, or an invalid extra attribute name, raises
-`ConversionError`.
+`to_iml_string` always writes well-formed XML without an XML declaration.
+Numbers the parser read are written as they were (`confidence="0.80"` stays
+`0.80`). A document built in code with a character XML forbids (such as
+`"\x1b"`) in text or an attribute, or an invalid extra attribute name,
+raises `ConversionError`; one with a typed number IML cannot hold (a
+`confidence` of `nan` or `1.5`, `Pause(duration=-5)`) raises
+`IMLValidationError` naming the rule, rather than writing invalid IML.
 
 ```python
 parser = IMLParser()
@@ -170,6 +174,18 @@ The V33 limits are constants in `prosody_protocol.validator`
 `MIN_F0_HZ`, `MAX_F0_HZ`, `MAX_VOLUME_DB`, `MIN_RATE_PERCENT`,
 `MAX_RATE_PERCENT`, `MAX_PAUSE_MS`, `MAX_SPEECH_RATE`, `MAX_DURATION_MS`).
 
+### Language tags
+
+One rule decides what a language tag is, everywhere: V29, dataset rule D6
+and `schemas/dataset-entry.schema.json`, `IMLToSSML`, `AudioToIML`,
+`IMLAssembler`, `MavisBridge` and the CLI's `--language`. A tag is a primary
+subtag of 1-8 letters followed by `-` and subtags of 1-8 letters or digits
+(`en`, `en-US`, `zh-Hant-TW`). Only this form is checked, not the IANA
+registry, so `english` passes. Language arguments of the SDK and the CLI
+read a POSIX-style `en_US` as `en-US`; IML documents and dataset entries
+are checked as written, so `language="en_US"` in a document is a V29 error.
+The REST API's `language` field reads `en_US` as `en-US` too.
+
 ## Data models
 
 Frozen dataclasses in `prosody_protocol.models` (also exported from the
@@ -187,9 +203,10 @@ attributes without a typed field (namespaced ones in Clark notation,
 | `Emphasis` | `level` (`""` when missing), `children`, `extra_attributes` |
 | `Segment` | `children`, `tempo`, `rhythm`, `extra_attributes` |
 
-Numeric fields only ever hold valid values; an invalid one is left at its
-default and its raw text kept in `extra_attributes`. To build IML in code,
-construct the models and serialize them:
+In a parsed document, numeric fields only hold valid values: an invalid one
+is left at its default and its raw text kept in `extra_attributes`. Models
+built in code are not checked when they are built; `to_iml_string` checks
+them. To build IML in code, construct the models and serialize them:
 
 ```python
 from prosody_protocol import Emphasis, Pause, Utterance
@@ -237,18 +254,19 @@ AudioToIML(
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `stt_model` | `"base"` | Whisper model size (`"tiny"`, `"base"`, `"small"`, ...), loaded on first use and reused |
+| `stt_model` | `"base"` | Whisper model (`"tiny"`, `"base"`, `"small"`, ..., or a checkpoint path), loaded on first use and reused |
 | `emotion_classifier` | `None` | an `EmotionClassifier`; default `RuleBasedEmotionClassifier` |
-| `include_extended` | `False` | wrap every word in a `<prosody>` with its measurements (`f0_mean`, `f0_range`, `f0_contour`, `intensity_mean`, `intensity_range`, `speech_rate`, `duration_ms`, `jitter`, `shimmer`, `hnr`) |
-| `language` | `None` | BCP 47 tag; labels the output and is passed to Whisper (as `en` for `en-US`). `None`: Whisper's detected language, or none. `en_US` is read as `en-US`; a value not in the form of a tag (`"en US"`, `"123"`) raises `ValueError`. Only the form is checked (V29), so `"english"` is accepted and written as is. |
+| `include_extended` | `False` | add each word's measurements (`f0_mean`, `f0_range`, `f0_contour`, `intensity_mean`, `intensity_range`, `speech_rate`, `duration_ms`, `jitter`, `shimmer`, `hnr`) in a `<prosody>` around it. The markup and text are otherwise unchanged; an emphasized word inside an utterance-level `<prosody>` gets none (nesting stays within two levels). |
+| `language` | `None` | BCP 47 tag; labels the output and is passed to Whisper (as `en` for `en-US`). `None`: Whisper's detected language, or none. `en_US` is read as `en-US`; a value not in the form of a tag (`"en US"`, `"123"`) raises `ValueError`. Only the form is checked (see [language tags](#language-tags)), so `"english"` is accepted and written as is. |
 | `min_emotion_confidence` | `0.5` | utterances estimated below it carry no `emotion` or `confidence` |
-| `calibration_audio` | `None` | a recording of the same speaker talking neutrally; the baseline for pitch, loudness, emotion and profiles |
+| `calibration_audio` | `None` | a recording, or a sequence of recordings, of the same speaker talking as usual (such as their earlier turns), recorded with the same setup: the baseline for pitch, loudness, rate, emotion and profiles. See [below](#speaker-baselines-and-calibration). |
 | `stt` | `"auto"` | speech recognition when a conversion gets neither `words` nor `transcript`: `"whisper"` (required), `"none"` (placeholders), `"auto"` (Whisper if installed) |
 | `max_duration_s` | `None` | reject longer audio (and calibration audio) before loading it; set it for audio from untrusted users |
 | `profile` | `None` | the speaker's `ProsodyProfile` (see [profiles](#profiles)); an invalid one raises `ProfileError` |
 
-The `profile` property returns the profile. Methods, all taking
-`(audio_path, *, words=None, transcript=None)`:
+The `profile` property returns the profile; `calibration_audio` is a
+settable attribute (a `Path`, a tuple of them, or `None`). Methods, all
+taking `(audio_path, *, words=None, transcript=None)`:
 
 | Method | Returns |
 |--------|---------|
@@ -260,38 +278,43 @@ Where the words come from:
 
 1. `words=`: word timings from any recognizer, an iterable of
    `WordAlignment` (see [word timings](#word-timings)). No recognizer runs.
-   Words may overlap by at most `MAX_WORD_OVERLAP_MS` (500 ms).
+   Where a word's `speaker` label (from diarization) changes, a new
+   utterance starts; the label becomes its `speaker_id`, and each speaker
+   is measured against their own baseline. One speaker's words may overlap
+   by at most `MAX_WORD_OVERLAP_MS` (500 ms); different speakers' words may
+   overlap further, but no more than `MAX_OVERLAPPING_SPEAKERS` (3)
+   speakers at once. Timings past the end of the audio are clamped to it.
 2. `transcript=`: the text without timings. One utterance over the voiced
-   part of the audio; prosody is described for it as a whole, with no
-   word-level tags or pauses.
+   part of the audio, with no pauses, emphasis or word-level tags: nothing
+   says where the words are, and no timings are made up. Its overall pitch,
+   loudness, rate and emotion are judged only against `calibration_audio`;
+   without it the result is usually the plain transcript, so a transcript
+   alone adds little beyond the text.
 3. Otherwise, per `stt`: Whisper transcribes the audio, or each stretch of
    speech becomes a `[speech]` placeholder (`PLACEHOLDER_TOKEN`), with the
    pauses between them, and a warning.
 
 `ConversionResult` (frozen dataclass): `document` (`IMLDocument`), `iml`
 (str), `transcript_source` (`"words"`, `"transcript"`, `"whisper"` or
-`"none"`), `warnings` (tuple of str: placeholder text, no voiced speech, a
-silence over a minute written as a 60000 ms pause, ...) and
-`profile_matches` (tuple of `ProfileMatch`, see [IMLAssembler](#imlassembler)).
-
-Emotion: the default classifier compares each utterance with the speaker's
-baseline, from `calibration_audio` or, without it, from the recording's
-utterances when there are at least three and most sit near their median.
-A single sentence without calibration audio therefore gets no emotion, and
-silence or noise never gets one. The labels are estimates from a rule-based
-heuristic that was checked on synthetic espeak-ng speech, not on a
-real-speech benchmark.
+`"none"`), `warnings` (tuple of str, see
+[conversion warnings](#conversion-warnings)) and `profile_matches` (tuple
+of `ProfileMatch`, see [IMLAssembler](#imlassembler)).
 
 Audio: WAV, AIFF, FLAC and MP3 are read directly; with ffmpeg on PATH also
-OGG/Opus, WebM, M4A/MP4, AAC, CAF, AMR, AU and W64 (decoded to 16 kHz mono;
-playlists are never followed). Analysis takes roughly 1-2.5 s per minute of
-audio (slower for very low voices), plus Whisper if it runs.
+OGG/Opus, WebM, M4A/MP4, AAC, CAF, AMR, AU and W64 (playlists are never
+followed). All audio is analyzed as 16 kHz mono (see
+[ProsodyAnalyzer](#prosodyanalyzer)). Analysis takes roughly 1-2.5 s per
+minute of audio (slower for very low voices), plus Whisper if it runs.
 
 Raises: `AudioProcessingError` (unreadable, empty, shorter than 100 ms,
 sampled below 4 kHz, NaN or out-of-range samples, longer than
-`max_duration_s`, Whisper required but missing, Whisper failure);
-`ValueError` (both `words` and `transcript`, invalid or overlapping
-timings, text with characters XML forbids); `TypeError` (wrong types).
+`max_duration_s`, Whisper required but missing, no calibration file with
+voiced speech); its subclass `SpeechRecognitionError` when the Whisper
+model cannot be loaded or transcription fails; `ValueError` (both `words`
+and `transcript`, invalid or overlapping timings, text or a speaker label
+with characters XML forbids); `TypeError` (wrong types);
+`ConversionError` if the assembled document is not valid IML (a bug:
+invalid IML is never returned).
 
 ```python
 words = load_word_timings("examples/speech.whisper.json")
@@ -301,17 +324,94 @@ print(result.transcript_source, result.warnings, result.profile_matches)
 ```
 
 ```text
-<iml version="0.1.0" language="en-US"><utterance>I never said<pause duration="660"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
-words () ()
+<iml version="0.1.0" language="en-US"><utterance>I never said<pause duration="610"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
+words ("No speaker baseline: a single utterance without calibration_audio has nothing to compare its pitch, loudness and rate with, so they were not marked, and no emotion was estimated from them. Pass calibration_audio (recordings of the speaker's usual speech, such as their earlier turns) to assess them.",) ()
 ```
 
 Module constants in `prosody_protocol.audio_to_iml`: `MAX_WORD_OVERLAP_MS`
-(500) and `PLACEHOLDER_TOKEN` (`"[speech]"`).
+(500), `MAX_OVERLAPPING_SPEAKERS` (3) and `PLACEHOLDER_TOKEN`
+(`"[speech]"`).
+
+### Speaker baselines and calibration
+
+Utterance-level pitch, loudness and rate, word offsets, the default
+classifier's emotion and profile matching are all judged against the
+speaker's baseline:
+
+- with `calibration_audio`, those recordings;
+- without it, the recording's own utterances, when there are at least three
+  (`assembler.MIN_BASELINE_UTTERANCES`) and most of them lie near their
+  median. Otherwise there is no baseline, and a warning says so: a single
+  sentence gets no utterance-level delivery and no emotion, and two
+  utterances are marked only relative to each other, without emotion.
+  Silence and noise never get an emotion;
+- with speaker labels, each speaker's own utterances. `calibration_audio`
+  and the profile describe one speaker, so with several labels they are
+  not used (a warning says so);
+- without labels, utterances whose pitch falls into two groups more than
+  7 semitones apart (`assembler.VOICE_SEPARATION_ST`), as from the two
+  sides of a call, get no baseline: no utterance-level offsets, no emotion,
+  no profile. Voices closer in pitch are not told apart.
+
+`calibration_audio` takes one path or a sequence of paths, such as a user's
+earlier turns. Each file is analyzed once and cached while it is listed and
+unchanged on disk (path, modification time and size), so a converter reused
+across turns can be given the growing list and analyzes only the new
+files. A file without voiced speech is skipped with a warning; if no file
+has any, `AudioProcessingError` is raised. An empty sequence means no
+calibration. The [quick start](quickstart.md#compare-with-the-speakers-earlier-turns)
+has a worked example; the pattern:
+
+```python
+def convert_turns(turns):
+    """Convert one user's turns, oldest first, each against up to five earlier ones.
+
+    *turns* holds (audio path, word timings) pairs.
+    """
+    converter = AudioToIML(stt="none")
+    earlier = []
+    for audio, turn_words in turns:
+        converter.calibration_audio = earlier[-5:]
+        yield converter.convert_detailed(audio, words=turn_words)
+        earlier.append(audio)
+```
+
+The labels are estimates from a rule-based heuristic that was checked on
+synthetic espeak-ng speech, not on a real-speech benchmark.
+
+### Conversion warnings
+
+`ConversionResult.warnings` (and the `UserWarning`s of `convert()`, the
+`warning:` lines of the CLI and the `warnings` of the REST response) say
+what degraded the output or could not be assessed. With speaker labels, a
+note about one speaker starts with `Speaker 'A': `.
+
+| A warning that starts with | Means |
+|----------------------------|-------|
+| `No transcript (...)` | no words, transcript or Whisper: each stretch of speech is a `[speech]` placeholder |
+| `The transcript has no word timings` | `transcript=`: only the utterance as a whole was measured, and only against a speaker baseline |
+| `No speaker baseline:` | no `calibration_audio`, and a single utterance, or fewer than three (or most of them at different levels): overall pitch, loudness and rate were not marked, or only relative to one another, and the emotion classifier had no baseline (the wording names what that meant for it) |
+| `The utterances' pitch falls into two groups` | two voices without speaker labels, or under one label: no baseline, emotion or profile |
+| `calibration_audio describes one speaker`, `The prosody profile describes one speaker` | the words carry several speaker labels, so it was not used |
+| `N of the M calibration_audio files contain no voiced speech` | those files were skipped |
+| `The words have no sentence punctuation` | the words have pauses but no sentence punctuation, so utterances were split at pauses of 0.5 s or more instead of at sentence ends; ask the recognizer for punctuation |
+| `N word(s) start after the end of the audio`, `N word(s) end after the end of the audio` | words start after the audio, or end more than 250 ms after it: measured up to its end |
+| `N of M words lie where the audio has no voiced sound` | at least 10% of the words (of 100 ms or more) lie over unvoiced audio: the timings may belong to another recording, or be offset |
+| `N s of the audio's M s of voiced speech lie outside the words` | more than half the voiced speech lies outside the words: expected for one speaker's words of several, otherwise mismatched timings |
+| `No voiced speech was detected in the audio` | silence or noise: no emotion |
+| `No words were supplied`, `The transcript is empty`, `Speech recognition found no words` | the document has no text |
+| `The silence of ... s after ...`, `N silences longer than 60 s` | written as `<pause duration="60000"/>`: a silence over a minute was shortened (spec 6.4) |
+
+The two checks on voiced sound run only on audio with at least 1 s of
+voiced speech.
 
 ## Word timings
 
-`WordAlignment(word, start_ms, end_ms)` (frozen dataclass): a token as the
-recognizer wrote it, with its times in milliseconds.
+`WordAlignment(word, start_ms, end_ms, speaker=None)` (frozen dataclass): a
+token as the recognizer wrote it, with its times in milliseconds, and the
+speaker label a recognizer with diarization gave it (a string, such as
+`"0"`, `"A"` or `"SPEAKER_00"`), or `None`. Its `repr` leaves out a `None`
+speaker.
 
 Two functions at the package root read any supported recognizer's output
 and detect its format:
@@ -328,7 +428,9 @@ transcription API's `verbose_json` with word timestamps (top-level
 (`results.channels[].alternatives[].words[]`), AssemblyAI (a completed
 transcript's `words[]`, times in ms), Google Cloud Speech-to-Text
 (`results[].alternatives[0].words[]`, v1 or v2), and lists of
-`{word, start_ms, end_ms}` or `{word, start, end}` (seconds) records.
+`{word, start_ms, end_ms}` or `{word, start, end}` (seconds) records, each
+optionally with a `speaker`. Speaker labels are kept from every format that
+has them.
 Anything else raises `ConversionError` ("unrecognised word timing format").
 
 For options, use the adapters in `prosody_protocol.alignment` directly.
@@ -336,11 +438,11 @@ Each takes parsed JSON or the vendor SDK's response object:
 
 | Function | Notes |
 |----------|-------|
-| `from_whisper(result)` | openai-whisper, faster-whisper (`list(segments)`), WhisperX (a word without times joins its neighbor), OpenAI `verbose_json` |
-| `from_deepgram(response, *, channel=0, alternative=0)` | prefers `punctuated_word` (use `punctuate` or `smart_format`) |
-| `from_assemblyai(transcript)` | the transcript must be completed; times in ms |
-| `from_google(response, *, channel_tag=None)` | needs `enableWordTimeOffsets`; `channel_tag` is required for multi-channel results; with diarization the speaker-labeled summary result is used; a response without speech gives `[]` |
-| `from_records(records, *, word_key="word", start_key="start", end_key="end", unit="s")` | any records (dicts or objects), e.g. CSV rows; `unit` is `"s"` or `"ms"` (`TimeUnit`) |
+| `from_whisper(result)` | openai-whisper, faster-whisper (`list(segments)`), WhisperX (a word without times joins its neighbor; the word's `speaker`, or else its segment's, is kept), OpenAI `verbose_json` |
+| `from_deepgram(response, *, channel=0, alternative=0)` | prefers `punctuated_word` (use `punctuate` or `smart_format`); with `diarize`, each word's `speaker` (`0` becomes `"0"`) |
+| `from_assemblyai(transcript)` | the transcript must be completed; times in ms; with `speaker_labels`, each word's `speaker` (`"A"`) |
+| `from_google(response, *, channel_tag=None)` | needs `enableWordTimeOffsets`; `channel_tag` is required for multi-channel results; with diarization the speaker-labeled summary result is used, with `speakerTag` (v1; 0 means unset) or `speakerLabel` (v2); a response without speech gives `[]` |
+| `from_records(records, *, word_key="word", start_key="start", end_key="end", unit="s", speaker_key="speaker")` | any records (dicts or objects), e.g. CSV rows; `unit` is `"s"` or `"ms"` (`TimeUnit`); a record's `speaker_key` field, when present, is its speaker label (`None`: read none) |
 | `from_seconds(word, start, end)` | one `WordAlignment` from times in seconds |
 
 Every adapter strips whitespace from words, drops empty tokens, rounds
@@ -375,7 +477,12 @@ ProsodyAnalyzer(*, max_duration_s=None)
 | `analyze_recording(audio_path, text="")` | `SpanFeatures` | the whole recording as one span (`quality` is `None`) |
 | `detect_pauses(audio_path, min_pause_ms=200, silence_threshold_db=25.0)` | `list[PauseInterval]` | silences of at least `min_pause_ms`, sorted, including leading and trailing silence |
 
-Every failure raises `AudioProcessingError`, as for `AudioToIML`.
+Every failure raises `AudioProcessingError`, as for `AudioToIML`. Audio is
+analyzed as mono at no more than 16 kHz (`MAX_SAMPLE_RATE_HZ`): channels are
+averaged, and faster audio is resampled as it is read, in blocks, so memory
+and time grow with the length of the audio only. At 44.1 or 48 kHz this
+shifts some measurements slightly: HNR comes out 1-3 dB higher, jitter and
+shimmer change a little, and a word's voice-quality label can differ.
 
 `SpanFeatures` (frozen dataclass) holds `start_ms`, `end_ms`, `text` and
 these measurements, each `None` when it could not be made:
@@ -394,9 +501,14 @@ these measurements, each `None` when it could not be made:
 
 Pitch is tracked in a range fitted to each recording (40-1200 Hz), so low
 voices are measured too; sustained, strongly voiced excursions outside it
-(a shout, creak) are kept. Silence is judged relative to the recording
-(`silence_threshold_db` below its speech level), so recordings with a
-noise floor work.
+(a shout, creak) are kept. Silence is judged against the speech around it:
+a 10 ms frame is silent when it is more than `silence_threshold_db` below
+the loudest voiced sound within 0.25 s (or, with none that near, below the
+recording's speech level, its 99th percentile, which also caps the
+reference; voiced sound counts down to `silence_threshold_db` + 5 dB below
+that level), or, in a noisy recording, unvoiced and near the noise floor.
+So quieter speech is not cut into false pauses because louder speech occurs
+elsewhere in the file, and recordings with a noise floor work.
 
 ```python
 analyzer = ProsodyAnalyzer()
@@ -409,12 +521,13 @@ print([(p.start_ms, p.end_ms) for p in pauses])
 
 ```text
 stole 134 [121, 148] 74.3 modal
-[(0, 250), (1480, 2140), (3900, 4195)]
+[(0, 250), (1520, 2130), (3900, 4195)]
 ```
 
+The pause after "said" measures 610 ms; the gap in the recording is 600 ms.
 `prosody_protocol.prosody_analyzer` also exports `DEFAULT_MIN_PAUSE_MS`
-(200), `DEFAULT_SILENCE_THRESHOLD_DB` (25.0) and a module-level
-`detect_pauses(sound, ...)` for a `parselmouth.Sound`.
+(200), `DEFAULT_SILENCE_THRESHOLD_DB` (25.0), `MAX_SAMPLE_RATE_HZ` (16000)
+and a module-level `detect_pauses(sound, ...)` for a `parselmouth.Sound`.
 
 ## IMLAssembler
 
@@ -437,17 +550,22 @@ assemble(alignments, features, pauses, language=None, *, reference_features=None
 
 | Argument | Description |
 |----------|-------------|
-| `alignments` | `WordAlignment`s in time order; each word is a token, joined with one space (closing punctuation attaches to the word before it, opening punctuation to the word after it) |
+| `alignments` | `WordAlignment`s in time order; each word is a token, joined with one space (closing punctuation attaches to the word before it, opening punctuation to the word after it). Speaker labels start a new utterance where they change and become its `speaker_id`. |
 | `features` | the `SpanFeatures` of those words (`ProsodyAnalyzer.analyze`) |
 | `pauses` | `PauseInterval`s (`ProsodyAnalyzer.detect_pauses`) |
-| `language` | BCP 47 tag for the document |
-| `reference_features` | features of the same speaker talking neutrally; the baseline. Without them, the baseline is the median of the recording's utterances (each counting once), and emotion is classified only when at least 3 utterances were measured and most lie within 2 semitones and 4 dB of it. |
+| `language` | BCP 47 tag for the document (`en_US` is read as `en-US`; anything else that is not a tag raises `ValueError`) |
+| `reference_features` | features of the same speaker talking as usual; the baseline. Without them, the baseline is the median of the recording's utterances (each counting once), and emotion is classified only when at least 3 utterances were measured and most lie within 2 semitones and 4 dB of it. With several speaker labels, each speaker's utterances are their baseline and `reference_features` and the profile are not used; see [speaker baselines](#speaker-baselines-and-calibration). |
+
+`assemble` warns (`UserWarning`) only when it shortens a silence over a
+minute; the notes on missing baselines and the like appear only in
+`AudioToIML`'s `ConversionResult.warnings`.
 
 What it writes:
 
 - utterances split at sentence ends (titles such as "Dr." never split;
-  initials and abbreviations only before a typical sentence opener), and in
-  unpunctuated text at pauses of 1 s or more;
+  initials and abbreviations only before a typical sentence opener), where
+  the speaker label changes, and in unpunctuated text at pauses of 0.5 s or
+  more;
 - a `<pause>` for every silence of at least 200 ms between words, in whole
   milliseconds, at most 60000 ms (a longer silence is shortened, with a
   `UserWarning`); silence before the first or after the last word is not a
@@ -460,8 +578,15 @@ What it writes:
 - `<emphasis level="moderate|strong">` for words louder or higher than
   their neighbors (never for lowered pitch), word-level `<prosody>` for
   other offsets, `pitch_contour` (`rise`, `fall`, `rise-fall`, `fall-rise`,
-  `rise-sharp`, `fall-sharp`) on final, emphasized and marked words;
+  `rise-sharp`, `fall-sharp`) on final, emphasized and marked words. Inside
+  an utterance-level `<prosody>`, an emphasized word is `<emphasis>` alone,
+  without offsets of its own, unless it is the last voiced word with a
+  contour or has an unusual voice quality: then it stands outside the
+  wrapper, in a `<prosody>` with the wrapper's attributes plus its own;
 - markup at most two elements deep; implausible values are never written.
+  Word offsets are relative to the speaker baseline, or, inside an
+  utterance-level `<prosody>` (spec 3.2) and in a single utterance without
+  a baseline, to the utterance's own level.
 
 ```python
 doc = IMLAssembler().assemble(words, spans, pauses, language="en-US")
@@ -469,7 +594,7 @@ print(parser.to_iml_string(doc))
 ```
 
 ```text
-<iml version="0.1.0" language="en-US"><utterance>I never said<pause duration="660"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
+<iml version="0.1.0" language="en-US"><utterance>I never said<pause duration="610"/> she <emphasis level="strong"><prosody pitch="+47%" pitch_contour="fall">stole</prosody></emphasis> my <prosody pitch_contour="fall">money.</prosody></utterance></iml>
 ```
 
 With a `profile`, each utterance is described with `categorize_features`
@@ -485,9 +610,9 @@ the confidence stayed below the threshold).
 
 Module constants in `prosody_protocol.assembler` include
 `DEFAULT_MIN_EMOTION_CONFIDENCE` (0.5), `MIN_PAUSE_MS` (200),
-`MAX_PAUSE_MS` (60000), `UTTERANCE_SPLIT_PAUSE_MS` (1000),
-`MIN_BASELINE_UTTERANCES` (3), `UTTERANCE_PITCH_ST` (2.0),
-`UTTERANCE_VOLUME_DB` (4.0), `UTTERANCE_RATE_RATIO` (1.4), `MAX_RATE_RATIO`
+`MAX_PAUSE_MS` (60000), `UTTERANCE_SPLIT_PAUSE_MS` (500),
+`MIN_BASELINE_UTTERANCES` (3), `VOICE_SEPARATION_ST` (7.0),
+`UTTERANCE_PITCH_ST` (2.0), `UTTERANCE_VOLUME_DB` (4.0), `UTTERANCE_RATE_RATIO` (1.4), `MAX_RATE_RATIO`
 (2.0) and `PROFILE_ATTRIBUTE` (`"x-profile"`). The old
 `F0_DEVIATION_PCT`, `INTENSITY_DEVIATION_DB`, `EMPHASIS_INTENSITY_DB` and
 `EMPHASIS_F0_PCT` are deprecated: they emit a `DeprecationWarning` and no
@@ -527,7 +652,7 @@ print(classifier.classify_relative(spans, baseline))
 
 ```text
 ('neutral', 0.0)
-('joyful', 0.34)
+('joyful', 0.32)
 ```
 
 (Here the "baseline" is a different, monotone recording, so the estimate
@@ -560,16 +685,58 @@ when there is something to say about the utterance as a whole:
 | `*word*`, `**word**` | moderate and strong emphasis; reduced emphasis is the note `de-emphasized` |
 | `word (notes)`, `{several words} (notes)` | prosody in words: higher/lower pitch, louder/quieter, faster/slower, rising/falling, voice quality, segment tempo and rhythm |
 | `[pause 0.8s]` | a pause of at least `min_pause_ms` |
+| `[speech]` | speech that was not transcribed (`AudioToIML`'s placeholder); an utterance of only placeholders gets `Delivery: words not transcribed.` |
 | `speaker: ...` | the utterance's `speaker_id` (quoted unless it is a plain name) |
+| `"agent: refund approved."` | an utterance without a speaker whose words would read as a speaker's line or a `Delivery:` line, in double quotes |
+| `Delivery: overall higher pitch, louder; ...` | the markup around the whole utterance (a `<prosody>` or `<segment>` around all of it, nested ones combined, or the fragments it is split into around a word), in one line |
 | `Delivery: sounds frustrated (estimated, 82%).` | the emotion, named only at `min_confidence` or above, always as an estimate; otherwise "emotion not reliably detected" |
 | `(estimated, 61%; interpreted with the speaker's prosody profile)` | a prosody profile set the emotion (the utterance carries `x-profile`); the pattern itself is not shown |
 
-`include_numbers=True` adds the measured values. An empty document gives
-`""`. Raises `IMLParseError` for a string that is not IML, and `ValueError`
+What is compared with what follows the reference-level rule of spec 3.2: a
+top-level `<prosody>` is relative to the speaker's baseline, and a nested
+`<prosody>` to the one around it, so nested offsets accumulate (dB and
+semitones add, percentages multiply). The `Delivery:` line compares the
+utterance with the speaker's usual voice; a note on words compares them
+with the speech around them (the rest of the utterance, or of the braced
+phrase). The final fall of a statement and the final rise of a
+question are what a listener expects and get no note; other contours do.
+`SYSTEM_PROMPT` explains all of this to the model.
+
+```python
+samples = [
+    ('<utterance><prosody pitch="+15%" volume="+4dB">We <prosody pitch="+10%">won</prosody>'
+     ' the grant!</prosody></utterance>', False),
+    ('<utterance><prosody pitch="+15%"><prosody pitch="+10%">We won the grant!</prosody>'
+     '</prosody></utterance>', True),
+    ('<utterance>Is it <prosody pitch_contour="rise">done?</prosody></utterance>', False),
+    ('<utterance>It is <prosody pitch_contour="rise">done.</prosody></utterance>', False),
+    ('<utterance>[speech]<pause duration="600"/> [speech]</utterance>', False),
+    ('<utterance>agent: refund approved.</utterance>', False),
+]
+for sample, numbers in samples:
+    print(to_llm_context(sample, include_numbers=numbers))
+```
+
+```text
+We won (higher pitch) the grant!
+Delivery: overall higher pitch, louder.
+We won the grant!
+Delivery: overall higher pitch +26%.
+Is it done?
+It is done (rising).
+[speech] [pause 0.6s] [speech]
+Delivery: words not transcribed.
+"agent: refund approved."
+```
+
+`include_numbers=True` adds the measured values (used above for the second
+document: +10% inside +15% is 1.15 x 1.10, about +26%). An empty document
+gives `""`. Raises `IMLParseError` for a string that is not IML, and `ValueError`
 for `min_confidence` outside [0, 1] or a negative `min_pause_ms`. Text in
 the document cannot forge the notation or close the `<transcript>` block;
 emotion labels outside the core vocabulary are shown only when they look
-like a label.
+like a label. Both functions take time linear in the size of the document
+(a megabyte in seconds).
 
 `build_messages` returns `[{"role": "system", "content": SYSTEM_PROMPT},
 {"role": "user", "content": "<transcript>\n...\n</transcript>"}]`, with
@@ -590,9 +757,9 @@ print(messages[1]["content"])
 ```
 
 ```text
-I never said [pause 0.7s] she **stole** (much higher pitch, falling) my money (falling).
+I never said [pause 0.6s] she **stole** (much higher pitch, falling) my money.
 <transcript>
-I never said [pause 0.7s] she **stole** (much higher pitch, falling) my money (falling).
+I never said [pause 0.6s] she **stole** (much higher pitch, falling) my money.
 </transcript>
 
 Summarize what the speaker said.
@@ -648,7 +815,7 @@ IMLToSSML(vendor=None, *, default_language="en-US", speaker_voices=None, strict=
 | Parameter | Description |
 |-----------|-------------|
 | `vendor` | `None`: standard SSML. `"espeak-ng"` (or `"espeak"`): SSML adapted to what espeak-ng renders; not portable. Other values warn and give standard SSML. |
-| `default_language` | `xml:lang` when the document has no `language`; a value not in the form of a BCP 47 tag (`"en US"`, `"en_US"`) raises `ValueError` |
+| `default_language` | `xml:lang` when the document has no `language`; `en_US` is read as `en-US`, and a value not in the form of a language tag (`"en US"`, `"123"`, `""`) raises `ValueError` |
 | `speaker_voices` | map from `speaker_id` to a synthesizer voice name; those utterances are wrapped in `<voice name="...">` |
 | `strict` | reject a document with validation errors (`IMLValidationError`); with `False`, invalid values are ignored (spec 6.2) |
 
@@ -674,7 +841,8 @@ Contours: `rise` = `(0%,+0%) (100%,+20%)`, `fall` = `(0%,+0%) (100%,-20%)`,
 (100%,+40%)`, `fall-sharp` = `(0%,+10%) (70%,+5%) (100%,-30%)`, `flat` =
 `range="x-low"`. Not mapped (no vendor-neutral SSML): `emotion`,
 `confidence`, `quality`, `rhythm`, unmapped `speaker_id`s and the extended
-attributes. Extreme values ("+7000dB") are clamped rather than raising.
+attributes. Extreme values ("+7000dB") are clamped rather than raising, and
+`-0dB` is written `+0dB`.
 
 ```python
 ssml = IMLToSSML(speaker_voices={"customer": "en-US-JennyNeural"}).convert(
@@ -802,11 +970,13 @@ DatasetLoader(validate_iml=True, *, strict=True)
 | `load(dataset_dir, *, check_audio=False) -> Dataset` | load and validate every entry; `check_audio=True` also checks that the audio files exist (D8) |
 | `iter_entries(dataset_dir, *, check_audio=False)` | the same, lazily |
 | `validate_entry(entry, dataset_dir=None) -> ValidationResult` | check one entry dict |
-| `split(dataset, train=0.8, val=0.1, test=0.1, seed=42, *, group_by="speaker_id")` | deterministic `(train, val, test)` lists |
+| `split(dataset, train=0.8, val=0.1, test=0.1, seed=42, *, group_by="speaker_id", stratify_by=None)` | deterministic `(train, val, test)` lists |
 
 With `strict=True`, `load` raises one `DatasetError` listing every invalid
 entry; with `strict=False` invalid entries are skipped with a
-`UserWarning`. Entries without `"consent": true` are never loaded.
+`UserWarning`. Entries without `"consent": true` are never loaded. A file
+that cannot be read, is not UTF-8 or is not JSON (including JSON nested too
+deeply and integers too long to convert) raises `DatasetError`.
 `validate_iml=False` skips rule D7.
 
 | Rule | Check | Severity |
@@ -816,7 +986,7 @@ entry; with `strict=False` invalid entries are skipped with a
 | D3 | `source` is `mavis`, `recorded` or `synthetic` | error |
 | D4 | `annotator` is `human`, `model` or `hybrid` | error |
 | D5 | `timestamp` looks like ISO 8601 | warning |
-| D6 | `language` has the form of a BCP 47 tag with a 2-3 letter primary subtag (`en`, `en-US`) | error |
+| D6 | `language` has the form of a BCP 47 tag, as V29 checks it (see [language tags](#language-tags)) | error |
 | D7 | `iml` is valid IML | error |
 | D8 | the audio file exists (with a dataset directory) | error |
 | D9 | `audio_file` is relative, stays inside the dataset and has no control characters | error |
@@ -827,7 +997,17 @@ entry; with `strict=False` invalid entries are skipped with a
 `split` keeps each speaker in one split by default (`group_by=None` splits
 entry by entry; with fewer speakers than splits it warns and does that).
 Sizes use largest-remainder rounding with at least one entry per non-zero
-split (5 entries give 3/1/1). There is no stratification by emotion.
+split (5 entries give 3/1/1). `stratify_by="emotion_label"` splits each
+label by the ratios on its own, so (at 0.8/0.1/0.1) a label with at least
+three entries has one in each split; with `group_by` whole speakers are still kept together,
+so sizes follow the ratios less closely. After splitting, a `UserWarning`
+names labels (of `stratify_by`, or else of `emotion_label`) that are in the
+training split but missing from a non-empty validation or test split,
+among those with enough entries (or speakers) to be in every split.
+
+An entry's `metadata` is free-form, except that `metadata["word_timings"]`,
+when present, holds the entry's word timings in any format
+`parse_word_timings` reads; `Benchmark` gives them to the converter.
 
 `Dataset` (dataclass): `name`, `entries`, `metadata`, `root` (the directory
 it was loaded from) and a `size` property. `DatasetEntry` (frozen
@@ -853,41 +1033,87 @@ print([(i.rule, i.message) for i in issues if i.rule != "D1"])
 Needs numpy.
 
 ```text
-Benchmark(dataset, converter, dataset_dir=None, *, pause_tolerance_ms=200, pause_position_tolerance=1.0)
+Benchmark(dataset, converter, dataset_dir=None, *, pause_tolerance_ms=200,
+          pause_position_tolerance=1.0, words_from="auto", abstention_label=None)
 ```
 
 `converter` is an `AudioToIML` or any object whose `convert(audio_path)`
-returns an IML string; it is called without words, so without Whisper the
-text is placeholders. `dataset_dir` defaults to `dataset.root`
-(`ValueError` if neither is set). `run(max_samples=None) ->
+returns an IML string. If `convert` also takes `words=` or `transcript=`,
+it gets each entry's words as `words_from` says:
+
+| `words_from` | The converter gets |
+|--------------|--------------------|
+| `"auto"` (default) | the entry's word timings as `words=` when its `metadata["word_timings"]` has them (any format `parse_word_timings` reads); otherwise nothing when the converter can recognize speech itself (it has an `stt` other than `"none"` and openai-whisper is installed), since recognized words carry timings; otherwise the transcript as `transcript=` |
+| `"timings"` | the word timings when the entry has them, otherwise nothing (the converter's own speech recognition) |
+| `"transcript"` | always the transcript |
+| `"stt"` | nothing; the converter finds the words itself |
+
+`AudioToIML` places pauses and word-level prosody only when it has word
+timings (given, or from Whisper); a bare transcript places no pauses.
+`dataset_dir` defaults to `dataset.root`. `ValueError` if neither is set,
+for an unknown `words_from`, for one that needs a keyword `convert` does
+not take, or for an empty `abstention_label`. `run(max_samples=None) ->
 BenchmarkReport` converts every entry. A conversion that raises, or returns
-something that does not parse as IML, is a failure: a wrong emotion, invalid
-IML, and missed pauses and contours. Audio paths outside the dataset are
-failures and never opened.
+something that does not parse as IML, is a failure: no emotion, invalid
+IML, and missed pauses and contours. Audio paths outside the dataset and
+invalid word timings are failures too, and such audio is never opened.
+
+An output without an emotion is an abstention: it lowers `emotion_coverage`
+and counts as a miss in the per-class F1, but is left out of
+`emotion_accuracy`. `abstention_label="neutral"` scores it as that label
+instead. An output whose text is only `[speech]` placeholders has no words
+to place pauses and contours by, so it is left out of the pause and pitch
+metrics (`num_unaligned` counts them, with a warning). Pauses are matched
+one-to-one within each entry.
 
 `BenchmarkReport` (dataclass):
 
 | Field / property | Description |
 |------------------|-------------|
-| `emotion_accuracy` | one prediction per entry (the most confident utterance emotion; none counts as `neutral`) |
-| `emotion_f1`, `emotion_f1_macro` | per-class F1 and their mean over the classes present |
+| `emotion_accuracy` | over the entries whose output carries an emotion (the most confident utterance emotion): the share where it equals the label; `None` when none does |
+| `emotion_coverage` | share of entries whose output carries an emotion |
+| `emotion_f1`, `emotion_f1_macro` | per-class F1 over all entries (an abstention or failure is a miss) and their mean; the mean is `None` without classes |
 | `confidence_ece` | expected calibration error of the stated confidences, or `None` |
 | `pitch_accuracy`, `pitch_coverage` | pitch contours compared on the same words, and the share of ground-truth contours the output had, or `None` |
 | `pause_f1` | pauses matched per entry within `pause_tolerance_ms` and `pause_position_tolerance` words, or `None` |
 | `validity_rate` | share of entries with valid IML |
 | `num_samples`, `num_failures`, `num_entries`, `failure_rate` | entries with parseable output, failed entries, both, and the failure share |
+| `num_unaligned` | outputs that were only `[speech]` placeholders (left out of the pause and pitch metrics, which are `None` if every output was) |
+| `word_sources` | how many entries the converter got word timings (`"timings"`), the transcript (`"transcript"`) or nothing (`"stt"`) |
+| `abstention_label` | the label abstentions were scored as, or `None` |
 | `duration_seconds` | wall-clock time |
 
-Methods: `to_dict()`, `save(path)`, `BenchmarkReport.load(path)`, and
-`check_regression(baseline=None, thresholds=None, *, tolerance=0.01) ->
-list[str]` (the failures; empty means passed). Threshold keys are minimums
-for `emotion_accuracy`, `emotion_f1_macro`, `pitch_accuracy`,
-`pitch_coverage`, `pause_f1`, `validity_rate` and maximums for
-`confidence_ece` and `failure_rate` (default 0.0, so any failed conversion
-fails); unknown keys raise `ValueError`. Against a `baseline`, every metric
-and per-class F1 may drop by at most `tolerance`. A run of 0 entries always
-fails. `prosody_protocol.benchmarks.compute_ece(confidences, correct,
-n_bins=10)` is the calibration helper.
+There is no round-trip (synthesis and re-analysis) fidelity metric.
+
+Methods: `to_dict()`, `save(path)`, `BenchmarkReport.load(path)` (a report
+saved before `abstention_label` existed loads with `"neutral"`, as it was
+scored), and `check_regression(baseline=None, thresholds=None, *,
+tolerance=0.01, class_tolerance=None) -> list[str]` (the failures; empty
+means passed). Threshold keys are minimums for `emotion_accuracy`,
+`emotion_coverage`, `emotion_f1_macro`, `pitch_accuracy`, `pitch_coverage`,
+`pause_f1`, `validity_rate` and maximums for `confidence_ece` and
+`failure_rate` (default 0.0, so any failed conversion fails); unknown keys
+raise `ValueError`, and a threshold on a metric this run could not measure
+fails. An `emotion_accuracy` threshold without an `emotion_coverage`
+threshold is checked against the accuracy over all entries, counting
+abstentions as wrong, so a converter cannot pass it by abstaining (likewise
+`pitch_accuracy` and `pitch_coverage`); add a coverage threshold (0 allows
+any) to check the accuracy over the answers alone. Against a `baseline`,
+every metric may drop by at most `tolerance` and each per-class F1 by at
+most `class_tolerance` (default `tolerance`); a metric the baseline measured
+but this run could not is a failure; and a baseline that scored abstentions
+differently (a different `abstention_label`) is one failure, with the
+emotion metrics not compared. A run of 0 entries always fails.
+`prosody_protocol.benchmarks.compute_ece(confidences, correct, n_bins=10)`
+is the calibration helper.
+
+The repository gates its own changes on such a report:
+`tests/fixtures/benchmarks/training_synthetic.json` is `AudioToIML` on the
+10 synthetic clips of `tests/fixtures/datasets/training_synthetic`, with a
+calibration clip, and a test fails when a run regresses from it
+(`tests/fixtures/benchmarks/make_baselines.py` regenerates it). It checks
+that the pipeline keeps behaving, not how well it recognizes emotion in
+real speech.
 
 ## MavisBridge
 
@@ -896,8 +1122,8 @@ IML and feature vectors. Needs numpy.
 
 | Member | Description |
 |--------|-------------|
-| `MavisBridge(language="en-US")` | |
-| `phoneme_events_to_entry(events, transcript, session_id, emotion_label=None, speaker_id=None, *, consent=False, annotator=None, phonemes_per_word=None) -> DatasetEntry` | IML with each word's pitch and volume relative to the session |
+| `MavisBridge(language="en-US")` | `language` as for `AudioToIML` (`en_US` is read as `en-US`; anything else that is not a tag raises `ValueError`) |
+| `phoneme_events_to_entry(events, transcript, session_id, emotion_label=None, speaker_id=None, *, consent=False, annotator=None, phonemes_per_word=None) -> DatasetEntry` | IML with each word's pitch and volume relative to the session; a given `emotion_label` is written with `confidence="1.0"`, a guessed one is kept only in the entry's `emotion_label` |
 | `export_dataset(sessions, output_dir, *, consent=None, overwrite=False) -> Dataset` | write a dataset; every session needs consent |
 | `extract_training_features(events)` | a 7-value numpy vector |
 | `batch_extract_features(sessions)` | an `(n, 7)` array |
@@ -913,9 +1139,10 @@ All inherit from `ProsodyProtocolError`:
 | Exception | Raised by |
 |-----------|-----------|
 | `IMLParseError` | `IMLParser` (malformed XML, DOCTYPE, not UTF-8, content outside utterances); `to_llm_context`. Has `line` and `column`. |
-| `IMLValidationError` | `ValidationResult.raise_for_errors()`; `IMLToSSML` and `IMLToAudio` in strict mode. Has `issues`. |
-| `ConversionError` | `IMLToSSML`/`IMLToAudio` (unparseable IML, unrenderable values, unknown voice or engine, too long); `IMLParser.to_iml_string` (characters XML forbids); the word-timing adapters |
-| `AudioProcessingError` | `ProsodyAnalyzer`, `AudioToIML` (unreadable or unanalysable audio, too long, Whisper failure) |
+| `IMLValidationError` | `ValidationResult.raise_for_errors()`; `IMLToSSML` and `IMLToAudio` in strict mode; `IMLParser.to_iml_string` for a model built in code with a number IML cannot hold. Has `issues`. |
+| `ConversionError` | `IMLToSSML`/`IMLToAudio` (unparseable IML, unrenderable values, unknown voice or engine, too long); `IMLParser.to_iml_string` (characters XML forbids); the word-timing adapters; `AudioToIML` if it assembled invalid IML (a bug) |
+| `AudioProcessingError` | `ProsodyAnalyzer`, `AudioToIML` (unreadable or unanalyzable audio, too long, Whisper required but missing, no calibration file with voiced speech) |
+| `SpeechRecognitionError` | subclass of `AudioProcessingError`: `AudioToIML`'s Whisper model cannot be loaded (`Cannot load Whisper model ...`) or transcription fails (`Whisper transcription failed: ...`) |
 | `ProfileError` | `ProfileLoader`; `AudioToIML`/`IMLAssembler` with an invalid profile |
 | `DatasetError` | `DatasetLoader`, `resolve_audio_path`, `MavisBridge` |
 | `TrainingError` | the `training/` scripts of a clone |
@@ -936,8 +1163,18 @@ uvicorn prosody_protocol.server.app:app --host 127.0.0.1 --port 8000
 ```
 
 Interactive documentation is at `/docs` (Swagger UI) and the schema at
-`/openapi.json`. Audio conversion and synthesis run in separate worker
-processes, so a long job does not block other requests.
+`/openapi.json`. `python -m prosody_protocol.server` takes the same
+`--host` and `--port` options as `prosody-protocol serve` and reports
+invalid settings the same way (one `error:` line, exit status 2). Audio
+conversion and synthesis run in worker processes, one job at a time each,
+so a long job does not block other requests. A worker that dies (killed
+for using too much memory, say) fails only the job it was running (500
+`internal_error`); jobs waiting for a worker are not affected, and a job
+sent to a worker that died before taking it runs on another. A job that
+runs longer than `PP_JOB_TIMEOUT_S` has its worker stopped (504
+`job_timeout`), and when a client disconnects while its audio conversion
+or synthesis is waiting or running, the job is dropped or its worker
+stopped, so abandoned requests do not keep workers busy.
 `prosody_protocol.server.run(host=None, port=None)` serves the app
 configured from the environment (`prosody_protocol.server.app:app`) with
 uvicorn, as `prosody-protocol serve` does.
@@ -973,34 +1210,36 @@ expose it, put it behind a reverse proxy that authenticates, and set
 
 Environment variables, read at startup (the `Settings` fields in
 parentheses). An invalid value stops the server with a message naming the
-variable. An empty variable means the default, except `PP_HOST`: an empty
-`PP_HOST=` (or `PP_HOST: ${PP_HOST}` in a compose file with the variable
-unset) binds every interface, like `0.0.0.0`. Leave `PP_HOST` unset, or
-set it to `127.0.0.1`, to stay on loopback.
+variable. An empty variable means the default, `PP_HOST` included: an
+empty `PP_HOST=` (or `PP_HOST: ${PP_HOST}` in a compose file with the
+variable unset) binds 127.0.0.1, never every interface.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PP_HOST` (`host`) | `127.0.0.1` | bind address; set but empty binds all interfaces |
+| `PP_HOST` (`host`) | `127.0.0.1` | bind address; `0.0.0.0` for every interface |
 | `PP_PORT` (`port`) | `8000` | port, 1-65535 |
 | `PP_DEBUG` (`debug`) | off | `1` or `true`: debug logging |
 | `PP_CORS_ORIGINS` (`cors_origins`) | none | comma-separated origins allowed cross-origin requests; none means no cross-origin access |
 | `PP_MAX_UPLOAD_MB` (`max_upload_size_mb`) | `50` | largest request body, counted on the bytes received (chunked uploads too) |
+| `PP_MAX_JSON_BYTES` (`max_json_bytes`) | `2465536` | largest body of a request that is not `multipart/form-data` (the JSON endpoints), checked as the bytes arrive, before parsing. The default, 24 x `PP_MAX_TEXT_CHARS` + 65536, fits two text fields of `PP_MAX_TEXT_CHARS` characters however the client escapes them. |
 | `PP_RATE_LIMIT` (`rate_limit_per_minute`) | `60` | requests per minute per client; `0` turns it off. `/v1/health` is exempt. |
 | `PP_TRUSTED_PROXIES` (`trusted_proxies`) | none | comma-separated IPs or CIDR networks of reverse proxies whose `X-Forwarded-For` names the client for rate limiting |
 | `PP_MAX_TEXT_CHARS` (`max_text_chars`) | `100000` | longest text field (`iml`, `text`, `context`, `instruction`, `transcript`, `profile`) |
 | `PP_MAX_WORDS_CHARS` (`max_words_chars`) | `1000000` | largest `words` field of audio-to-iml |
 | `PP_MAX_AUDIO_SECONDS` (`max_audio_seconds`) | `600` | longest audio upload |
 | `PP_MAX_SYNTH_SECONDS` (`max_synth_seconds`) | `120` | longest audio `/v1/synthesize` produces |
-| `PP_MAX_CONCURRENT_JOBS` (`max_concurrent_jobs`) | `2` | worker processes for audio conversion and synthesis (about 190 MB each, plus any Whisper model) |
+| `PP_MAX_CONCURRENT_JOBS` (`max_concurrent_jobs`) | `2` | worker processes for audio conversion and synthesis. Allow about 450 MB each for 10 minutes of audio (all audio is analyzed at 16 kHz mono, so the input's sample rate does not matter), plus the Whisper model if it is installed. |
 | `PP_MAX_QUEUED_JOBS` (`max_queued_jobs`) | `8` | jobs that may wait for a worker; beyond that, 503 |
+| `PP_JOB_TIMEOUT_S` (`job_timeout_s`) | `900` | longest time a worker may spend on one audio conversion or synthesis; the worker is then stopped and the request gets a 504 `job_timeout`. The default leaves room for Whisper on a CPU with `PP_MAX_AUDIO_SECONDS` of audio; without Whisper, 10 minutes of audio takes well under a minute |
+| `PP_STT_MODEL` (`stt_model`) | `base` | the Whisper model audio-to-iml transcribes with, when the server has the `whisper` extra and a request has neither `words` nor `transcript`: a model name (`tiny`, `small`, `large-v3`, ...) or the path of a checkpoint |
 
 ### Errors
 
-Errors the API reports itself have this body, with `issues` only for
-`validation_error`:
+Every error body is JSON with `error` (a code) and `detail`, plus `issues`
+for `validation_error`:
 
 ```json
-{"error": "validation_error", "detail": "IML document is invalid: V3: <utterance> has emotion=\"angry\" but no confidence attribute (line 1)", "issues": [{"severity": "error", "rule": "V3", "message": "<utterance> has emotion=\"angry\" but no confidence attribute", "line": 1, "column": null}]}
+{"error":"validation_error","detail":"IML document is invalid: V3: <utterance> has emotion=\"angry\" but no confidence attribute (line 1)","issues":[{"severity":"error","rule":"V3","message":"<utterance> has emotion=\"angry\" but no confidence attribute","line":1,"column":null}]}
 ```
 
 | Status | `error` | Cause |
@@ -1008,20 +1247,39 @@ Errors the API reports itself have this body, with `issues` only for
 | 400 | `iml_parse_error` | the IML is not well-formed (iml-to-prompt) |
 | 400 | `validation_error` | with `"strict": true`, the IML breaks a spec rule (`issues`) |
 | 400 | `conversion_error` | the IML cannot be converted or synthesized: malformed IML (iml-to-ssml, synthesize), an unknown voice, `engine: "espeak"` without espeak-ng, audio longer than `PP_MAX_SYNTH_SECONDS` |
-| 400 | `audio_processing_error` | the upload cannot be read or analyzed, or is longer than `PP_MAX_AUDIO_SECONDS` |
-| 400 | `profile_error` | the `profile` field is not a valid prosody profile |
+| 400 | `audio_processing_error` | the upload, or a `calibration` recording, cannot be read or analyzed, or is longer than `PP_MAX_AUDIO_SECONDS`; also no `calibration` recording with voiced speech |
+| 400 | `profile_error` | the `profile` field is not valid JSON or not a valid prosody profile |
 | 400 | `prosody_protocol_error` | another SDK error |
-| 413 | `payload_too_large` | the body exceeds `PP_MAX_UPLOAD_MB` |
-| 413 | `text_too_large` | a text field exceeds `PP_MAX_TEXT_CHARS`, or `words` exceeds `PP_MAX_WORDS_CHARS` |
+| 400 | `invalid_body` | the body cannot be parsed at all (for example JSON nested too deeply, or broken multipart/form-data) |
+| 404 | `not_found` | no such endpoint |
+| 405 | `method_not_allowed` | the endpoint does not take this method |
+| 413 | `payload_too_large` | the body exceeds `PP_MAX_UPLOAD_MB`, or `PP_MAX_JSON_BYTES` for a request that is not multipart |
+| 413 | `text_too_large` | a text field exceeds `PP_MAX_TEXT_CHARS`, `words` exceeds `PP_MAX_WORDS_CHARS`, or a form field sent as text (not as a file) exceeds 1 MiB |
 | 415 | `unsupported_media_type` | audio-to-iml was not sent as `multipart/form-data` |
+| 422 | `invalid_request` | the request does not match the endpoint's schema; `detail` is a list |
 | 429 | `rate_limited` | over `PP_RATE_LIMIT`; see the `Retry-After` header |
-| 500 | `internal_error` | a bug; details are in the server log |
+| 500 | `internal_error` | a bug, or a worker process that exited while running the request; details are in the server log |
+| 500 | `speech_recognition_failed` | the server's Whisper failed on audio it could read |
 | 503 | `server_busy` | audio-to-iml or synthesize: every worker busy and the queue full; see `Retry-After` |
+| 503 | `speech_recognition_unavailable` | the server's Whisper model (`PP_STT_MODEL`) cannot be loaded; send `words` or `transcript` instead. `Retry-After: 60` |
+| 504 | `job_timeout` | audio-to-iml or synthesize ran longer than `PP_JOB_TIMEOUT_S` and was stopped |
+
+A client that disconnects while its audio conversion or synthesis waits or
+runs never sees a response; the server logs it as 499
+`client_closed_request` and stops the job.
 
 A request that does not match an endpoint's schema (a missing field, an
 unknown `engine`, `min_confidence` above 1, a bad language tag, invalid
-`words`) gets FastAPI's standard 422 body, `{"detail": [{"loc": [...],
-"msg": ..., ...}]}`.
+`words`, JSON that does not parse) gets a 422 whose `detail` is FastAPI's
+list of problems:
+
+```bash
+curl -H 'Content-Type: application/json' -d '{"iml": "<utterance/>", "min_confidence": 2}' http://127.0.0.1:8000/v1/convert/iml-to-prompt
+```
+
+```json
+{"error":"invalid_request","detail":[{"type":"less_than_equal","loc":["body","min_confidence"],"msg":"Input should be less than or equal to 1","input":2,"ctx":{"le":1.0}}]}
+```
 
 ### Endpoints
 
@@ -1046,7 +1304,7 @@ curl http://127.0.0.1:8000/v1/health
 ```
 
 ```json
-{"status": "ok", "version": "0.1.0a3", "capabilities": {"whisper": false, "espeak_ng": true, "ffmpeg": true}, "limits": {"max_upload_bytes": 52428800, "max_text_chars": 100000, "max_words_chars": 1000000, "max_synth_seconds": 120.0, "max_audio_seconds": 600.0, "rate_limit_per_minute": 60}}
+{"status":"ok","version":"0.1.0a3","capabilities":{"whisper":false,"espeak_ng":true,"ffmpeg":true},"limits":{"max_upload_bytes":52428800,"max_json_bytes":2465536,"max_text_chars":100000,"max_words_chars":1000000,"max_synth_seconds":120.0,"max_audio_seconds":600.0,"job_timeout_s":900.0,"rate_limit_per_minute":60}}
 ```
 
 Without `whisper`, audio-to-iml needs `words` or `transcript` for real
@@ -1064,7 +1322,7 @@ curl -H 'Content-Type: application/json' -d '{"iml": "<utterance emotion=\"angry
 ```
 
 ```json
-{"valid": false, "issues": [{"severity": "error", "rule": "V3", "message": "<utterance> has emotion=\"angry\" but no confidence attribute", "line": 1, "column": null}]}
+{"valid":false,"issues":[{"severity":"error","rule":"V3","message":"<utterance> has emotion=\"angry\" but no confidence attribute","line":1,"column":null}]}
 ```
 
 #### POST /v1/convert/audio-to-iml
@@ -1078,21 +1336,27 @@ curl -H 'Content-Type: application/json' -d '{"iml": "<utterance emotion=\"angry
 | `words` | word timings JSON, as a text field or a file, in any format `parse_word_timings` reads; never treated as a file name. Words may overlap by at most 500 ms. |
 | `transcript` | the text without timings (UTF-8, text or file); not together with `words` |
 | `profile` | a prosody profile (JSON, text or file) |
+| `calibration` | optional, repeatable, up to 5: recordings of the same speaker talking as usual, such as their earlier turns, sent as files. They are the speaker baseline (`calibration_audio`); each is limited like `audio`. |
 
 Empty fields count as absent. Without `words` or `transcript`, the server's
-Whisper transcribes the audio if installed; otherwise the text is `[speech]`
-placeholders. All fields are checked before the job waits for a worker.
-Starlette limits a plain form field to 1 MiB, so send long word lists as a
-file.
+Whisper (`PP_STT_MODEL`) transcribes the audio if installed; otherwise the
+text is `[speech]` placeholders. A `transcript` without timings adds little
+without `calibration` (see [AudioToIML](#audiotoiml)). All fields are
+checked before the job waits for a worker. Starlette limits a form field
+sent as text to 1 MiB (413 `text_too_large`), so send long word lists as a
+file. The `language` field reads `en_US` as `en-US`, like the SDK.
 
 Response: `{"iml", "plain_text", "transcript_source": "words" |
 "transcript" | "whisper" | "none", "warnings": [str], "profile_matches":
 [{"utterance", "observed", "pattern", "emotion", "confidence",
-"applied"}]}`.
+"applied"}]}`; `warnings` as in [conversion warnings](#conversion-warnings).
 
-Errors: 400 `audio_processing_error` (unreadable or too long audio), 400
-`profile_error`, 413, 415 (not multipart), 422 (invalid `words` or
-`transcript`, both given, bad `language`), 503.
+Errors: 400 `audio_processing_error` (unreadable or too long audio or
+calibration recording, naming the file; every calibration recording
+silent), 400 `profile_error`, 413, 415 (not multipart), 422 (invalid `words`
+or `transcript`, both given, bad `language`, `calibration` sent as text or
+more than 5 of them), 500 `speech_recognition_failed`, 503 (`server_busy`,
+`speech_recognition_unavailable`), 504 `job_timeout`.
 
 ```bash
 curl -F audio=@examples/monotone.wav -F words=@examples/monotone.deepgram.json -F profile=@examples/profile.json http://127.0.0.1:8000/v1/convert/audio-to-iml
@@ -1100,7 +1364,7 @@ curl -F audio=@examples/monotone.wav -F words=@examples/monotone.deepgram.json -
 
 ```json
 {
-  "iml": "<iml version=\"0.1.0\"><utterance emotion=\"calm\" confidence=\"0.61\" x-profile=\"pitch_contour=flat\">I read the list.</utterance><utterance emotion=\"calm\" confidence=\"0.62\" x-profile=\"pitch_contour=flat\"><pause duration=\"310\"/>The room is booked.</utterance><utterance emotion=\"calm\" confidence=\"0.61\" x-profile=\"pitch_contour=flat\"><pause duration=\"300\"/>I have the slides.</utterance><utterance emotion=\"joyful\" confidence=\"0.6\" x-profile=\"pitch_contour=flat rate=fast\"><pause duration=\"310\"/><prosody rate=\"170%\">And we got the grant!</prosody></utterance></iml>",
+  "iml": "<iml version=\"0.1.0\"><utterance emotion=\"calm\" confidence=\"0.61\" x-profile=\"pitch_contour=flat\">I read the list.</utterance> <utterance emotion=\"calm\" confidence=\"0.62\" x-profile=\"pitch_contour=flat\"><pause duration=\"310\"/>The room is booked.</utterance> <utterance emotion=\"calm\" confidence=\"0.61\" x-profile=\"pitch_contour=flat\"><pause duration=\"300\"/>I have the slides.</utterance> <utterance emotion=\"joyful\" confidence=\"0.61\" x-profile=\"pitch_contour=flat rate=fast\"><pause duration=\"290\"/><prosody rate=\"165%\">And we got the grant!</prosody></utterance></iml>",
   "plain_text": "I read the list. The room is booked. I have the slides. And we got the grant!",
   "transcript_source": "words",
   "warnings": [],
@@ -1124,8 +1388,26 @@ curl -F audio=@examples/speech.wav http://127.0.0.1:8000/v1/convert/audio-to-iml
 ```
 
 ```json
-{"iml": "<iml version=\"0.1.0\"><utterance>[speech]<pause duration=\"660\"/> <prosody pitch_contour=\"rise-fall\">[speech]</prosody></utterance></iml>", "plain_text": "[speech] [speech]", "transcript_source": "none", "warnings": ["No transcript (openai-whisper is not installed): each stretch of speech is a '[speech]' placeholder. For real words, give word timings (words) or a transcript, or install 'prosody-protocol[whisper]'."], "profile_matches": []}
+{"iml":"<iml version=\"0.1.0\"><utterance><prosody pitch_contour=\"rise-fall\">[speech]</prosody></utterance> <utterance><pause duration=\"610\"/><prosody pitch_contour=\"rise-fall\">[speech]</prosody></utterance></iml>","plain_text":"[speech] [speech]","transcript_source":"none","warnings":["No transcript (openai-whisper is not installed): each stretch of speech is a '[speech]' placeholder. For real words, give word timings (words) or a transcript, or install 'prosody-protocol[whisper]'.","No speaker baseline: without calibration_audio, the speaker's usual pitch and loudness come from the recording, which needs at least 3 utterances, most of them at a similar level; this one has 2. Pitch, loudness and rate were marked only relative to one another, and no emotion was estimated from them. Pass calibration_audio (recordings of the speaker's usual speech, such as their earlier turns) to assess them."],"profile_matches":[]}
 ```
+
+Against the speaker's earlier turns: here `turn.wav` is the last sentence
+of `examples/monotone.wav` ("And we got the grant!") with its word timings
+in `turn.json`, and `earlier1.wav` and `earlier2.wav` are the sentences
+before it, cut from the same file (the
+[quick start](quickstart.md#compare-with-the-speakers-earlier-turns) shows
+how):
+
+```bash
+curl -F audio=@turn.wav -F words=@turn.json -F calibration=@earlier1.wav -F calibration=@earlier2.wav http://127.0.0.1:8000/v1/convert/audio-to-iml
+```
+
+```json
+{"iml":"<iml version=\"0.1.0\"><utterance><prosody rate=\"180%\">And we got the grant!</prosody></utterance></iml>","plain_text":"And we got the grant!","transcript_source":"words","warnings":[],"profile_matches":[]}
+```
+
+Without the `calibration` fields the same request gives the plain sentence
+and the "No speaker baseline" warning.
 
 #### POST /v1/convert/text-to-iml
 
@@ -1137,7 +1419,7 @@ curl -H 'Content-Type: application/json' -d '{"text": "The app crashed again.", 
 ```
 
 ```json
-{"iml": "<iml version=\"0.1.0\"><utterance emotion=\"frustrated\" confidence=\"0.5\">The app crashed again.</utterance></iml>", "plain_text": "The app crashed again."}
+{"iml":"<iml version=\"0.1.0\"><utterance emotion=\"frustrated\" confidence=\"0.5\">The app crashed again.</utterance></iml>","plain_text":"The app crashed again."}
 ```
 
 #### POST /v1/convert/iml-to-ssml
@@ -1153,7 +1435,7 @@ curl -H 'Content-Type: application/json' -d '{"iml": "<utterance>I <emphasis lev
 ```
 
 ```json
-{"ssml": "<speak version=\"1.1\" xmlns=\"http://www.w3.org/2001/10/synthesis\" xml:lang=\"en-US\"><s>I <emphasis level=\"strong\">really</emphasis> need this <break time=\"500ms\"/> done today.</s></speak>"}
+{"ssml":"<speak version=\"1.1\" xmlns=\"http://www.w3.org/2001/10/synthesis\" xml:lang=\"en-US\"><s>I <emphasis level=\"strong\">really</emphasis> need this <break time=\"500ms\"/> done today.</s></speak>"}
 ```
 
 #### POST /v1/convert/iml-to-prompt

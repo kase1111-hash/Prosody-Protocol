@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from ._install import install_hint
+from ._types import normalize_language_tag
 
 try:
     import numpy as np
@@ -130,10 +131,13 @@ class MavisBridge:
     - Dataset entries (JSON) for the dataset infrastructure
     - Feature vectors (numpy) for sklearn training
     - IML markup from phoneme prosody parameters
+
+    *language* is a BCP 47 tag (``en_US`` is read as ``en-US``); anything
+    else raises :class:`ValueError`.
     """
 
     def __init__(self, language: str = "en-US") -> None:
-        self.language = language
+        self.language = normalize_language_tag(language)
         self._parser = IMLParser()
 
     def phoneme_events_to_entry(
@@ -165,7 +169,17 @@ class MavisBridge:
             Unique identifier for this recording session: letters, digits,
             ``.``, ``_`` and ``-`` (it becomes part of file names).
         emotion_label:
-            Ground-truth emotion label. If None, inferred from prosody.
+            Ground-truth emotion label, such as the emotion the player set
+            out to express. The IML states it with ``confidence="1.0"``: it
+            is your label, not a measurement. If None, the bridge guesses a
+            label from the session's averages (volume above 0.8: ``angry``
+            above 300 Hz, else ``joyful``; breathiness above 0.5: ``sad``;
+            volume below 0.3: ``calm``; otherwise ``neutral``). The guess
+            becomes the entry's ``emotion_label`` (annotator ``model`` by
+            default) but is not written into the IML, whose utterance then
+            has no ``emotion`` or ``confidence``: a threshold rule on
+            averages has no measured accuracy, so it has no confidence to
+            state.
         speaker_id:
             Optional speaker identifier.
         consent:
@@ -217,6 +231,7 @@ class MavisBridge:
                     f"Phoneme event {event.phoneme!r} has a missing or non-finite value"
                 )
 
+        inferred = emotion_label is None
         if emotion_label is None:
             emotion_label = self._infer_emotion(events)
             default_annotator = "model"
@@ -236,7 +251,9 @@ class MavisBridge:
                 f"annotator must be one of {sorted(_VALID_ANNOTATORS)}, got {annotator!r}"
             )
 
-        iml = self._events_to_iml(events, transcript, emotion_label, phonemes_per_word)
+        iml = self._events_to_iml(
+            events, transcript, None if inferred else emotion_label, phonemes_per_word
+        )
         features = self.extract_training_features(events)
         if dropped_warning is not None:  # only once the input has been accepted
             warnings.warn(dropped_warning, UserWarning, stacklevel=2)
@@ -454,7 +471,13 @@ class MavisBridge:
     # -- Private helpers ----------------------------------------------------
 
     def _infer_emotion(self, events: list[PhonemeEvent]) -> str:
-        """Infer a simple emotion label from aggregate prosody features."""
+        """Guess an emotion label from aggregate prosody features.
+
+        Mean volume above 0.8 is ``angry`` when the mean pitch is above
+        300 Hz and ``joyful`` otherwise, mean breathiness above 0.5 is
+        ``sad``, mean volume below 0.3 is ``calm``, and anything else
+        ``neutral``. It is a heuristic with no measured accuracy.
+        """
         mean_volume = sum(e.volume for e in events) / len(events)
         mean_breathiness = sum(e.breathiness for e in events) / len(events)
         mean_pitch = sum(e.pitch_hz for e in events) / len(events)
@@ -471,20 +494,20 @@ class MavisBridge:
         self,
         events: list[PhonemeEvent],
         transcript: str,
-        emotion: str,
+        emotion: str | None,
         phonemes_per_word: Sequence[int] | None = None,
     ) -> str:
         """Build IML markup from phoneme events and transcript.
 
         A word whose events' mean pitch differs from the session mean by more
         than 10 %, or whose mean volume differs by more than 30 %, is wrapped
-        in ``<prosody>`` with its relative pitch and volume.
+        in ``<prosody>`` with its relative pitch and volume. *emotion* (a
+        label the caller gave) is stated with confidence 1.0; with ``None``
+        the utterance has no emotion.
         """
         # Compute overall prosody stats for the utterance
         mean_pitch = sum(e.pitch_hz for e in events) / max(len(events), 1)
         mean_volume = sum(e.volume for e in events) / max(len(events), 1)
-
-        confidence = self._compute_confidence(events)
 
         words = transcript.split()
         groups = self._group_events_by_word(events, len(words), phonemes_per_word)
@@ -504,7 +527,7 @@ class MavisBridge:
         doc = IMLDocument(utterances=(Utterance(
             children=tuple(children),
             emotion=emotion,
-            confidence=round(confidence, 2),
+            confidence=None if emotion is None else 1.0,
         ),))
         return self._parser.to_iml_string(doc)
 
@@ -529,7 +552,13 @@ class MavisBridge:
         ):
             return word
         vol_db = 20.0 * math.log10(max(vol_ratio, 0.001))
-        return Prosody(children=(word,), pitch=f"{pitch_dev:+.0f}%", volume=f"{vol_db:+.0f}dB")
+        # A value that rounds to the session's own is left out (spec 6.1:
+        # baseline values SHOULD be omitted); the other one stands out.
+        return Prosody(
+            children=(word,),
+            pitch=None if round(pitch_dev) == 0 else f"{pitch_dev:+.0f}%",
+            volume=None if round(vol_db) == 0 else f"{vol_db:+.0f}dB",
+        )
 
     @staticmethod
     def _group_events_by_word(
@@ -568,21 +597,6 @@ class MavisBridge:
                 cuts = [i * len(ordered) // n_words for i in range(1, n_words)]
         bounds = [0, *cuts, len(ordered)]
         return [ordered[a:b] for a, b in zip(bounds, bounds[1:], strict=False)]
-
-    def _compute_confidence(self, events: list[PhonemeEvent]) -> float:
-        """Compute confidence score based on prosodic distinctiveness."""
-        if len(events) < 2:
-            return 0.5
-
-        volumes = [e.volume for e in events]
-        pitches = [e.pitch_hz for e in events]
-
-        vol_range = max(volumes) - min(volumes)
-        pitch_range = max(pitches) - min(pitches)
-
-        # More dynamic range → higher confidence
-        confidence = 0.5 + min(vol_range * 0.3 + pitch_range / 500, 0.4)
-        return float(min(confidence, 0.95))
 
 
 @dataclass(frozen=True)
@@ -658,7 +672,7 @@ def _exported_audio(output_path: Path, entry_files: list[Path]) -> set[Path]:
     for entry_file in entry_files:
         try:
             raw = json.loads(entry_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):  # e.g. JSON nested too deeply
             continue
         audio_file = raw.get("audio_file") if isinstance(raw, dict) else None
         if not isinstance(audio_file, str):

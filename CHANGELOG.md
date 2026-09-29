@@ -12,9 +12,11 @@ This release makes the core installable without the audio stack, fixes how
 the audio analysis measures pauses, pitch, loudness and tempo (checked on
 synthetic espeak-ng speech), makes emotion labels abstain when unsure, adds
 a command line, an LLM formatter and adapters for word timings from any
-speech recognizer, hardens the REST API, and rewrites the documentation
-around examples that the test suite runs. Many outputs change; read
-**Breaking changes** first.
+speech recognizer, measures each speaker against their own voice (or their
+earlier turns), says in its warnings what it could not assess, scores
+benchmarks without counting abstentions as "neutral", hardens the REST API,
+and rewrites the documentation around examples that the test suite runs.
+Many outputs change; read **Breaking changes** first.
 
 ### Breaking changes
 
@@ -52,7 +54,10 @@ around examples that the test suite runs. Many outputs change; read
   0 when no syllable is found. Voice quality is judged relative to the
   speaker (`modal`, `breathy`, `creaky`, `harsh` or `None`; the analyzer no
   longer produces `tense` or `whispery`). `f0_contour` lists the voiced F0
-  every 10 ms.
+  every 10 ms. Silence is judged against the speech around each frame, and
+  all audio is analyzed as 16 kHz mono, so pauses, rates and levels change
+  on some recordings, and on 44.1/48 kHz audio HNR comes out 1-3 dB higher
+  and jitter and shimmer change a little.
 - **The validator is stricter.** V9, V13, V14, V17 and V18 are errors (were
   warnings), and there are new error rules V19-V31 and warning rules V32
   and V33 (see Added). Numeric attributes must use ASCII digits, floats
@@ -82,8 +87,14 @@ around examples that the test suite runs. Many outputs change; read
   `ValueError` for a `language` that is not a BCP 47 tag (`en_US` is
   accepted as `en-US`). Without words, a transcript or Whisper it emits
   `[speech]` placeholders and says so in its warnings. Whisper load or
-  transcription failures raise `AudioProcessingError` instead of falling
-  back silently.
+  transcription failures raise `SpeechRecognitionError`, a subclass of
+  `AudioProcessingError`, instead of falling back silently. Utterances also
+  split where the speaker label changes and, in unpunctuated text, at
+  pauses of 0.5 s (`UTTERANCE_SPLIT_PAUSE_MS`, was 1 s). A single utterance
+  without calibration audio gets no utterance-level pitch, loudness or rate
+  and a "No speaker baseline" warning; `convert()` issues these notes as
+  `UserWarning`s. `include_extended` adds measurements without changing the
+  markup or the text.
 - **Datasets and benchmarks.** `DatasetLoader` validates every entry when
   loading and raises `DatasetError` listing the problems
   (`DatasetLoader(strict=False)` skips invalid entries instead); a
@@ -93,15 +104,44 @@ around examples that the test suite runs. Many outputs change; read
   defaults to the directory the dataset was loaded from, several
   `BenchmarkReport` metrics can be `None`, and `check_regression()` fails on
   any failed conversion unless a `failure_rate` threshold allows it.
+- **Benchmarks count a missing emotion as an abstention**, no longer as
+  the label `neutral`: `emotion_accuracy` is over the entries whose output
+  has an emotion (`None` when none has), the new `emotion_coverage` is
+  their share, and the per-class F1 counts an abstention as a miss (`emotion_f1_macro` may be `None`). An
+  `emotion_accuracy` threshold without an `emotion_coverage` threshold
+  counts abstentions as wrong. `Benchmark(abstention_label="neutral")` and
+  `benchmark --abstention-label neutral` restore the old scoring. Reports
+  saved before load with `abstention_label="neutral"`, and comparing a run
+  with one scored the other way is a failure. `Benchmark` now gives
+  converters that take them each entry's word timings or transcript
+  (`words_from="auto"`), so scores change.
+- **Serialized IML.** `IMLParser.to_iml_string` separates the utterances
+  inside `<iml>` with a space (`</utterance> <utterance>`), writes parsed
+  numbers as they were written, and raises `IMLValidationError` rather than
+  write invalid numbers from models built in code.
+- **LLM context.** `to_llm_context` merges utterance-level prosody into one
+  `Delivery: overall ...` line, accumulates nested offsets, and gives no
+  note to the ordinary fall of a statement or rise of a question ("my money
+  (falling)." is now "my money."). Speaker-like text in an utterance
+  without a speaker is quoted.
 - **Profiles and Mavis.** `ProfileLoader` rejects unknown keys and treats
   P5 and P6 as errors. `MavisBridge.phoneme_events_to_entry` records the
   caller's `consent` (default `False`; it was always `True`), and
-  `export_dataset` refuses sessions without stated consent.
+  `export_dataset` refuses sessions without stated consent. A given
+  `emotion_label` is written with `confidence="1.0"`; a guessed one stays in
+  the entry's `emotion_label` and is no longer written into the IML with a
+  pseudo-confidence from the session's pitch and volume range. Zero offsets
+  (`+0%`, `+0dB`) are left out.
 - **REST API.** Errors are JSON `{"error": ..., "detail": ...}`, plus
-  `issues` for validation errors. `/v1/synthesize` picks a voice for the
-  document's language by default. `/v1/convert/audio-to-iml` returns 415
-  for requests that are not multipart and 400 for unreadable audio (was
-  500).
+  `issues` for validation errors; that includes 404 (`not_found`), 405
+  (`method_not_allowed`), unparseable bodies (400 `invalid_body`) and
+  schema errors (422 `invalid_request`, whose `detail` is FastAPI's list).
+  `/v1/synthesize` picks a voice for the document's language by default.
+  `/v1/convert/audio-to-iml` returns 415 for requests that are not
+  multipart, 400 for unreadable audio (was 500), and 500
+  `speech_recognition_failed` or 503 `speech_recognition_unavailable` when
+  the server's Whisper fails. An empty `PP_HOST` binds 127.0.0.1 (it bound
+  every interface).
 
 ### Added
 
@@ -132,8 +172,34 @@ around examples that the test suite runs. Many outputs change; read
   (text without timings) on `convert()` and `convert_to_doc()`;
   `convert_detailed()` returning `ConversionResult` (`document`, `iml`,
   `transcript_source`, `warnings`, `profile_matches`); and the options
-  `stt=`, `calibration_audio=` (a neutral recording of the speaker as the
-  baseline), `min_emotion_confidence=`, `max_duration_s=` and `profile=`.
+  `stt=`, `calibration_audio=` (recordings of the speaker as the baseline),
+  `min_emotion_confidence=`, `max_duration_s=` and `profile=`.
+- **Several speakers.** `WordAlignment` has a `speaker` label, which the
+  adapters keep from Deepgram (`speaker`), AssemblyAI (`speaker`), Google
+  (`speakerTag` in v1, 0 meaning none; `speakerLabel` in v2), WhisperX (the
+  word's or its segment's `speaker`) and records (`from_records(...,
+  speaker_key="speaker")`). The assembler starts a new utterance where the
+  speaker changes, writes the label as `speaker_id`, and measures each
+  speaker against their own baseline. Speakers may talk over each other (at
+  most `audio_to_iml.MAX_OVERLAPPING_SPEAKERS`, 3, at once). Without labels,
+  utterances whose pitch falls into two groups more than 7 semitones apart
+  (`assembler.VOICE_SEPARATION_ST`) get no baseline, emotion or profile.
+- **Multi-turn calibration.** `calibration_audio` takes one recording or a
+  sequence of them, such as a user's earlier turns. The attribute can be
+  reassigned between conversions; each file is analyzed once and cached
+  (path, modification time and size). A file without voiced speech is
+  skipped with a warning; if no file has any, `AudioProcessingError`.
+- **Conversion warnings** in `ConversionResult.warnings`: no speaker
+  baseline (worded for the classifier in use), two voices without speaker
+  labels, calibration audio or a profile not used with several speakers,
+  silent calibration files, a transcript without timings (only the whole
+  utterance measured), words without sentence punctuation, and word
+  timings that do not match the audio (words ending more than 250 ms after
+  it, at least 10% of the words over unvoiced audio, or more than half of
+  the voiced speech outside the words).
+- `SpeechRecognitionError` (a subclass of `AudioProcessingError`, exported
+  from the package root) for a Whisper model that cannot be loaded or a
+  failed transcription.
 - **Prosody profiles in the audio pipeline** (spec Section 7.2):
   `AudioToIML(profile=...)` and `IMLAssembler(profile=...)` apply matching
   mappings, mark affected utterances with `x-profile="<matched pattern>"`
@@ -144,7 +210,9 @@ around examples that the test suite runs. Many outputs change; read
 - **`IMLAssembler`** writes every silence of 200 ms or more between words as
   a `<pause>`, and emits `pitch_contour`, utterance-level `rate` for clear
   tempo changes, and `quality` when a voice is unusual for the speaker.
-  `include_extended=True` adds measurements in spec units to every word.
+  `include_extended=True` adds measurements in spec units to the words
+  (except an emphasized word inside an utterance-level `<prosody>`, which
+  stays two levels deep).
 - `SpeakerBaseline`, the `BaselineAwareEmotionClassifier` protocol and
   `RuleBasedEmotionClassifier.classify_relative()`.
 - `ProsodyAnalyzer.analyze_recording()`, `ProsodyAnalyzer(max_duration_s=)`
@@ -174,6 +242,24 @@ around examples that the test suite runs. Many outputs change; read
   `DatasetLoader.load(check_audio=True)`.
 - `BenchmarkReport.emotion_f1_macro`, `failure_rate`, `pitch_coverage` and
   `num_entries`; `check_regression(tolerance=)` with per-class F1 checks.
+- `Benchmark(words_from=, abstention_label=)`: `"auto"` gives a converter
+  that takes them each entry's word timings (`metadata.word_timings`, any
+  format `parse_word_timings` reads), else nothing when it can recognize
+  speech itself (Whisper installed and `stt` not `"none"`), else the
+  transcript; `"timings"`, `"transcript"` and `"stt"` force a source.
+  `BenchmarkReport.emotion_coverage`, `num_unaligned` (outputs that are only
+  `[speech]` placeholders, left out of the pause and pitch metrics),
+  `word_sources` and `abstention_label`; `check_regression(class_tolerance=)`,
+  an `emotion_coverage` threshold, and a failure for a metric the baseline
+  measured but a run could not. `prosody-protocol benchmark --words-from`
+  and `--abstention-label`, and a summary that says where the words came
+  from. A committed report for the `training_synthetic` fixture
+  (`tests/fixtures/benchmarks/training_synthetic.json`, regenerated by
+  `make_baselines.py` there) and a test that fails when a run regresses
+  from it.
+- `DatasetLoader.split(stratify_by=...)` (e.g. `"emotion_label"`), which
+  also works with speaker grouping, and a warning when a label in the
+  training split is missing from a non-empty validation or test split.
 - `MavisBridge.events_from_entry()`; `export_dataset` can copy session audio
   and accepts numpy event values.
 - REST: `POST /v1/convert/iml-to-prompt`; `words`, `transcript` and
@@ -184,18 +270,35 @@ around examples that the test suite runs. Many outputs change; read
   `/v1/convert/iml-to-ssml`; backends and limits in `/v1/health`;
   `create_app(settings)`; the settings `PP_TRUSTED_PROXIES`,
   `PP_MAX_TEXT_CHARS`, `PP_MAX_WORDS_CHARS`, `PP_MAX_SYNTH_SECONDS`,
-  `PP_MAX_AUDIO_SECONDS`, `PP_MAX_CONCURRENT_JOBS` and
-  `PP_MAX_QUEUED_JOBS`.
+  `PP_MAX_AUDIO_SECONDS`, `PP_MAX_CONCURRENT_JOBS`, `PP_MAX_QUEUED_JOBS`,
+  `PP_MAX_JSON_BYTES` (largest non-multipart body, default 2465536 bytes:
+  24 x `PP_MAX_TEXT_CHARS` + 65536; `max_json_bytes` in `/v1/health`) and
+  `PP_STT_MODEL` (the Whisper model name or checkpoint path, default
+  `base`); a repeatable `calibration` file field on
+  `/v1/convert/audio-to-iml` (up to 5 recordings of the speaker, such as
+  earlier turns).
 - Training: `export.py --format json` writes a pickle-free `model.json` that
   `training.portable.PortableModel` runs with numpy alone;
   `training.inference.TrainedEmotionClassifier` plugs a trained model into
-  `AudioToIML(emotion_classifier=...)`; `training/README.md`.
+  `AudioToIML(emotion_classifier=...)`, and abstains on input more than
+  `max_feature_z` (default 4) training standard deviations from the
+  training data (exports record `feature_stats`);
+  `unusual_features()` names such features; `training/README.md`.
+- Spec 3.2 defines reference levels: a top-level `<prosody>` is relative to
+  the speaker's baseline, a nested one to the `<prosody>` around it, so
+  offsets accumulate (dB and semitones add, percentages multiply).
+  `SYSTEM_PROMPT` explains this, and `[speech]` placeholders; an utterance
+  of only placeholders gets `Delivery: words not transcribed.`
+- `prosody_analyzer.MAX_SAMPLE_RATE_HZ` (16000), and the test fixture
+  `speech_levels.wav` (one sentence at several levels, with known pauses)
+  with its generator `tests/generate_speech_levels_fixture.py`.
 - `examples/`: a recording with Whisper-format word timings, a monotone
   speaker with Deepgram-format timings and a matching prosody profile, and a
   sarcastic IML document.
 - `tests/test_docs_examples.py` runs the Python, IML and CLI examples of
   README.md, examples/README.md and docs/. CI gained a core-only job and a
   wheel smoke test.
+- `PP_JOB_TIMEOUT_S` (default 900): a worker that spends longer on one audio conversion or synthesis is stopped and the request gets a 504 `job_timeout`; `/v1/health` reports the limit.
 
 ### Changed
 
@@ -215,6 +318,34 @@ around examples that the test suite runs. Many outputs change; read
 - The `consent` vocabulary adds `none`, and `processing` adds `hybrid`.
 - The `training_synthetic` test dataset is 10 espeak-ng clips whose
   delivery follows their label (was 10 identical tones).
+- Silence is judged against the speech around each frame: the loudest
+  voiced frame within 0.25 s, capped at the file's 99th percentile, so a
+  quieter passage is judged against itself. `silence_threshold_db` also
+  sets how far below the file's level voiced sound still counts as speech
+  (the threshold plus 5 dB).
+- All audio is analyzed as 16 kHz mono: channels are averaged, and faster
+  audio is read in blocks and resampled, so memory and time grow with the
+  duration only (a 10-minute 192 kHz FLAC: 21 s and 293 MB, was 222 s and
+  2.7 GB). A server job needs about 450 MB for 10 minutes of audio.
+- One language-tag rule (a 1-8 letter primary subtag, then subtags of 1-8
+  letters or digits; the form only, not the IANA registry) for validator
+  rule V29, dataset rule D6, `dataset-entry.schema.json`, `IMLToSSML`,
+  `AudioToIML`, `IMLAssembler`, `MavisBridge` and the CLI. SDK and CLI
+  arguments read `en_US` as `en-US` (`IMLToSSML(default_language=)` too);
+  documents and dataset entries are checked as written.
+- Install hints in errors and `prosody-protocol doctor` name the GitHub
+  install (`pip install "prosody-protocol[audio] @ git+https://github.com/kase1111-hash/Prosody-Protocol"`).
+- The REST worker pool runs one process per worker: a worker that dies
+  fails only the job it was running, and queued jobs run on a new one.
+  `python -m prosody_protocol.server` takes the CLI's `--host` and `--port`
+  and reports errors on one line, as `prosody-protocol serve` does.
+- `to_llm_context`, `TextToIML` and `parse_word_timings` run in time linear
+  in their input (a megabyte in seconds). `IMLToSSML` writes `+0dB` for
+  `-0dB`.
+- CI lints and type-checks on Python 3.10; the publish workflow runs the
+  test suite against the built wheel before uploading. The docs harness
+  skips an example only when the extra it needs is really missing, and
+  runs only the `$ `-prompted lines of console blocks.
 - README, CLAUDE.md, CONTRIBUTING.md, datasets/README.md and the docs were
   rewritten against the current code, with real output.
 
@@ -268,9 +399,27 @@ around examples that the test suite runs. Many outputs change; read
 - The Docker image could not start (the `[api]` extra did not install the
   packages the SDK imported); it now installs `.[api]` with espeak-ng and
   ffmpeg and honors `PP_HOST` and `PP_PORT`.
+- Quieter speech got false pauses, an inflated speech rate or a wrong level
+  when louder speech occurred elsewhere in the file.
+- The rule-based classifier's pitch-spread cue depended on utterance length,
+  which gave false `joyful` labels when calibration audio was combined with
+  `transcript=`.
+- `AudioToIML` clamps word timings past the end of the audio, and never
+  returns invalid IML (`ConversionError`); `IMLAssembler` and `MavisBridge`
+  wrote any `language` they were given, even one that is not a tag.
+- Dataset rule D6 required a 2-3 letter primary subtag, so entries whose
+  IML validated could be rejected. Dataset files with JSON nested too
+  deeply or integers too long to convert raised raw errors, not
+  `DatasetError`.
+- `from prosody_protocol import *` failed on the core install.
+- Pause matching in `Benchmark` hit `RecursionError` on long recordings.
+- REST: a text form field over 1 MiB gave a 400; it is a 413
+  `text_too_large` that says to send the field as a file.
 - Earlier fixes after 0.1.0a2 (February 2026): `ProsodyProfile.mappings` is
   a tuple, matching the frozen dataclass; `MavisBridge` converts volume to
   dB with 20·log10; `BenchmarkReport` gained `num_failures`.
+- A client that disconnects no longer leaves its audio conversion or synthesis running: a waiting job is dropped and the worker running a started one is stopped.
+- Several silences at one word boundary now add up; the speech between them (an untranscribed "um") is no longer counted as pause.
 
 ### Security
 
@@ -284,9 +433,17 @@ around examples that the test suite runs. Many outputs change; read
   hours of audio.
 - `PP_MAX_UPLOAD_MB` is enforced on the bytes received, including chunked
   uploads; text fields are capped by `PP_MAX_TEXT_CHARS` and word timings by
-  `PP_MAX_WORDS_CHARS`; caller-supplied words may overlap by at most
-  500 ms; at most `PP_MAX_QUEUED_JOBS` jobs wait for a worker (503 after
-  that).
+  `PP_MAX_WORDS_CHARS`; one speaker's words may overlap by at most 500 ms,
+  and at most three speakers' words at once; at most `PP_MAX_QUEUED_JOBS`
+  jobs wait for a worker (503 after that).
+- `PP_MAX_JSON_BYTES` limits bodies that are not multipart before they are
+  parsed, counted as the bytes arrive: a 48 MB JSON body could cost
+  gigabytes of memory and stall `/v1/health`.
+- A set but empty `PP_HOST` (as a compose file writes for an unset
+  variable) bound the server to every interface; it now means 127.0.0.1.
+- Install hints named `pip install prosody-protocol[...]`, a PyPI name
+  nobody has registered: it fails today and could later install someone
+  else's package. They point at the GitHub repository.
 - The rate limiter keys on the connecting address and trusts
   `X-Forwarded-For` only from `PP_TRUSTED_PROXIES`.
 - Dataset `audio_file` paths must be relative and stay inside the dataset.
@@ -295,7 +452,9 @@ around examples that the test suite runs. Many outputs change; read
   data loads with `allow_pickle=False`. See the correction under 0.1.0a2.
 - Text in an IML document cannot close the `<transcript>` block that
   `build_messages()` writes, and a prosody profile's `user_id` is never
-  written into IML.
+  written into IML. Words in an utterance without a speaker that look like
+  another speaker's line are quoted, so they cannot impersonate a
+  speaker.
 
 ### Deprecated
 
@@ -409,6 +568,13 @@ around examples that the test suite runs. Many outputs change; read
 - `BenchmarkReport` with 7 metrics: emotion accuracy, per-class F1, confidence ECE, pitch accuracy, pause F1, validity rate
 - JSON report persistence for tracking metrics over time
 - Regression detection for CI integration with baseline comparison and threshold checks
+  - **Correction (added in 0.1.0a3):** the report had the six metrics listed; the
+    seventh planned in EXECUTION_GUIDE.md, round-trip (synthesis and
+    re-analysis) fidelity, was never implemented, and there is still no such
+    metric. `check_regression()` existed, but no CI job ran a benchmark or
+    compared one with a baseline. Since 0.1.0a3 a test compares a benchmark of
+    the `training_synthetic` fixture with a committed report
+    (`tests/fixtures/benchmarks/training_synthetic.json`).
 
 #### Documentation & Adoption (Phase 13)
 - Quick Start Guide (`docs/quickstart.md`)

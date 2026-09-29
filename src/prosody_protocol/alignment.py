@@ -32,6 +32,15 @@ non-negative, end no earlier than they start and in time order, and rounds
 them to whole milliseconds. Bad input raises
 :class:`~prosody_protocol.exceptions.ConversionError` naming the word.
 
+Speaker labels from speaker diarization are kept, as strings, in
+:attr:`WordAlignment.speaker <prosody_protocol._types.WordAlignment>`:
+Deepgram's ``words[].speaker`` (``diarize=true``; ``0`` becomes ``"0"``),
+AssemblyAI's ``words[].speaker`` (``speaker_labels``; ``"A"``), Google's
+``speakerTag`` (v1) or ``speakerLabel`` (v2), WhisperX's ``speaker``
+(``"SPEAKER_00"``, from the word or else its segment) and a ``speaker``
+field of other records. The assembler then measures each speaker against
+their own baseline.
+
 This module needs only the standard library.
 """
 
@@ -43,7 +52,7 @@ import math
 import numbers
 import os
 import statistics
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -63,11 +72,22 @@ _MIN_MEDIAN_WORD_MS = 5
 # The unit check needs a few words to be meaningful.
 _UNIT_CHECK_MIN_WORDS = 3
 
-# (word, start, end) as the source gave them, before conversion.
-_RawWord = tuple[Any, Any, Any]
+# (word, start, end, speaker) as the source gave them, before conversion.
+_RawWord = tuple[Any, Any, Any, Any]
 
 # A token ending in one of these ends a sentence.
 _SENTENCE_END = (".", "!", "?", "\u2026", "\u3002", "\uff01", "\uff1f")
+
+# Punctuation is restored by matching the words with the tokens of the text.
+# difflib finds the best matching, but its time grows with the product of
+# their numbers, so beyond this product a linear-time matching is used: it
+# follows the two sequences and, where they differ, looks up to
+# _RESYNC_LOOKAHEAD positions ahead in either for _RESYNC_RUN equal keys in a
+# row (a run, so that a common word such as "the" does not resynchronise
+# them at the wrong place).
+_DIFFLIB_BUDGET = 1_000_000
+_RESYNC_LOOKAHEAD = 8
+_RESYNC_RUN = 3
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +136,20 @@ def _number(value: Any, what: str) -> float:
     return number
 
 
+def _speaker(value: Any, what: str) -> str | None:
+    """A speaker label as a string (``0`` becomes ``"0"``); ``None`` for none or a blank one."""
+    if value is None:
+        return None
+    value = getattr(value, "value", value)  # an SDK enum
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, numbers.Real) and not isinstance(value, bool):
+        number = float(value)
+        if math.isfinite(number) and number.is_integer():
+            return str(int(number))
+    raise ConversionError(f"{what} speaker must be a string or an integer, got {value!r}")
+
+
 def _check_unit(alignments: Sequence[WordAlignment], source: str) -> None:
     """Reject timings whose median word length shows they are in the wrong unit."""
     if len(alignments) < _UNIT_CHECK_MIN_WORDS:
@@ -136,7 +170,7 @@ def _check_unit(alignments: Sequence[WordAlignment], source: str) -> None:
 def _to_alignments(
     raw_words: Iterable[_RawWord], source: str, *, unit: TimeUnit = "s"
 ) -> list[WordAlignment]:
-    """Validate ``(word, start, end)`` triples and convert them to milliseconds.
+    """Validate ``(word, start, end, speaker)`` tuples and convert them to milliseconds.
 
     Empty words are dropped first; the others must have finite, non-negative
     times with ``end >= start``, and start no earlier than the word before.
@@ -144,7 +178,7 @@ def _to_alignments(
     scale = _MS_PER_UNIT[unit]
     alignments: list[WordAlignment] = []
     previous_start = -math.inf
-    for index, (word, start, end) in enumerate(raw_words):
+    for index, (word, start, end, speaker) in enumerate(raw_words):
         if not isinstance(word, str):
             raise ConversionError(f"{source}: word {index} must be a string, got {word!r}")
         text = word.strip()
@@ -163,7 +197,9 @@ def _to_alignments(
                 "word timings must be in time order"
             )
         previous_start = start_ms
-        alignments.append(WordAlignment(text, round(start_ms), round(end_ms)))
+        alignments.append(
+            WordAlignment(text, round(start_ms), round(end_ms), _speaker(speaker, what))
+        )
     _check_unit(alignments, source)
     return alignments
 
@@ -172,13 +208,50 @@ def _match_key(token: str) -> str:
     return "".join(char for char in token.casefold() if char.isalnum())
 
 
+def _linear_matches(a: Sequence[str], b: Sequence[str]) -> Iterator[tuple[int, int]]:
+    """Pairs ``(i, j)`` of equal keys ``a[i] == b[j]``, in order, in linear time.
+
+    The sequences are followed together; where they differ, the nearest
+    place up to :data:`_RESYNC_LOOKAHEAD` positions ahead where
+    :data:`_RESYNC_RUN` keys agree again (after keys missing from ``a``,
+    missing from ``b``, or replaced) is where matching resumes. Keys that
+    never agree are skipped one by one.
+    """
+    n, m = len(a), len(b)
+
+    def agree(i: int, j: int) -> bool:
+        run = min(_RESYNC_RUN, n - i, m - j)
+        return run > 0 and a[i: i + run] == b[j: j + run]
+
+    i = j = 0
+    while i < n and j < m:
+        if a[i] == b[j]:
+            yield i, j
+            i, j = i + 1, j + 1
+            continue
+        for skip in range(1, _RESYNC_LOOKAHEAD + 1):
+            if agree(i, j + skip):
+                j += skip
+                break
+            if agree(i + skip, j):
+                i += skip
+                break
+            if agree(i + skip, j + skip):
+                i, j = i + skip, j + skip
+                break
+        else:
+            i, j = i + 1, j + 1
+
+
 def _restore_punctuation(words: list[Any], text: str) -> list[Any]:
     """Replace bare words with their written form, punctuation included, from *text*.
 
     The OpenAI transcription API gives word timestamps without punctuation
     but the full ``text`` with it; sentence punctuation is what lets the
     assembler split utterances. Words are matched to the whitespace-separated
-    tokens of *text* in order; words that do not match keep their form.
+    tokens of *text* in order; words that do not match keep their form. The
+    time is linear in the size of the input where the two differ a lot
+    (see :data:`_DIFFLIB_BUDGET`), so untrusted input cannot make it slow.
     """
     tokens = text.split()
     token_keys = [_match_key(token) for token in tokens]
@@ -191,11 +264,24 @@ def _restore_punctuation(words: list[Any], text: str) -> list[Any]:
         for word_index, token_index in zip(keyed_words, keyed_tokens, strict=True):
             restored[word_index] = tokens[token_index]
         return restored
-    matcher = difflib.SequenceMatcher(None, word_keys, token_keys, autojunk=False)
-    for word_index, token_index, size in matcher.get_matching_blocks():
-        for offset in range(size):
-            if token_keys[token_index + offset]:
-                restored[word_index + offset] = tokens[token_index + offset]
+    pairs: Iterable[tuple[int, int]]
+    if len(word_keys) * len(token_keys) <= _DIFFLIB_BUDGET:
+        matcher = difflib.SequenceMatcher(None, word_keys, token_keys, autojunk=False)
+        pairs = (
+            (word_index + offset, token_index + offset)
+            for word_index, token_index, size in matcher.get_matching_blocks()
+            for offset in range(size)
+        )
+    else:
+        pairs = (
+            (keyed_words[i], keyed_tokens[j])
+            for i, j in _linear_matches(
+                [word_keys[i] for i in keyed_words], [token_keys[j] for j in keyed_tokens]
+            )
+        )
+    for word_index, token_index in pairs:
+        if token_keys[token_index]:
+            restored[word_index] = tokens[token_index]
     return restored
 
 
@@ -212,7 +298,7 @@ def _merge_untimed(segments: Iterable[Iterable[_RawWord]], source: str) -> list[
     pending: list[str] = []
     for segment in segments:
         previous: list[Any] | None = None  # the last timed word of this segment
-        for word, start, end in segment:
+        for word, start, end, speaker in segment:
             if start is None and end is None:
                 if not isinstance(word, str) or not word.strip():
                     continue
@@ -226,14 +312,14 @@ def _merge_untimed(segments: Iterable[Iterable[_RawWord]], source: str) -> list[
             if pending and isinstance(word, str):
                 word = " ".join([*pending, word.strip()])
                 pending = []
-            previous = [word, start, end]
+            previous = [word, start, end, speaker]
             merged.append(previous)
     if pending:
         if not merged:
             raise ConversionError(f"{source}: no word has start and end times")
         # Untimed words at the very end, after a sentence end.
         merged[-1][0] = " ".join([str(merged[-1][0]).rstrip(), *pending])
-    return [(word, start, end) for word, start, end in merged]
+    return [(word, start, end, speaker) for word, start, end, speaker in merged]
 
 
 def _parse_json(text: str | bytes | bytearray, what: str) -> Any:
@@ -257,7 +343,7 @@ def from_seconds(word: str, start: float, end: float) -> WordAlignment:
     >>> from_seconds(" country.", 5.21, 5.74)
     WordAlignment(word='country.', start_ms=5210, end_ms=5740)
     """
-    alignments = _to_alignments([(word, start, end)], "from_seconds")
+    alignments = _to_alignments([(word, start, end, None)], "from_seconds")
     if not alignments:
         raise ConversionError("from_seconds: the word is empty")
     return alignments[0]
@@ -270,12 +356,15 @@ def from_records(
     start_key: str = "start",
     end_key: str = "end",
     unit: TimeUnit = "s",
+    speaker_key: str | None = "speaker",
 ) -> list[WordAlignment]:
     """Word timings from records with the given keys (dicts or objects).
 
     *unit* is the unit of the start and end times: ``"s"`` (seconds, the
     default) or ``"ms"``. Times may be numbers or numeric strings, so rows
-    from :class:`csv.DictReader` work.
+    from :class:`csv.DictReader` work. A record's *speaker_key* field, when
+    it has one, is its speaker label (a string or an integer); ``None``
+    reads no speaker labels.
     """
     if unit not in _MS_PER_UNIT:
         raise ValueError(f"unit must be 's' or 'ms', got {unit!r}")
@@ -285,7 +374,8 @@ def from_records(
         for key, value in zip((word_key, start_key, end_key), values, strict=True):
             if value is None:
                 raise ConversionError(f"records: record {index} has no {key!r}")
-        raw_words.append((values[0], values[1], values[2]))
+        speaker = None if speaker_key is None else _field(record, speaker_key)
+        raw_words.append((values[0], values[1], values[2], speaker))
     return _to_alignments(raw_words, "records", unit=unit)
 
 
@@ -297,7 +387,9 @@ def from_whisper(result: Any) -> list[WordAlignment]:
     - openai-whisper's ``model.transcribe(..., word_timestamps=True)`` result
       (``segments[].words[]`` with ``word``, ``start``, ``end``);
     - WhisperX output of the same shape (words it could not align, which
-      have no times, are attached to the neighbouring word);
+      have no times, are attached to the neighbouring word; the ``speaker``
+      that ``assign_word_speakers`` gives a word, or else its segment, is
+      kept);
     - a list of segments, such as faster-whisper's
       ``list(model.transcribe(..., word_timestamps=True)[0])``;
     - the OpenAI transcription API's ``verbose_json`` response with
@@ -312,13 +404,16 @@ def from_whisper(result: Any) -> list[WordAlignment]:
         words, segments = None, result
     if words is not None:
         raw_words = [
-            (_field(w, "word"), _field(w, "start"), _field(w, "end"))
+            (_field(w, "word"), _field(w, "start"), _field(w, "end"), _field(w, "speaker"))
             for w in _items(words, "whisper: words")
         ]
         text = _field(result, "text")
         if isinstance(text, str):
-            restored = _restore_punctuation([word for word, _, _ in raw_words], text)
-            raw_words = [(r, s, e) for r, (_, s, e) in zip(restored, raw_words, strict=True)]
+            restored = _restore_punctuation([word for word, _, _, _ in raw_words], text)
+            raw_words = [
+                (r, s, e, speaker)
+                for r, (_, s, e, speaker) in zip(restored, raw_words, strict=True)
+            ]
         return _to_alignments(_merge_untimed([raw_words], "whisper"), "whisper")
 
     if segments is None:
@@ -331,9 +426,15 @@ def from_whisper(result: Any) -> list[WordAlignment]:
                 "whisper: the segments have no word timestamps; transcribe with "
                 "word_timestamps=True (or timestamp_granularities=['word'] in the API)"
             )
+        segment_speaker = _field(segment, "speaker")
         per_segment.append(
             [
-                (_field(w, "word"), _field(w, "start"), _field(w, "end"))
+                (
+                    _field(w, "word"),
+                    _field(w, "start"),
+                    _field(w, "end"),
+                    segment_speaker if _field(w, "speaker") is None else _field(w, "speaker"),
+                )
                 for w in _items(segment_words, "whisper: segment words")
             ]
         )
@@ -347,6 +448,7 @@ def _deepgram_words(words: Any) -> list[WordAlignment]:
                 _first_field(w, "punctuated_word", "word"),
                 _field(w, "start"),
                 _field(w, "end"),
+                _field(w, "speaker"),
             )
             for w in _items(words, "deepgram: words")
         ),
@@ -360,6 +462,8 @@ def from_deepgram(response: Any, *, channel: int = 0, alternative: int = 0) -> l
     Reads ``results.channels[channel].alternatives[alternative].words[]``,
     using ``punctuated_word`` (present with ``punctuate`` or
     ``smart_format``) and falling back to ``word``. Times are in seconds.
+    With ``diarize=true`` each word's ``speaker`` (``0``, ``1``, ...) is kept
+    as its speaker label (``"0"``, ``"1"``, ...).
     """
     channels = _field(_field(response, "results"), "channels")
     if channels is None:
@@ -379,7 +483,7 @@ def from_deepgram(response: Any, *, channel: int = 0, alternative: int = 0) -> l
 def _assemblyai_words(words: Any) -> list[WordAlignment]:
     return _to_alignments(
         (
-            (_field(w, "text"), _field(w, "start"), _field(w, "end"))
+            (_field(w, "text"), _field(w, "start"), _field(w, "end"), _field(w, "speaker"))
             for w in _items(words, "assemblyai: words")
         ),
         "assemblyai",
@@ -392,8 +496,9 @@ def from_assemblyai(transcript: Any) -> list[WordAlignment]:
 
     Accepts the JSON of ``GET /v2/transcript/{id}`` or the SDK's
     ``Transcript`` object, and reads ``words[]`` (``text``, ``start``,
-    ``end``). Raises :class:`ConversionError` if the transcript is not
-    completed yet or failed.
+    ``end``, and with ``speaker_labels`` the ``speaker``, such as ``"A"``).
+    Raises :class:`ConversionError` if the transcript is not completed yet
+    or failed.
     """
     words = _field(transcript, "words")
     status = _field(transcript, "status")
@@ -434,9 +539,19 @@ def _google_words(words: Any) -> list[_RawWord]:
                 _field(w, "word"),
                 _google_seconds(start, f"{what} start time"),
                 _google_seconds(end, f"{what} end time"),
+                _google_speaker(w),
             )
         )
     return raw_words
+
+
+def _google_speaker(word: Any) -> Any:
+    """A word's speaker label: ``speakerLabel`` (v2), or ``speakerTag`` (v1) unless 0 (unset)."""
+    label = _first_field(word, "speakerLabel", "speaker_label")
+    if label is not None and label != "":
+        return label
+    tag = _first_field(word, "speakerTag", "speaker_tag")
+    return None if tag == 0 else tag
 
 
 def _google_speaker_tagged(words: Any) -> bool:
@@ -456,7 +571,8 @@ def from_google(response: Any, *, channel_tag: int | None = None) -> list[WordAl
     With ``enableSeparateRecognitionPerChannel`` each result carries a
     ``channelTag``: pass *channel_tag* to choose the channel. With speaker
     diarization the last result repeats every word of the earlier ones with
-    speaker labels; only that result is then used.
+    speaker labels; only that result is then used, and each word's
+    ``speakerTag`` (v1) or ``speakerLabel`` (v2) becomes its speaker label.
 
     Raises :class:`ConversionError` if the results have transcripts but no
     word time offsets, or come from several channels and *channel_tag* is
@@ -547,8 +663,8 @@ def load_word_timings(
       of words: ``text`` (AssemblyAI, ms), ``punctuated_word`` (Deepgram),
       ``startTime``/``startOffset`` (Google), ``word`` with
       ``start_ms``/``end_ms`` (ms, as :func:`dataclasses.asdict` writes a
-      :class:`WordAlignment`) or ``start``/``end`` (seconds), or
-      :class:`WordAlignment` objects.
+      :class:`WordAlignment`) or ``start``/``end`` (seconds), each with an
+      optional ``speaker``, or :class:`WordAlignment` objects.
 
     Use :func:`from_records` for other keys or units, and the ``from_*``
     functions for their options (such as a Deepgram channel).
@@ -570,7 +686,8 @@ def parse_word_timings(
     Like :func:`load_word_timings`, but a :class:`str` or :class:`bytes` is
     JSON text, never a file name: this function does not touch the file
     system, so it is safe on untrusted input such as a form field (limit
-    its size first). The shapes are those of :func:`load_word_timings`.
+    its size first; the time taken grows linearly with it). The shapes are
+    those of :func:`load_word_timings`.
 
     Raises :class:`ConversionError` if the text is not JSON (including an
     empty string) or the data is unrecognised or invalid.
@@ -612,7 +729,7 @@ def _load_list(data: Sequence[Any]) -> list[WordAlignment]:
         if not all(isinstance(item, WordAlignment) for item in data):
             raise ConversionError("word timings mix WordAlignment objects with other items")
         return _to_alignments(
-            ((a.word, a.start_ms, a.end_ms) for a in data), "word timings", unit="ms"
+            ((a.word, a.start_ms, a.end_ms, a.speaker) for a in data), "word timings", unit="ms"
         )
     if not isinstance(first, Mapping):
         raise ConversionError(

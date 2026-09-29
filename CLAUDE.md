@@ -28,7 +28,7 @@ Prosody-Protocol/
 │   └── server/              # FastAPI app (app.py, config.py, routes/, jobs.py, middleware.py)
 ├── examples/                # speech.wav + word timings, monotone.wav + profile.json, sarcasm.iml
 ├── training/                # scikit-learn baselines, configs/, scripts/ (source checkout only)
-├── tests/                   # pytest; fixtures/ (valid/, invalid/, audio/, datasets/, profiles/)
+├── tests/                   # pytest; fixtures/ (valid/, invalid/, audio/, datasets/, profiles/, benchmarks/)
 ├── docs/                    # API.md, cli.md, quickstart.md, integrations/ (speech-to-text, whisper, claude, TTS, mavis)
 ├── datasets/README.md       # dataset format (no corpora are shipped)
 ├── Dockerfile               # REST API image
@@ -41,10 +41,12 @@ Prosody-Protocol/
 - **IML:** the XML format. `spec.md` is authoritative; Appendix A (content models) and Appendix D (MUST/SHOULD/MAY table) are normative summaries.
 - **Core tags:** `<iml>` (optional wrapper), `<utterance>`, `<prosody>`, `<pause>`, `<emphasis>`, `<segment>` (all stable).
 - **Extended attributes:** `f0_mean`, `f0_range`, `f0_contour`, `intensity_mean`, `intensity_range`, `speech_rate`, `duration_ms`, `jitter` and `shimmer` (percent), `hnr` -- experimental, for research use.
-- **Speaker baseline:** pitch/volume/rate in IML are relative to the speaker. The assembler uses calibration audio or the recording's typical utterances; without one it abstains from emotion.
+- **Speaker baseline:** pitch/volume/rate in IML are relative to the speaker; a nested `<prosody>` is relative to the enclosing one, so offsets accumulate (dB/st add, percentages multiply; spec 3.2, "Reference level"). Each speaker (`WordAlignment.speaker` labels) has their own baseline: `calibration_audio` (one file or several, e.g. the user's earlier turns; single-speaker only) or at least 3 of their typical utterances. Without one: no utterance-level offsets, no emotion, and a "No speaker baseline" warning. Unlabeled utterances whose pitch splits into two groups > 7 st apart get no baseline.
+- **Warnings:** `ConversionResult.warnings` (and `UserWarning`s from `convert()`) say what degraded the output: no baseline, placeholders, transcript without timings, unpunctuated words, word timings that do not match the audio, calibration/profile unused with several speakers.
 - **Abstention:** utterances below `min_emotion_confidence` (0.5) carry no `emotion`/`confidence`. The rule-based classifier never reports `neutral` or `calm` at 0.5 or above.
 - **Prosody profiles:** JSON documents (spec Section 7) that map a speaker's atypical patterns to intended meanings. Profile use is reported downstream (spec 7.2): `x-profile="<matched pattern>"` on the utterance, `ConversionResult.profile_matches`, and "interpreted with the speaker's prosody profile" in `to_llm_context`. The profile's `user_id` is never written into IML.
-- **Word timings:** the SDK measures how words were said; the words come from `words=` (any STT, via `prosody_protocol.alignment`), `transcript=`, or Whisper (`whisper` extra).
+- **Word timings:** the SDK measures how words were said; the words come from `words=` (any STT, via `prosody_protocol.alignment`; speaker labels kept), `transcript=` (no timings: whole-utterance delivery only, and only against calibration), or Whisper (`whisper` extra). Utterances split at sentence ends, speaker changes, and in unpunctuated text at pauses of 500 ms.
+- **Language tags:** one rule everywhere (`_types.LANGUAGE_TAG_RE`: 1-8 letters, then `-` subtags of 1-8 alphanumerics; form only): V29, D6, the dataset schema, `IMLToSSML`, `AudioToIML`, `IMLAssembler`, `MavisBridge`, CLI. SDK, CLI and REST arguments read `en_US` as `en-US`; documents and datasets are checked as written.
 
 ## Specification Rules
 
@@ -77,26 +79,26 @@ Public API (`prosody_protocol.__all__`):
 - Emotion: `EmotionClassifier`, `BaselineAwareEmotionClassifier`, `RuleBasedEmotionClassifier`, `SpeakerBaseline`
 - Output: `to_llm_context`, `build_messages`, `IMLToSSML`, `IMLToAudio` (espeak-ng, or a tone preview), `TextToIML` (rule-based)
 - Profiles: `ProfileLoader`, `ProfileApplier` (`match`, `apply`), `ProsodyProfile`, `ProsodyMapping`, `ProfileMatch`, `categorize_features`
-- Data: `DatasetLoader`, `Dataset`, `DatasetEntry`, `Benchmark`, `BenchmarkReport`, `MavisBridge`, `PhonemeEvent`
-- Exceptions: `ProsodyProtocolError` and its subclasses `IMLParseError`, `IMLValidationError`, `ProfileError`, `AudioProcessingError`, `ConversionError`, `DatasetError`, `TrainingError`
+- Data: `DatasetLoader` (`split(stratify_by=)`), `Dataset`, `DatasetEntry`, `Benchmark` (`words_from=`, `abstention_label=`; entries' `metadata.word_timings`), `BenchmarkReport` (an output without emotion is an abstention: `emotion_accuracy` is over answered entries, `emotion_coverage` their share), `MavisBridge`, `PhonemeEvent`
+- Exceptions: `ProsodyProtocolError` and its subclasses `IMLParseError`, `IMLValidationError`, `ProfileError`, `AudioProcessingError` (and its subclass `SpeechRecognitionError`), `ConversionError`, `DatasetError`, `TrainingError`
 
 CLI: `prosody-protocol validate | to-text | to-ssml | to-prompt | from-text | from-audio | synthesize | benchmark | serve | doctor` (`--help` on each; `python -m prosody_protocol` is the same). `-` reads stdin. Exit 0 success, 1 rejected input, 2 usage/I-O error or missing extra.
 
 ## REST API
 
-`prosody-protocol serve` or `python -m prosody_protocol.server` (binds 127.0.0.1:8000; settings are `PP_*` env vars, see `server/config.py`):
+`prosody-protocol serve` or `python -m prosody_protocol.server` (same options; binds 127.0.0.1:8000, also when `PP_HOST` is empty). Settings are `PP_*` env vars (`server/config.py`): `PP_HOST`, `PP_PORT`, `PP_DEBUG`, `PP_CORS_ORIGINS`, `PP_MAX_UPLOAD_MB`, `PP_MAX_JSON_BYTES`, `PP_RATE_LIMIT`, `PP_TRUSTED_PROXIES`, `PP_MAX_TEXT_CHARS`, `PP_MAX_WORDS_CHARS`, `PP_MAX_AUDIO_SECONDS`, `PP_MAX_SYNTH_SECONDS`, `PP_MAX_CONCURRENT_JOBS`, `PP_MAX_QUEUED_JOBS`, `PP_JOB_TIMEOUT_S`, `PP_STT_MODEL`.
 
 ```
 GET  /v1/health
 POST /v1/validate
-POST /v1/convert/audio-to-iml     # multipart: audio, words, transcript, profile, language
+POST /v1/convert/audio-to-iml     # multipart: audio, words, transcript, profile, language, calibration (up to 5)
 POST /v1/convert/text-to-iml
 POST /v1/convert/iml-to-ssml
 POST /v1/convert/iml-to-prompt
 POST /v1/synthesize               # -> audio/wav
 ```
 
-Audio conversion and synthesis run in worker processes; scripts that embed the app need an `if __name__ == "__main__":` guard.
+Every error body is `{"error", "detail"}` (422 `invalid_request` has a list as `detail`). Audio conversion and synthesis run in worker processes (about 450 MB per job for 10 minutes of audio); a job over `PP_JOB_TIMEOUT_S` is stopped (504), and one whose client disconnects is dropped or its worker stopped; scripts that embed the app need an `if __name__ == "__main__":` guard.
 
 ## Build and Test
 
@@ -106,12 +108,12 @@ sudo apt install espeak-ng ffmpeg           # optional; tests needing them skip 
 pytest                                      # full suite
 pytest -p no:cacheprovider tests/test_docs_examples.py   # documentation examples only
 ruff check src/ tests/ training/ examples/
-mypy src/                                   # strict
+mypy src/                                   # strict; CI lints and type-checks on Python 3.10
 ```
 
 - **Core-only rule:** a bare `pip install .` has only `lxml`. Every module `__init__.py` imports eagerly (parser, validator, models, exceptions, `_types`, alignment, assembler, emotion_classifier, iml_to_ssml, text_to_iml, llm, profiles, datasets) and `cli.py` must import with the standard library and lxml alone. Modules that need numpy/parselmouth (audio_to_iml, prosody_analyzer, iml_to_audio, benchmarks, mavis_bridge) are listed in `_LAZY` and raise `ImportError` naming the extra. CI's `test-core-only` job enforces this; tests that need an extra use `pytest.importorskip`.
-- **Docs harness:** `tests/test_docs_examples.py` runs every `python` block of README.md, examples/README.md and docs/**/*.md in order (cwd is a scratch dir with `examples/` linked), validates `xml` IML blocks, and runs `prosody-protocol ...` lines of `bash`/`console` blocks. Put `<!-- docs-test: skip -->` above a block only when it calls an external service or needs whisper/network, and `<!-- docs-test: invalid -->` above an IML example that must fail validation. Show real output: run the example and paste it.
-- Audio fixtures are regenerated with `tests/generate_audio_fixtures.py` and `tests/generate_training_fixture.py` (need espeak-ng), examples with `examples/make_examples.py`.
+- **Docs harness:** `tests/test_docs_examples.py` runs every `python` block of README.md, examples/README.md and docs/**/*.md in order (cwd is a scratch dir with `examples/` linked), validates `xml` IML blocks, and runs `prosody-protocol ...` lines of `bash` blocks and `$ prosody-protocol ...` lines of `console` blocks. It skips an example only when the extra it needs is really missing. Put `<!-- docs-test: skip -->` above a block only when it calls an external service or needs whisper/network, and `<!-- docs-test: invalid -->` above an IML example that must fail validation. Show real output: run the example and paste it. `tests/test_adoption.py` (TestReadmeOutput) and `tests/test_cli.py` (TestExamples) compare README.md and examples/README.md blocks with real output.
+- Audio fixtures are regenerated with `tests/generate_audio_fixtures.py`, `tests/generate_speech_levels_fixture.py` and `tests/generate_training_fixture.py` (need espeak-ng), examples with `examples/make_examples.py`, and the committed benchmark baseline with `tests/fixtures/benchmarks/make_baselines.py` (a test fails when a run regresses from it).
 - Training checkpoints (`model.joblib`) are pickles: never load untrusted ones. `export.py --format json` writes a pickle-free model.
 
 ## Style Guidelines
