@@ -26,6 +26,7 @@ from prosody_protocol.exceptions import (
     IMLValidationError,
     ProfileError,
     ProsodyProtocolError,
+    SpeechRecognitionError,
     TrainingError,
 )
 from prosody_protocol.iml_to_audio import IMLToAudio
@@ -56,7 +57,6 @@ class SpeechRecognitionFailed(AudioProcessingError):
 
 # How AudioToIML reports Whisper failures (audio_to_iml.AudioToIML._transcribe).
 _STT_LOAD_FAILED = "Cannot load Whisper model"
-_STT_RUN_FAILED = "Whisper transcription failed"
 
 
 _SDK_ERRORS: tuple[type[ProsodyProtocolError], ...] = (
@@ -238,12 +238,17 @@ def convert_audio(
 
 
 def _server_side(exc: AudioProcessingError, message: str) -> AudioProcessingError | None:
-    """The server-side error *exc* stands for, if it is a speech recognition failure."""
+    """The server-side error *exc* stands for, if it is a speech recognition failure.
+
+    The SDK raises :class:`SpeechRecognitionError` for both a model that cannot
+    be loaded (the service is unavailable: 503) and a failed transcription
+    (500); its message prefix tells them apart.
+    """
+    if not isinstance(exc, SpeechRecognitionError):
+        return None
     if message.startswith(_STT_LOAD_FAILED):
         return SpeechRecognitionUnavailable(message)
-    if message.startswith(_STT_RUN_FAILED) or type(exc).__name__ == "SpeechRecognitionError":
-        return SpeechRecognitionFailed(message)
-    return None
+    return SpeechRecognitionFailed(message)
 
 
 def synthesize(
