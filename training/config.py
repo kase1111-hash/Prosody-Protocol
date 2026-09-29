@@ -167,7 +167,8 @@ def load_config(path: str | Path) -> TrainingConfig:
     FileNotFoundError
         If the config file does not exist.
     ValueError
-        If the config is missing required keys or has an invalid value.
+        If the config is not valid YAML, is missing required keys or has an
+        invalid value.
 
     Keys the pipeline does not use are reported with a :class:`UserWarning`.
     """
@@ -175,8 +176,13 @@ def load_config(path: str | Path) -> TrainingConfig:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    with open(path, encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{path} is not valid YAML: {_one_line(exc)}") from None
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{path} is not UTF-8 text: {exc.reason}") from None
 
     if not isinstance(raw, dict):
         raise ValueError(f"Config must be a YAML mapping, got {type(raw).__name__}")
@@ -199,6 +205,16 @@ def load_config(path: str | Path) -> TrainingConfig:
         output=raw["output"],
         raw=raw,
     )
+
+
+def _one_line(exc: yaml.YAMLError) -> str:
+    """A YAML error as one line: the problem and where it is."""
+    if isinstance(exc, yaml.MarkedYAMLError) and exc.problem:
+        mark = exc.problem_mark
+        where = f" (line {mark.line + 1}, column {mark.column + 1})" if mark else ""
+        context = f"{exc.context} " if exc.context else ""
+        return f"{context}{exc.problem}{where}".replace("\n", " ")
+    return " ".join(str(exc).split())
 
 
 # ---------------------------------------------------------------------------

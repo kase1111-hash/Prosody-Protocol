@@ -20,8 +20,17 @@ Format (``format_version`` 1)::
         "fill_values": [...],                   #   replaces NaN inputs
         "mean": [...], "scale": [...]           #   (x - mean) / scale
       },
+      "feature_stats": {                        # optional: the training data's
+        "mean": [...], "std": [...]             #   mean and standard deviation
+      },                                        #   of each feature
       "estimator": {"kind": "linear", "coef": [[...]], "intercept": [...]}
     }
+
+``feature_stats`` describes the measured (non-NaN) training values of each
+feature; a ``std`` of 0 marks a feature that was constant or never measured
+in training. :meth:`PortableModel.feature_z_scores` uses it to tell how far
+an input lies outside the training data (models exported before it existed
+fall back to ``preprocessing.mean`` and ``scale``). Predictions do not use it.
 
 A linear estimator gives class probabilities as the softmax of
 ``coef @ x + intercept``; with a single row of coefficients (two classes)
@@ -68,6 +77,22 @@ def tree_params(tree: Any) -> dict[str, Any]:
         "threshold": nodes.threshold.tolist(),
         "value": distribution.tolist(),
     }
+
+
+def feature_stats(X: npt.ArrayLike) -> dict[str, list[float]]:
+    """The ``feature_stats`` of training matrix *X*: mean and std of each column.
+
+    Only measured (non-NaN, finite) values count. A column with no
+    measurement, or a single distinct value, gets a ``std`` of 0 (not
+    checked by :meth:`PortableModel.feature_z_scores`).
+    """
+    data = np.array(X, dtype=np.float64, ndmin=2)
+    means, stds = [], []
+    for column in data.T:
+        measured = column[np.isfinite(column)]
+        means.append(float(measured.mean()) if measured.size else 0.0)
+        stds.append(float(measured.std()) if measured.size > 1 else 0.0)
+    return {"mean": means, "std": stds}
 
 
 def write_model(params: Mapping[str, Any], path: str | Path) -> Path:
@@ -159,6 +184,19 @@ class PortableModel:
         if self._scale is not None and not np.all(self._scale != 0):
             raise ValueError("scale must not contain zeros")
 
+        stats = params.get("feature_stats")
+        self._stats_mean: _FloatArray | None = None
+        self._stats_std: _FloatArray | None = None
+        if stats is not None:
+            if not isinstance(stats, Mapping):
+                raise ValueError("feature_stats must be an object")
+            self._stats_mean = _vector(stats.get("mean"), n_features, "feature_stats.mean")
+            self._stats_std = _vector(stats.get("std"), n_features, "feature_stats.std")
+            if self._stats_mean is None or self._stats_std is None:
+                raise ValueError("feature_stats needs both mean and std")
+            if np.any(self._stats_std < 0):
+                raise ValueError("feature_stats.std must not be negative")
+
         estimator = params.get("estimator")
         if not isinstance(estimator, Mapping):
             raise ValueError("estimator must be an object")
@@ -242,6 +280,36 @@ class PortableModel:
         """The most probable class of each row of *X*."""
         best = np.argmax(self.predict_proba(X), axis=1)
         return [self.classes[i] for i in best]
+
+    @property
+    def has_feature_stats(self) -> bool:
+        """Whether :meth:`feature_z_scores` can tell how unusual an input is."""
+        return self._stats_mean is not None or (
+            self._mean is not None and self._scale is not None
+        )
+
+    def feature_z_scores(self, X: npt.ArrayLike) -> _FloatArray:
+        """How many training standard deviations each value of *X* is from the training mean.
+
+        Signed, one column per feature. ``NaN`` for unmeasured (``NaN``)
+        inputs, for features without a spread in training, and for every
+        feature of a model without training statistics (see
+        :attr:`has_feature_stats`).
+        """
+        data = np.array(X, dtype=np.float64, ndmin=2)
+        if data.ndim != 2 or data.shape[1] != len(self.feature_names):
+            raise ValueError(
+                f"Expected rows of {len(self.feature_names)} features, got shape {data.shape}"
+            )
+        if self._stats_mean is not None and self._stats_std is not None:
+            mean, std = self._stats_mean, self._stats_std
+        elif self._mean is not None and self._scale is not None:
+            mean, std = self._mean, np.abs(self._scale)
+        else:
+            return np.full(data.shape, np.nan)
+        spread = np.where(std > 0, std, np.nan)
+        z: _FloatArray = (data - mean) / spread
+        return z
 
 
 def _names(value: Any, what: str) -> tuple[str, ...]:

@@ -48,6 +48,10 @@ _LANGUAGE_DESCRIPTION = (
 _SUFFIX_RE = re.compile(r"\.[A-Za-z0-9]{1,10}")
 _COPY_CHUNK_BYTES = 1024 * 1024
 
+#: The most calibration recordings one audio-to-iml request may send. Each
+#: is analysed like the upload itself (up to PP_MAX_AUDIO_SECONDS).
+MAX_CALIBRATION_FILES = 5
+
 
 class TextToIMLRequest(BaseModel):
     text: str
@@ -280,6 +284,22 @@ def _parse_words(raw: str | bytes) -> tuple[WordAlignment, ...]:
     return tuple(_checked_words(parse_word_timings(raw)))
 
 
+def _calibration_files(values: list[UploadFile | str] | None) -> list[UploadFile]:
+    """The ``calibration`` recordings; empty fields count as absent, text is a 422."""
+    files = []
+    for value in values or ():
+        if isinstance(value, str):
+            if value:
+                raise _field_error(
+                    "calibration",
+                    "calibration must be sent as a file (e.g. curl -F calibration=@calm.wav), "
+                    "not as text.",
+                )
+        elif value.filename or value.size:
+            files.append(value)
+    return files
+
+
 def _reject_constant(name: str) -> float:
     raise ProfileError(f"Invalid JSON in profile: {name} is not a JSON number")
 
@@ -312,12 +332,41 @@ _PROFILE_DESCRIPTION = (
     "file. A mapping that matches an utterance sets its emotion (see profile_matches). "
     "An invalid profile is a 400 profile_error."
 )
+_CALIBRATION_DESCRIPTION = (
+    "Optional recording of the same speaker talking neutrally, as a file (repeat the "
+    f"field for up to {MAX_CALIBRATION_FILES} recordings, e.g. earlier turns of a "
+    "conversation). It is the speaker baseline that pitch, loudness, rate and emotion "
+    "are measured against. Without it the baseline is the recording's typical "
+    "utterances, so a single utterance gets no overall delivery and no emotion. Each "
+    "recording is limited like the audio (PP_MAX_AUDIO_SECONDS); an unreadable one, "
+    "or one without voiced speech, is a 400 audio_processing_error."
+)
+
+#: OpenAPI ``responses`` of audio-to-iml beyond the shared ones.
+_AUDIO_RESPONSES: dict[int | str, dict[str, Any]] = {
+    500: {
+        "model": ErrorResponse,
+        "description": (
+            "`speech_recognition_failed`: the server's Whisper failed on audio it could "
+            "read; `internal_error`: a bug, or the worker running the request exited."
+        ),
+    },
+    503: {
+        "model": ErrorResponse,
+        "description": (
+            "`server_busy`: every worker is busy and the queue is full. "
+            "`speech_recognition_unavailable`: the server's Whisper model cannot be "
+            "loaded; send words or transcript instead. Retry after `Retry-After` seconds."
+        ),
+        "headers": BUSY_RESPONSES[503]["headers"],
+    },
+}
 
 
 @router.post(
     "/audio-to-iml",
     response_model=AudioToIMLResponse,
-    responses={**ERROR_RESPONSES, **_UNSUPPORTED_MEDIA, **BUSY_RESPONSES},
+    responses={**ERROR_RESPONSES, **_UNSUPPORTED_MEDIA, **_AUDIO_RESPONSES},
     dependencies=[Depends(_require_multipart)],
 )
 async def audio_to_iml(
@@ -341,6 +390,9 @@ async def audio_to_iml(
         UploadFile | str | None, Form(description=_TRANSCRIPT_DESCRIPTION)
     ] = None,
     profile: Annotated[UploadFile | str | None, Form(description=_PROFILE_DESCRIPTION)] = None,
+    calibration: Annotated[
+        list[UploadFile | str] | None, File(description=_CALIBRATION_DESCRIPTION)
+    ] = None,
     language_query: Annotated[
         str | None,
         Query(
@@ -355,10 +407,10 @@ async def audio_to_iml(
 
     Send multipart/form-data with the file in ``audio`` and, optionally,
     ``language``, ``words`` (word timings from any speech recogniser) or
-    ``transcript``, and a prosody ``profile``. ``words``, ``transcript`` and
-    ``profile`` may be sent as text fields or as files. Unreadable audio, or
-    audio longer than the server's PP_MAX_AUDIO_SECONDS, is a 400
-    audio_processing_error.
+    ``transcript``, a prosody ``profile``, and ``calibration`` recordings of
+    the speaker. ``words``, ``transcript`` and ``profile`` may be sent as
+    text fields or as files. Unreadable audio, or audio longer than the
+    server's PP_MAX_AUDIO_SECONDS, is a 400 audio_processing_error.
     """
     # BCP 47 tags are case-insensitive: "FR-fr" and "fr-FR" agree.
     if language and language_query and language.lower() != language_query.lower():
@@ -393,20 +445,41 @@ async def audio_to_iml(
             _checked_text(transcript_text, "transcript")
         except ValueError as exc:
             raise _field_error("transcript", str(exc)) from None
+    calibration_files = _calibration_files(calibration)
+    if len(calibration_files) > MAX_CALIBRATION_FILES:
+        raise _field_error(
+            "calibration",
+            f"At most {MAX_CALIBRATION_FILES} calibration recordings may be sent; "
+            f"got {len(calibration_files)}.",
+        )
     options = _worker.ConvertOptions(
         max_duration_s=settings.max_audio_seconds,
         language=language,
         words=alignments,
         transcript=transcript_text,
         profile=_profile_field(profile_text),
+        stt_model=settings.stt_model,
     )
 
     with jobs.admit(), tempfile.TemporaryDirectory(prefix="prosody-protocol-upload-") as tmp:
         path = Path(tmp) / f"upload{_upload_suffix(audio.filename)}"
         await run_in_threadpool(_save_upload, audio.file, path, settings.max_upload_bytes)
-        # Drop the server's first copy of the upload while the job waits for a worker.
+        # Drop the server's first copies of the uploads while the job waits for a worker.
         await audio.close()
-        result = await jobs.run(_worker.convert_audio, str(path), display_name, options)
+        saved: list[tuple[str, str]] = []
+        for number, upload in enumerate(calibration_files, start=1):
+            copy = Path(tmp) / f"calibration{number}{_upload_suffix(upload.filename)}"
+            await run_in_threadpool(_save_upload, upload.file, copy, settings.max_upload_bytes)
+            await upload.close()
+            name = (
+                f"calibration {PurePath(upload.filename).name!r}"
+                if upload.filename
+                else f"calibration recording {number}"
+            )
+            saved.append((str(copy), name))
+        result = await jobs.run(
+            _worker.convert_audio, str(path), display_name, options, tuple(saved)
+        )
     return AudioToIMLResponse(
         iml=result.iml,
         plain_text=IMLParser().to_plain_text(result.document),

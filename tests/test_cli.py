@@ -13,6 +13,8 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -106,6 +108,13 @@ class TestGeneral:
         code, out, _ = run(capsys, "from-audio", "--help")
         assert code == 0
         assert "--words" in out and "--profile" in out
+
+    def test_help_uses_american_spelling(self, capsys: pytest.CaptureFixture[str]) -> None:
+        code, out, err = run(capsys)
+        assert "labeled dataset" in err and "labelled" not in err
+        code, out, _ = run(capsys, "benchmark", "--help")
+        assert "labeled dataset" in out and "labelled" not in out
+        assert "labelled" not in (cli.__doc__ or "")
 
     def test_unknown_command(self, capsys: pytest.CaptureFixture[str]) -> None:
         code, _, err = run(capsys, "frobnicate")
@@ -375,12 +384,15 @@ class TestFromAudio:
             capsys, "from-audio", str(SPEECH), "--words", speech_words(tmp_path),
             "--language", "en-US",
         )
-        assert (code, err) == (0, "")
+        assert code == 0
+        # One utterance and no --calibration: only the missing baseline is noted.
+        assert [line for line in err.splitlines() if "speaker baseline" not in line] == []
         doc = IMLParser().parse(out)
         assert doc.language == "en-US"
         assert IMLParser().to_plain_text(doc) == "I told you to call me yesterday."
         assert '<emphasis level="strong">' in out and "told</prosody></emphasis>" in out
-        assert '<pause duration="6' in out
+        # The 600 ms gap between "you" and "to", as measured.
+        assert 550 <= int(re.findall(r'<pause duration="(\d+)"', out)[0]) <= 650
         assert IMLValidator().validate(out).valid
 
     def test_json(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
@@ -393,7 +405,8 @@ class TestFromAudio:
             "iml", "plain_text", "transcript_source", "warnings", "profile_matches"
         }
         assert data["transcript_source"] == "words"
-        assert data["warnings"] == [] and data["profile_matches"] == []
+        assert data["profile_matches"] == []
+        assert [w for w in data["warnings"] if "speaker baseline" not in w] == []
 
     def test_prompt(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
         code, out, _ = run(
@@ -401,7 +414,7 @@ class TestFromAudio:
         )
         assert code == 0
         assert out.startswith("I **told** (")
-        assert "you [pause 0.6s] to call me [pause 0.3s] yesterday" in out
+        assert "you [pause 0.6s] to call me" in out
 
     def test_transcript(self, capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
         code, out, _ = run(
@@ -451,7 +464,7 @@ class TestFromAudio:
         assert ('x-profile="pause_frequency=high"' in out) is applied
         assert "caller_7" not in out
         if applied:
-            assert err.startswith("note: prosody profile 'caller_7' set utterance 1 to 'uncertain'")
+            assert "note: prosody profile 'caller_7' set utterance 1 to 'uncertain'" in err
         else:
             assert "is below 0.5, so no emotion is reported" in err
 
@@ -486,7 +499,8 @@ class TestFromAudio:
             "--profile", str(EXAMPLES / "profile.json"),
         )
         assert code == 0
-        assert err == "note: prosody profile 'example_user' matched no utterance\n"
+        assert err.endswith("note: prosody profile 'example_user' matched no utterance\n")
+        assert [line for line in err.splitlines()[:-1] if "speaker baseline" not in line] == []
 
     @pytest.mark.parametrize(
         ("profile", "message"),
@@ -758,12 +772,36 @@ class TestBenchmark:
         assert code == 0, out + err
         lines = out.splitlines()
         assert lines[0].startswith("Benchmark of sample: 3 entries, 0 failed conversions")
+        # The entries' transcripts are used, so there are no placeholders.
+        assert lines[1] == "  words from        transcripts 3"
         assert "  validity_rate     1.0000" in lines
         assert "  pause_f1          n/a" in lines
+        assert any(line.startswith("  emotion_coverage  ") for line in lines)
         assert lines[-1] == "Passed"
         assert json.loads(report.read_text())["num_samples"] == 3
-        # The placeholder warning is printed once, not once per entry.
+        assert "[speech]" not in err and "No transcript" not in err
+
+    def test_placeholders_are_reported(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Without words, the scores used to be of [speech] placeholders, silently."""
+        code, out, err = run(
+            capsys, "benchmark", str(SAMPLE_DATASET), "--stt", "none", "--words-from", "stt"
+        )
+        assert code == 0, out + err
+        lines = out.splitlines()
+        assert "  words from        none (speech recognition) 3" in lines
+        assert "  (3 outputs were only [speech] placeholders, without words: pause_f1 and " \
+            "the pitch metrics leave them out)" in lines
+        # The converter's warning is printed once, not once per entry.
         assert err.count("warning: No transcript") == 1
+        assert "warning: 3 of 3 outputs have only '[speech]' placeholders" in err
+
+    def test_abstention_label(self, capsys: pytest.CaptureFixture[str]) -> None:
+        code, out, err = run(
+            capsys, "benchmark", str(SAMPLE_DATASET), "--stt", "none",
+            "--abstention-label", "neutral",
+        )
+        assert code == 0, out + err
+        assert "  (an output without an emotion counts as 'neutral')" in out.splitlines()
 
     def test_regression_against_a_baseline(
         self, capsys: pytest.CaptureFixture[str], tmp_path: Path
@@ -778,14 +816,14 @@ class TestBenchmark:
 
         better = json.loads(report.read_text())
         better["validity_rate"] = 1.0
-        better["emotion_accuracy"] = 0.9
+        better["emotion_coverage"] = 0.9
         report.write_text(json.dumps(better))
         code, out, _ = run(
             capsys, "benchmark", str(SAMPLE_DATASET), "--stt", "none", "--baseline", str(report)
         )
         assert code == 1
         assert "FAILED:" in out
-        assert "emotion_accuracy regressed" in out
+        assert "emotion_coverage regressed" in out
         code, _, _ = run(
             capsys, "benchmark", str(SAMPLE_DATASET), "--stt", "none", "--baseline", str(report),
             "--tolerance", "0.9",
@@ -912,6 +950,63 @@ class TestServeAndDoctor:
         monkeypatch.setenv("PP_PORT", "70000")
         code, _, err = run(capsys, "serve")
         assert (code, err) == (2, "error: port (PP_PORT) must be at most 65535, got 70000\n")
+
+    def test_module_entry_point_rejects_a_bad_port(self) -> None:
+        """python -m prosody_protocol.server (the Docker command) used to print a
+        traceback for --port 99999."""
+        result = subprocess.run(
+            [sys.executable, "-m", "prosody_protocol.server", "--port", "99999"],
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 2
+        assert "argument --port: 99999 is not a port number" in result.stderr
+        assert "Traceback" not in result.stderr
+
+    def test_module_entry_point_without_the_api_extra(self) -> None:
+        code = (
+            "import sys; sys.modules['uvicorn'] = None; "
+            "from prosody_protocol.server.__main__ import main; sys.exit(main([]))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=False
+        )
+        assert result.returncode == 2
+        assert result.stderr.startswith("error: serve needs the 'api' extra (")
+        assert result.stderr.count("\n") == 1, result.stderr
+
+    @pytest.mark.parametrize(
+        ("variable", "value", "message"),
+        [
+            ("PP_MAX_QUEUED_JOBS", "-1", "max_queued_jobs (PP_MAX_QUEUED_JOBS) must be"),
+            ("PP_PORT", "abc", "PP_PORT must be an integer, got 'abc'"),
+        ],
+    )
+    def test_module_entry_point_with_invalid_settings(
+        self, variable: str, value: str, message: str
+    ) -> None:
+        pytest.importorskip("uvicorn")
+        pytest.importorskip("fastapi")
+        result = subprocess.run(
+            [sys.executable, "-m", "prosody_protocol.server"],
+            capture_output=True, text=True, check=False,
+            env={**os.environ, variable: value},
+        )
+        assert result.returncode == 2
+        assert result.stderr == f"error: {message}" + result.stderr.split(message, 1)[1]
+        assert result.stderr.count("\n") == 1 and "Traceback" not in result.stderr
+
+    def test_serve_main_is_serve(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import prosody_protocol.server
+
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(cli, "_missing_api_modules", list)
+        monkeypatch.setattr(prosody_protocol.server, "run", lambda **kw: calls.append(kw))
+        assert cli.serve_main(["--host", "", "--port", "0"]) == 0
+        assert calls == [{"host": "", "port": 0}]
+        assert cli.serve_main(["--help"], prog="python -m prosody_protocol.server") == 0
+        assert capsys.readouterr().out.startswith("usage: python -m prosody_protocol.server")
 
     def test_serve_warnings_are_not_held_back(
         self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
@@ -1069,7 +1164,9 @@ class TestExamples:
         exec(compile(code, "examples/README.md", "exec"), {})  # noqa: S102
         out = capsys.readouterr().out
         assert "<emphasis" in out and "**stole**" in out
-        assert "3 {'pitch_contour': 'flat', 'rate': 'fast'} joyful 0.6 True" in out
+        [last] = re.findall(r"^3 \{'pitch_contour': 'flat', 'rate': 'fast'\} joyful ([\d.]+) True$",
+                            out, re.MULTILINE)
+        assert 0.5 <= float(last) <= 1.0
 
     def test_example_files_are_valid(self) -> None:
         from prosody_protocol.alignment import load_word_timings

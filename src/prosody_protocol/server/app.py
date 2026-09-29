@@ -65,7 +65,10 @@ class Capabilities(BaseModel):
 class Limits(BaseModel):
     """Request limits this server enforces."""
 
-    max_upload_bytes: int
+    max_upload_bytes: int = Field(description="Largest request body (audio-to-iml uploads).")
+    max_json_bytes: int = Field(
+        description="Largest body of any other request (the JSON endpoints)."
+    )
     max_text_chars: int
     max_words_chars: int
     max_synth_seconds: float
@@ -105,6 +108,7 @@ async def health(settings: SettingsDep) -> HealthResponse:
         capabilities=_capabilities(),
         limits=Limits(
             max_upload_bytes=settings.max_upload_bytes,
+            max_json_bytes=settings.json_body_limit,
             max_text_chars=settings.max_text_chars,
             max_words_chars=settings.max_words_chars,
             max_synth_seconds=settings.max_synth_seconds,
@@ -139,7 +143,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.jobs = JobRunner(settings.max_concurrent_jobs, settings.max_queued_jobs)
 
     # Middleware added last runs first: CORS, then rate limit, then size limit.
-    application.add_middleware(UploadSizeLimitMiddleware, max_bytes=settings.max_upload_bytes)
+    application.add_middleware(
+        UploadSizeLimitMiddleware,
+        max_bytes=settings.max_upload_bytes,
+        max_json_bytes=settings.json_body_limit,
+    )
     if settings.rate_limit_per_minute > 0:
         application.add_middleware(
             RateLimitMiddleware,

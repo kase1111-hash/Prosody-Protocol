@@ -24,31 +24,57 @@ class _BodyTooLarge(Exception):
 
 
 class UploadSizeLimitMiddleware:
-    """Reject request bodies larger than ``max_bytes`` with 413.
+    """Reject request bodies larger than the limit with 413.
+
+    ``max_bytes`` limits every request. ``max_json_bytes``, when given,
+    limits requests that are not ``multipart/form-data`` -- the JSON
+    endpoints, whose bodies are parsed whole on the event loop before any
+    field is checked -- so only uploads may be as large as ``max_bytes``.
 
     A ``Content-Length`` over the limit is rejected before the body is read.
     Otherwise the bytes actually received are counted, so chunked uploads
     (which have no ``Content-Length``) are limited too: once the count passes
-    ``max_bytes`` the application gets an exception instead of more body, and
+    the limit the application gets an exception instead of more body, and
     whatever response it produces for that is replaced by the 413.
     """
 
-    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        max_bytes: int,
+        max_json_bytes: int | None = None,
+        *,
+        upload_setting: str = "PP_MAX_UPLOAD_MB",
+        json_setting: str = "PP_MAX_JSON_BYTES",
+    ) -> None:
         self.app = app
         self.max_bytes = max_bytes
+        self.max_json_bytes = max_json_bytes
+        self.upload_setting = upload_setting
+        self.json_setting = json_setting
+
+    def limit(self, scope: Scope) -> tuple[int, str]:
+        """The body limit for the request *scope*, and the setting that sets it."""
+        if self.max_json_bytes is None or self.max_json_bytes >= self.max_bytes:
+            return self.max_bytes, self.upload_setting
+        content_type = Headers(scope=scope).get("content-type", "")
+        if content_type.strip().lower().startswith("multipart/form-data"):
+            return self.max_bytes, self.upload_setting
+        return self.max_json_bytes, self.json_setting
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
+        max_bytes, setting = self.limit(scope)
         declared = _content_length(scope)
-        if declared is not None and declared > self.max_bytes:
+        if declared is not None and declared > max_bytes:
             response = error_response(
                 413,
                 "payload_too_large",
                 f"Request body ({declared} bytes) exceeds maximum allowed size "
-                f"({self.max_bytes} bytes).",
+                f"({max_bytes} bytes, {setting}).",
             )
             await response(scope, receive, send)
             return
@@ -64,7 +90,7 @@ class UploadSizeLimitMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
-                if received > self.max_bytes:
+                if received > max_bytes:
                     exceeded = True
                     raise _BodyTooLarge
             return message
@@ -87,7 +113,7 @@ class UploadSizeLimitMiddleware:
             response = error_response(
                 413,
                 "payload_too_large",
-                f"Request body exceeds maximum allowed size ({self.max_bytes} bytes).",
+                f"Request body exceeds maximum allowed size ({max_bytes} bytes, {setting}).",
             )
             await response(scope, receive, send)
 

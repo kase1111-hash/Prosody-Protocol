@@ -75,6 +75,7 @@ class PitchContourModel(BaseModel):
         if not self.feature_names and X.ndim == 2:
             self.feature_names = [f"f0_{i}" for i in range(X.shape[1])]
         self._check_features(X)
+        self._record_feature_stats(X)
         self.sequence_length = X.shape[1]
         y_encoded = self._encoder.fit_transform(y)
         self._classifier.fit(X, y_encoded)

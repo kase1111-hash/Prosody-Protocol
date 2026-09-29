@@ -8,8 +8,10 @@ from __future__ import annotations
 import multiprocessing
 import multiprocessing.connection
 import os
+import signal
 import threading
-from collections.abc import Callable
+import traceback
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -37,7 +39,29 @@ T = TypeVar("T")
 # whatever languages its requests ask for.
 _whisper_models: dict[str, Any] = {}
 
+
+class SpeechRecognitionUnavailable(AudioProcessingError):
+    """The server's speech recognition cannot run (its Whisper model did not load).
+
+    A problem of the server, not of the upload: reported as 503.
+    """
+
+
+class SpeechRecognitionFailed(AudioProcessingError):
+    """The server's speech recognition failed on audio that was read fine.
+
+    A problem of the server, not of the upload: reported as 500.
+    """
+
+
+# How AudioToIML reports Whisper failures (audio_to_iml.AudioToIML._transcribe).
+_STT_LOAD_FAILED = "Cannot load Whisper model"
+_STT_RUN_FAILED = "Whisper transcription failed"
+
+
 _SDK_ERRORS: tuple[type[ProsodyProtocolError], ...] = (
+    SpeechRecognitionUnavailable,
+    SpeechRecognitionFailed,
     IMLParseError,
     IMLValidationError,
     ProfileError,
@@ -103,6 +127,49 @@ def call(func: Callable[..., T], *args: object) -> T:
         raise JobError.from_exception(exc) from None
 
 
+# Messages between the server and a worker process (see serve). The server
+# sends ``(func, args)``, or ``None`` to stop the worker; the worker answers
+# STARTED as soon as it has the job, then ``(OK, result)``,
+# ``(RAISED, (exception, traceback text))``, or ``(FAILED, traceback text)``
+# when the answer cannot be pickled.
+STARTED = "started"
+OK = "ok"
+RAISED = "raised"
+FAILED = "failed"
+
+
+def serve(conn: multiprocessing.connection.Connection) -> None:
+    """Main loop of a worker process: run the jobs *conn* delivers, one at a time.
+
+    The STARTED answer tells the server that a job reached this worker, so
+    if the worker dies, the server knows whether the job was running (it
+    fails) or never started (it runs elsewhere). Answers are written to the
+    pipe before :meth:`~multiprocessing.connection.Connection.send` returns,
+    so they reach the server even when the worker is killed right after.
+    """
+    # Ctrl-C in a terminal reaches the whole process group; the server stops
+    # its workers itself.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    exit_with_parent()
+    while True:
+        try:
+            job = conn.recv()
+        except (EOFError, OSError):
+            return  # The server closed its end.
+        if job is None:
+            return
+        conn.send(STARTED)
+        func, args = job
+        try:
+            answer: tuple[str, Any] = (OK, call(func, *args))
+        except Exception as exc:  # Reported to the server, which re-raises it.
+            answer = (RAISED, (exc, traceback.format_exc()))
+        try:
+            conn.send(answer)
+        except Exception:  # A result or exception that cannot be pickled.
+            conn.send((FAILED, traceback.format_exc()))
+
+
 @dataclass(frozen=True)
 class ConvertOptions:
     """What an audio-to-iml request asks for, checked by the route.
@@ -115,9 +182,10 @@ class ConvertOptions:
     words: tuple[WordAlignment, ...] | None = None
     transcript: str | None = None
     profile: ProsodyProfile | None = None
+    stt_model: str = "base"
 
 
-def _converter(options: ConvertOptions) -> AudioToIML:
+def _converter(options: ConvertOptions, calibration: Sequence[str] = ()) -> AudioToIML:
     """A converter for one request, sharing this worker's Whisper models.
 
     AudioToIML keeps the models it loads in its private ``_whisper_models``
@@ -125,29 +193,57 @@ def _converter(options: ConvertOptions) -> AudioToIML:
     language. Replacing the dict is checked by
     ``test_whisper_model_is_loaded_once_per_worker``.
     """
+    calibration_audio: Any = None
+    if len(calibration) == 1:
+        calibration_audio = calibration[0]
+    elif calibration:
+        calibration_audio = tuple(calibration)
     converter = AudioToIML(
+        stt_model=options.stt_model,
         language=options.language,
         max_duration_s=options.max_duration_s,
         profile=options.profile,
+        calibration_audio=calibration_audio,
     )
     converter._whisper_models = _whisper_models
     return converter
 
 
-def convert_audio(path: str, display_name: str, options: ConvertOptions) -> ConversionResult:
+def convert_audio(
+    path: str,
+    display_name: str,
+    options: ConvertOptions,
+    calibration: Sequence[tuple[str, str]] = (),
+) -> ConversionResult:
     """Convert the audio file at *path*; errors name *display_name* instead.
 
-    Audio longer than ``options.max_duration_s`` seconds is rejected before
-    it is decoded in full.
+    *calibration* holds ``(path, display_name)`` pairs of calibration
+    recordings of the same speaker. Audio longer than
+    ``options.max_duration_s`` seconds is rejected before it is decoded in
+    full. A Whisper failure raises :class:`SpeechRecognitionUnavailable` or
+    :class:`SpeechRecognitionFailed`, since it is not the upload's fault.
     """
+    names = [(path, display_name), *calibration]
     try:
-        return _converter(options).convert_detailed(
+        return _converter(options, [p for p, _ in calibration]).convert_detailed(
             path, words=options.words, transcript=options.transcript
         )
     except AudioProcessingError as exc:
-        # Name the client's file, not the server's temporary copy.
-        message = str(exc).replace(str(Path(path).resolve()), display_name)
-        raise AudioProcessingError(message.replace(path, display_name)) from exc
+        # Name the client's files, not the server's temporary copies.
+        message = str(exc)
+        for temporary, name in names:
+            message = message.replace(str(Path(temporary).resolve()), name)
+            message = message.replace(temporary, name)
+        raise _server_side(exc, message) or AudioProcessingError(message) from exc
+
+
+def _server_side(exc: AudioProcessingError, message: str) -> AudioProcessingError | None:
+    """The server-side error *exc* stands for, if it is a speech recognition failure."""
+    if message.startswith(_STT_LOAD_FAILED):
+        return SpeechRecognitionUnavailable(message)
+    if message.startswith(_STT_RUN_FAILED) or type(exc).__name__ == "SpeechRecognitionError":
+        return SpeechRecognitionFailed(message)
+    return None
 
 
 def synthesize(

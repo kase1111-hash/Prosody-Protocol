@@ -216,17 +216,29 @@ print(converter.convert(
 ```
 
 ```
-<iml version="0.1.0"><utterance emotion="frustrated" confidence="0.69"><prosody pitch_contour="fall">I cannot believe you did that!</prosody></utterance></iml>
+<iml version="0.1.0"><utterance emotion="frustrated" confidence="0.67"><prosody pitch_contour="fall">I cannot believe you did that!</prosody></utterance></iml>
 ```
 
-This clip is labeled angry: the model, trained on eight clips, is wrong
-and fairly sure of itself, which is what an uncalibrated model trained on
+`AudioToIML` also warns, on stderr, that the transcript has no word
+timings and that a single utterance has no speaker baseline; the trained
+model labels the utterance anyway, because it does not use a baseline (see
+"Limits" below). This clip is labeled angry: the model, trained on eight
+clips, is wrong and fairly sure of itself, which is what an uncalibrated model trained on
 little data does. The classifier summarizes the utterance's word features
 with the same code data preparation uses (`training/features.py`), so the
 model sees the kind of input it was trained on. Its confidence is the
 model's probability for the label; `AudioToIML` leaves out the emotion when
 that is below 0.5 (`min_emotion_confidence`). Utterances without voiced
-speech get `("neutral", 0.0)`, which means no emotion.
+speech get `("neutral", 0.0)`, which means no emotion. So do utterances
+unlike the training data: when any feature lies more than
+`max_feature_z` (default 4) training standard deviations from its training
+mean, the classifier abstains, because a model's answer for such input is
+arbitrary however sure it looks (a sine tone used to come out as joyful at
+0.99). `classifier.unusual_features(spans)` names the features that were
+out of range; `TrainedEmotionClassifier(dir, max_feature_z=None)` turns the
+check off. Exports record the training mean and spread of each feature
+(`feature_stats` in `model.json`); exports made before that have only the
+logistic regression's scaler, which is used instead.
 `TrainedEmotionClassifier.from_checkpoint(dir)` builds the classifier from
 a checkpoint instead (a pickle; see below).
 
@@ -327,15 +339,23 @@ always trained these scikit-learn baselines.
 
 ## Limits
 
-- **Absolute features.** The SER features are absolute: Hz and dB. They
-  depend on the speaker's voice and on the microphone and gain as much as
-  on emotion, so a model trained on one set of speakers or recording
-  conditions transfers poorly to others. There is no speaker normalization.
-  The SDK's rule-based `RuleBasedEmotionClassifier` judges deviations from
-  a speaker baseline instead.
+- **Absolute features, no speaker baseline.** The SER features are
+  absolute: Hz and dB. They depend on the speaker's voice and on the
+  microphone and gain as much as on emotion, so a model trained on one set
+  of speakers or recording conditions transfers poorly to others: a
+  higher-pitched voice or a louder recording can read as an emotion. There
+  is no speaker normalization in training, and `TrainedEmotionClassifier`
+  ignores the speaker baseline at inference: `AudioToIML(calibration_audio=...)`
+  changes the relative `pitch`/`volume` markup but not the trained model's
+  labels. The SDK's rule-based `RuleBasedEmotionClassifier` judges
+  deviations from the speaker baseline instead, so prefer it unless your
+  model was trained on the same speakers and recording setup it will hear.
 - **Uncalibrated confidence.** The confidence is a raw logistic-regression
   probability. A model trained on little data can be confidently wrong,
-  especially on recordings unlike its training data.
+  especially on recordings unlike its training data. The `max_feature_z`
+  check only catches input far outside the training data (non-speech,
+  another kind of recording altogether); within that range, a wrong label
+  can still come with a high confidence.
 - **Utterance level only.** Dataset entries have no word timings, so SER
   and pitch-contour features describe whole recordings.
 - **Shallow text features.** The text-to-prosody features do not look at

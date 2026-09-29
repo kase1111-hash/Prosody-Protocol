@@ -76,6 +76,7 @@ class SERModel(BaseModel):
         the column's median (0 for a column with no measurement at all).
         """
         self._check_features(X)
+        self._record_feature_stats(X)
         self._fill_values = _column_medians(X)
         y_encoded = self._encoder.fit_transform(y)
         X_scaled = self._scaler.fit_transform(self._fill(X))

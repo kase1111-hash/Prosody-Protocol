@@ -65,6 +65,7 @@ class TextProsodyModel(BaseModel):
     def train(self, X: np.ndarray, y: np.ndarray) -> dict[str, Any]:
         """Train on feature matrix X and string label array y."""
         self._check_features(X)
+        self._record_feature_stats(X)
         y_encoded = self._encoder.fit_transform(y)
         self._classifier.fit(X, y_encoded)
         self._trained = True

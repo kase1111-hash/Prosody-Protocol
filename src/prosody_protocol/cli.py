@@ -9,7 +9,7 @@ Subcommands::
     from-text TEXT        predict IML markup for plain text
     from-audio AUDIO      IML from a recording (with word timings or a transcript)
     synthesize FILE       speak an IML document to a WAV file
-    benchmark DIR         score AudioToIML against a labelled dataset
+    benchmark DIR         score AudioToIML against a labeled dataset
     serve                 run the REST API
     doctor                list the optional capabilities that are installed
 
@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from .profiles import ProsodyProfile
     from .validator import ValidationIssue, ValidationResult
 
-__all__ = ["main"]
+__all__ = ["main", "serve_main"]
 
 PROG = "prosody-protocol"
 
@@ -604,6 +604,20 @@ def _format_metric(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.4f}"
 
 
+# How BenchmarkReport.word_sources names what the converter was given.
+_WORD_SOURCE_NAMES = {
+    "timings": "word timings",
+    "transcript": "transcripts",
+    "stt": "none (speech recognition)",
+}
+
+
+def _word_sources(sources: dict[str, int]) -> str:
+    """``"transcripts 3"``: how many entries got their words from each source."""
+    counts = [f"{_WORD_SOURCE_NAMES.get(k, k)} {n}" for k, n in sources.items() if n]
+    return ", ".join(counts) or "n/a"
+
+
 def _cmd_benchmark(args: argparse.Namespace) -> int:
     benchmarks = _require("prosody_protocol.benchmarks", "benchmark", "audio")
     audio_to_iml = _require("prosody_protocol.audio_to_iml", "benchmark", "audio")
@@ -650,7 +664,13 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
     logger.addHandler(handler)
     propagate, logger.propagate = logger.propagate, False
     try:
-        report = benchmarks.Benchmark(dataset, converter).run(max_samples=args.max_samples)
+        benchmark = benchmarks.Benchmark(
+            dataset,
+            converter,
+            words_from=args.words_from,
+            abstention_label=args.abstention_label,
+        )
+        report = benchmark.run(max_samples=args.max_samples)
     finally:
         logger.removeHandler(handler)
         logger.propagate = propagate
@@ -658,16 +678,25 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
     data = report.to_dict()
     lines = [
         f"Benchmark of {dataset.name}: {report.num_entries} entries, "
-        f"{report.num_failures} failed conversions, {data['duration_seconds']:.1f} s"
+        f"{report.num_failures} failed conversions, {data['duration_seconds']:.1f} s",
+        f"  words from        {_word_sources(report.word_sources)}",
     ]
     for metric in (
-        "emotion_accuracy", "emotion_f1_macro", "confidence_ece", "pitch_accuracy",
-        "pitch_coverage", "pause_f1", "validity_rate", "failure_rate",
+        "emotion_accuracy", "emotion_coverage", "emotion_f1_macro", "confidence_ece",
+        "pitch_accuracy", "pitch_coverage", "pause_f1", "validity_rate", "failure_rate",
     ):
         lines.append(f"  {metric:<17} {_format_metric(data[metric])}")
     if report.emotion_f1:
         per_class = ", ".join(f"{k} {v:.2f}" for k, v in sorted(report.emotion_f1.items()))
         lines.append(f"  emotion_f1        {per_class}")
+    if report.abstention_label is not None:
+        lines.append(f"  (an output without an emotion counts as {report.abstention_label!r})")
+    if report.num_unaligned:
+        # The benchmark has warned why; the summary says how many.
+        lines.append(
+            f"  ({report.num_unaligned} outputs were only [speech] placeholders, without "
+            "words: pause_f1 and the pitch metrics leave them out)"
+        )
     if args.save is not None:
         try:
             report.save(args.save)
@@ -973,7 +1002,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = command(
         "benchmark",
         _cmd_benchmark,
-        "Score AudioToIML against a labelled dataset; exit 1 on failed conversions or "
+        "Score AudioToIML against a labeled dataset; exit 1 on failed conversions or "
         "a regression.",
     )
     sub.add_argument("dataset_dir", metavar="DATASET_DIR", help="dataset directory")
@@ -1000,35 +1029,85 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-samples", type=_positive_int, metavar="N", help="evaluate the first N entries"
     )
     sub.add_argument(
+        "--words-from",
+        choices=["auto", "timings", "transcript", "stt"],
+        default="auto",
+        help="what the converter gets besides the audio: auto (default): each entry's word "
+        "timings (metadata.word_timings) when it has them, else its transcript; timings: "
+        "word timings only; transcript: the transcript; stt: nothing (speech recognition, "
+        "see --stt)",
+    )
+    sub.add_argument(
         "--stt",
         choices=["auto", "whisper", "none"],
         default="auto",
-        help="speech recognition for the converter (default auto)",
+        help="speech recognition for entries given no words (default auto: Whisper if "
+        "installed, else [speech] placeholders)",
+    )
+    sub.add_argument(
+        "--abstention-label",
+        metavar="LABEL",
+        help="score an output without an emotion as this label (e.g. neutral) instead of "
+        "as an abstention, which lowers emotion_coverage but not emotion_accuracy",
     )
     sub.add_argument("--language", type=_language, metavar="TAG", help="BCP 47 language tag")
 
-    sub = command("serve", _cmd_serve, "Run the REST API (needs the 'api' extra).")
-    sub.add_argument("--host", help="bind address (default: $PP_HOST or 127.0.0.1)")
-    sub.add_argument(
-        "--port", type=_port, help="port, 0-65535 (default: $PP_PORT or 8000; 0: any free port)"
-    )
+    sub = command("serve", _cmd_serve, _SERVE_HELP)
+    _add_serve_arguments(sub)
 
     command("doctor", _cmd_doctor, "Show which optional capabilities are installed.")
     return parser
 
 
+_SERVE_HELP = "Run the REST API (needs the 'api' extra)."
+
+
+def _add_serve_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--host", help="bind address (default: $PP_HOST or 127.0.0.1; empty means the default)"
+    )
+    parser.add_argument(
+        "--port", type=_port, help="port, 0-65535 (default: $PP_PORT or 8000; 0: any free port)"
+    )
+
+
+def _parse_args(
+    parser: argparse.ArgumentParser, argv: Sequence[str] | None
+) -> argparse.Namespace | int:
+    """The parsed arguments, or the exit status for --help, --version and usage errors."""
+    try:
+        return parser.parse_args(argv)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else EXIT_USAGE
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command line; returns the exit status."""
     parser = _build_parser()
-    try:
-        args = parser.parse_args(argv)
-    except SystemExit as exc:  # --help, --version and usage errors
-        return exc.code if isinstance(exc.code, int) else EXIT_USAGE
+    args = _parse_args(parser, argv)
+    if isinstance(args, int):
+        return args
     if args.command is None:
         parser.print_help(sys.stderr)
         return EXIT_USAGE
+    return _run(args.handler, args)
 
-    handler: Callable[[argparse.Namespace], int] = args.handler
+
+def serve_main(argv: Sequence[str] | None = None, prog: str = f"{PROG} serve") -> int:
+    """``serve`` as a program of its own (``python -m prosody_protocol.server``).
+
+    Returns the exit status, as :func:`main` does.
+    """
+    parser = argparse.ArgumentParser(prog=prog, description=_SERVE_HELP)
+    _add_serve_arguments(parser)
+    args = _parse_args(parser, argv)
+    if isinstance(args, int):
+        return args
+    return _run(_cmd_serve, args)
+
+
+def _run(handler: Callable[[argparse.Namespace], int], args: argparse.Namespace) -> int:
+    """Run a subcommand's *handler*, printing expected failures as one line."""
     try:
         if handler is _cmd_serve:
             # A long-running server: its warnings are printed as usual.
