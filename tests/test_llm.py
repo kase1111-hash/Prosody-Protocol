@@ -50,8 +50,8 @@ MONOTONE_WITH_PROFILE = (
     '<pause duration="310"/>The room is booked.</utterance> '
     '<utterance emotion="calm" confidence="0.61" x-profile="pitch_contour=flat">'
     '<pause duration="300"/>I have the slides.</utterance> '
-    '<utterance emotion="joyful" confidence="0.6" x-profile="pitch_contour=flat rate=fast">'
-    '<pause duration="310"/><prosody rate="170%">And we got the grant!</prosody></utterance>'
+    '<utterance emotion="joyful" confidence="0.61" x-profile="pitch_contour=flat rate=fast">'
+    '<pause duration="290"/><prosody rate="165%">And we got the grant!</prosody></utterance>'
     "</iml>"
 )
 MONOTONE_WITH_PROFILE_CONTEXT = (
@@ -61,8 +61,8 @@ MONOTONE_WITH_PROFILE_CONTEXT = (
     f"Delivery: sounds calm (estimated, 62%; {PROFILE_NOTE}).\n"
     "[pause 0.3s] I have the slides.\n"
     f"Delivery: sounds calm (estimated, 61%; {PROFILE_NOTE}).\n"
-    "[pause 0.3s] And we got the grant!\n"
-    f"Delivery: overall much faster; sounds joyful (estimated, 60%; {PROFILE_NOTE})."
+    "And we got the grant!\n"
+    f"Delivery: overall much faster; sounds joyful (estimated, 61%; {PROFILE_NOTE})."
 )
 
 SARCASM = """\
