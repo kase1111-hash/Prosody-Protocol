@@ -199,9 +199,9 @@ Marks a span of text with specific prosodic features. This is the primary tag fo
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `pitch` | Relative | OPTIONAL | Pitch offset from speaker baseline |
+| `pitch` | Relative | OPTIONAL | Pitch offset from the reference level (see below) |
 | `pitch_contour` | Enum | OPTIONAL | Direction of pitch movement |
-| `volume` | Relative | OPTIONAL | Volume offset from speaker baseline |
+| `volume` | Relative | OPTIONAL | Volume offset from the reference level |
 | `rate` | Enum/Percentage | OPTIONAL | Speech rate |
 | `quality` | Enum | OPTIONAL | Voice quality descriptor |
 
@@ -230,7 +230,15 @@ Relative values MUST carry an explicit sign; absolute values MUST NOT. Each is a
 **Rate values:**
 
 - Named: `fast`, `slow`, `medium`
-- Percentage of baseline, without a sign: `150%`, `80%`
+- Percentage of the reference rate, without a sign: `150%`, `80%`
+
+**Reference level:** Relative pitch (percentage or semitones), relative volume and rate percentages describe the span against a reference level. For a `<prosody>` that is not inside another `<prosody>`, the reference is the speaker's baseline (their usual pitch, loudness and rate). For a `<prosody>` nested inside another `<prosody>`, the reference is the enclosing `<prosody>`'s level: its own value of that attribute, or, where it has none, its reference in turn. Nested values therefore accumulate, as in SSML: semitone and dB offsets add, and relative percentages and rate percentages multiply (`+20%` inside `+10%` is 1.1 x 1.2 = 1.32 times the baseline pitch). `<emphasis>` and `<segment>` carry no pitch, volume or rate and do not change the reference level. An absolute pitch (`185Hz`) and the named rates are not offsets: an absolute pitch is the span's own pitch, and `fast`, `medium` and `slow` compare the span with the speaker's baseline.
+
+In the example below, "very" is 3 dB louder than the speaker's baseline and 5 dB quieter than the words around it:
+
+```xml
+<prosody volume="+8dB">We are so <prosody volume="-5dB">very</prosody> late now.</prosody>
+```
 
 **Quality values:**
 
@@ -428,7 +436,7 @@ A **producer** is any system that generates IML (e.g., a prosody-aware STT pipel
 
 1. Producers MUST generate well-formed XML.
 2. Producers MUST include `confidence` when `emotion` is specified on `<utterance>`.
-3. Producers SHOULD omit attributes when values are at speaker baseline (e.g., don't emit `pitch="+0%"`).
+3. Producers SHOULD omit attributes when values are at their reference level (Section 3.2), for example at the speaker baseline (don't emit `pitch="+0%"`).
 4. Producers SHOULD use the core emotion vocabulary (Section 3.1) where applicable.
 5. Producers MUST express `<pause>` durations in whole milliseconds.
 
@@ -465,7 +473,7 @@ Some attribute values are valid syntax but lie far outside anything a human voic
 
 | Attribute | Element | Plausible values |
 |-----------|---------|------------------|
-| `pitch` (relative) | `<prosody>` | Within two octaves of the baseline: `-24st` to `+24st`, `-75%` to `+300%` |
+| `pitch` (relative) | `<prosody>` | Within two octaves of the reference level: `-24st` to `+24st`, `-75%` to `+300%` |
 | `pitch` (absolute) | `<prosody>` | `40Hz` to `1200Hz` |
 | `volume` | `<prosody>` | `-40dB` to `+40dB` |
 | `rate` (percentage) | `<prosody>` | `25%` to `400%` |
@@ -474,7 +482,7 @@ Some attribute values are valid syntax but lie far outside anything a human voic
 | `speech_rate` | `<prosody>` | At most 20 syllables/second |
 | `duration_ms` | `<prosody>` | At most 3600000 ms (one hour) |
 
-The limits are inclusive. The pitch limits are the same in every unit: +24 semitones is four times the baseline frequency (+300%), and -24 semitones a quarter of it (-75%). 40-1200 Hz covers the speaking voice from a deep bass to a scream (only the lowest vocal fry goes below it), and 20 syllables per second is far faster than anyone speaks.
+The limits are inclusive and apply to each value as written, relative to its reference level (Section 3.2). The pitch limits are the same in every unit: +24 semitones is four times the reference frequency (+300%), and -24 semitones a quarter of it (-75%). 40-1200 Hz covers the speaking voice from a deep bass to a scream (only the lowest vocal fry goes below it), and 20 syllables per second is far faster than anyone speaks.
 
 The length of a pause is the exception: a silence of more than a minute is usually real (a voicemail, a recorded interview), not an error. It means no more than a pause of two seconds (Section 3.3), so producers SHOULD end the utterance at such a silence, or write it as a `<pause>` of at most 60000 ms.
 
@@ -754,7 +762,7 @@ This specification uses the key words MUST, MUST NOT, SHOULD, SHOULD NOT, MAY, R
 |----|-------------|---------|
 | S1 | The IML namespace `http://prosody-protocol.org/iml/0.1` SHOULD be used when embedding IML in other XML formats. | 2.3 |
 | S2 | The combined nesting depth of `<prosody>` and `<emphasis>` SHOULD NOT exceed 2 levels. | 5.2 |
-| S3 | Producers SHOULD omit attributes when values are at speaker baseline. | 6.1 |
+| S3 | Producers SHOULD omit attributes when values are at their reference level (the speaker baseline, or the enclosing `<prosody>`). | 6.1 |
 | S4 | Producers SHOULD use the core emotion vocabulary where applicable. | 6.1 |
 | S5 | Consumers SHOULD treat `confidence` values below 0.5 as low-confidence annotations. | 6.2 |
 | S6 | Consumers SHOULD use speaker-specific baselines when `speaker_id` is present. | 6.2 |

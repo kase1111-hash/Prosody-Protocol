@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import functools
 import math
+import numbers
+import operator
 import re
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -36,7 +38,7 @@ from typing import TypeVar, cast
 
 from lxml import etree
 
-from .exceptions import ConversionError, IMLParseError
+from .exceptions import ConversionError, IMLParseError, IMLValidationError
 from .models import (
     ChildNode,
     Emphasis,
@@ -109,6 +111,29 @@ _T = TypeVar("_T")
 # ---------------------------------------------------------------------------
 
 
+class _ParsedFloat(float):
+    """A float read from an IML attribute that remembers how it was written.
+
+    The serializer writes it back in that lexical form, so a parse/serialize
+    round trip keeps ``f0_mean="220"``, ``confidence="1"`` and
+    ``jitter="1.20"`` byte for byte (a plain float would come back as
+    ``220.0``, ``1.0`` and ``1.2``). It compares, hashes and computes as the
+    float it holds, so models built in code with plain floats are equal to
+    parsed ones.
+    """
+
+    __slots__ = ("lexical",)
+    lexical: str
+
+    def __new__(cls, value: float, lexical: str | None = None) -> _ParsedFloat:
+        number = super().__new__(cls, value)
+        number.lexical = repr(float(value)) if lexical is None else lexical
+        return number
+
+    def __reduce__(self) -> tuple[type[_ParsedFloat], tuple[float, str]]:
+        return (_ParsedFloat, (float(self), self.lexical))
+
+
 def _parse_float(raw: str) -> float | None:
     """Parse an IML Float; ``None`` unless it is a finite ASCII decimal number."""
     text = raw.strip(_XML_WHITESPACE)
@@ -116,6 +141,18 @@ def _parse_float(raw: str) -> float | None:
         return None
     value = float(text)
     return value if math.isfinite(value) else None
+
+
+def _keeping_lexical_form(
+    parse: Callable[[str], float | None],
+) -> Callable[[str], float | None]:
+    """*parse*, returning a :class:`_ParsedFloat` that keeps the value as written."""
+
+    def read(raw: str) -> float | None:
+        value = parse(raw)
+        return None if value is None else _ParsedFloat(value, raw.strip(_XML_WHITESPACE))
+
+    return read
 
 
 def _parse_non_negative_float(raw: str) -> float | None:
@@ -143,6 +180,13 @@ def _parse_positive_int(raw: str) -> int | None:
         return None
     value = int(digits)
     return value if value <= MAX_INTEGER else None
+
+
+# Readers for the typed float fields of the models: valid values keep the
+# form they were written in (see _ParsedFloat).
+_FLOAT = _keeping_lexical_form(_parse_float)
+_NON_NEGATIVE_FLOAT = _keeping_lexical_form(_parse_non_negative_float)
+_CONFIDENCE = _keeping_lexical_form(_parse_confidence)
 
 
 def _iml_name(node: etree._Element) -> str | None:
@@ -395,16 +439,16 @@ def _parse_prosody(element: etree._Element) -> Prosody:
         rate=attrs.text("rate"),
         quality=attrs.text("quality"),
         # Extended attributes (Section 4).
-        f0_mean=attrs.convert("f0_mean", _parse_non_negative_float),
+        f0_mean=attrs.convert("f0_mean", _NON_NEGATIVE_FLOAT),
         f0_range=attrs.text("f0_range"),
         f0_contour=attrs.text("f0_contour"),
-        intensity_mean=attrs.convert("intensity_mean", _parse_float),
-        intensity_range=attrs.convert("intensity_range", _parse_non_negative_float),
-        speech_rate=attrs.convert("speech_rate", _parse_non_negative_float),
+        intensity_mean=attrs.convert("intensity_mean", _FLOAT),
+        intensity_range=attrs.convert("intensity_range", _NON_NEGATIVE_FLOAT),
+        speech_rate=attrs.convert("speech_rate", _NON_NEGATIVE_FLOAT),
         duration_ms=attrs.convert("duration_ms", _parse_positive_int),
-        jitter=attrs.convert("jitter", _parse_non_negative_float),
-        shimmer=attrs.convert("shimmer", _parse_non_negative_float),
-        hnr=attrs.convert("hnr", _parse_float),
+        jitter=attrs.convert("jitter", _NON_NEGATIVE_FLOAT),
+        shimmer=attrs.convert("shimmer", _NON_NEGATIVE_FLOAT),
+        hnr=attrs.convert("hnr", _FLOAT),
         extra_attributes=attrs.extra(),
     )
 
@@ -439,7 +483,7 @@ def _parse_utterance(element: etree._Element) -> Utterance:
     return Utterance(
         children=_collect_children(element),
         emotion=attrs.text("emotion"),
-        confidence=attrs.convert("confidence", _parse_confidence),
+        confidence=attrs.convert("confidence", _CONFIDENCE),
         speaker_id=attrs.text("speaker_id"),
         extra_attributes=attrs.extra(),
     )
@@ -499,13 +543,83 @@ def _children_to_plain_text(children: tuple[ChildNode, ...]) -> str:
     return "".join(parts)
 
 
+def _invalid_number(what: str, value: object, requirement: str, rule: str) -> IMLValidationError:
+    """The error for a typed numeric field that holds a value IML cannot have."""
+    from .validator import ValidationIssue  # the validator imports this module
+
+    message = (
+        f"Cannot write IML: {what} is {value!r}, but it must be {requirement}, so the "
+        "output would not be valid IML. Documents built in code are not checked when "
+        "they are built; the parser never puts such a value in a typed field."
+    )
+    return IMLValidationError(message, [ValidationIssue("error", rule, message)])
+
+
+def _is_real(value: object) -> bool:
+    # numbers.Real also covers numpy's scalar types.
+    return isinstance(value, numbers.Real) and not isinstance(value, bool)
+
+
+def _checked_float(
+    what: str, value: float | None, rule: str, *, lo: float | None = None, hi: float | None = None
+) -> float | None:
+    """*value* if it is ``None`` or a finite number within [*lo*, *hi*].
+
+    Raises :class:`IMLValidationError` otherwise (spec 2.6: Floats are finite).
+    """
+    if value is None:
+        return None
+    if (
+        not _is_real(value)
+        or not math.isfinite(value)
+        or (lo is not None and value < lo)
+        or (hi is not None and value > hi)
+    ):
+        if lo is not None and hi is not None:
+            requirement = f"a finite number from {lo:g} to {hi:g}"
+        elif lo is not None:
+            requirement = f"a finite number of at least {lo:g}"
+        else:
+            requirement = "a finite number"
+        raise _invalid_number(what, value, requirement, rule)
+    return value
+
+
+def _checked_int(
+    what: str, value: int | None, rule: str, *, missing: int | None = None
+) -> int | None:
+    """*value* if it is ``None`` (or *missing*, written as ``None``) or an IML
+    positive Integer (1 to :data:`MAX_INTEGER`); raises otherwise."""
+    if value is None or (missing is not None and value == missing and _is_real(value)):
+        return None
+    try:
+        number = operator.index(value)  # int, or an integer type such as numpy's
+    except TypeError:
+        number = None
+    if number is None or isinstance(value, bool) or not 0 < number <= MAX_INTEGER:
+        requirement = f"a whole number from 1 to {MAX_INTEGER}"
+        if missing is not None:
+            requirement += f" (or {missing}, for a missing value)"
+        raise _invalid_number(what, value, requirement, rule)
+    return number
+
+
+def _format_value(value: str | float | int) -> str:
+    """The attribute text for *value*: parsed floats keep their lexical form."""
+    if isinstance(value, _ParsedFloat):
+        return value.lexical
+    return str(value)
+
+
 def _serialize_children(children: tuple[ChildNode, ...]) -> str:
     parts: list[str] = []
     for child in children:
         if isinstance(child, str):
             parts.append(_escape_xml(child))
         elif isinstance(child, Pause):
-            attrs = _attrs([("duration", child.duration or None)], child.extra_attributes)
+            # 0 is the model's value for a missing (or invalid) duration.
+            duration = _checked_int("Pause.duration", child.duration, "V6", missing=0)
+            attrs = _attrs([("duration", duration)], child.extra_attributes)
             parts.append(f"<pause{attrs}/>")
         elif isinstance(child, Prosody):
             parts.append(_serialize_prosody(child))
@@ -603,7 +717,7 @@ def _attrs(
     written: set[str] = set()
     for name, value in typed:
         if value is not None:
-            parts.append(f' {name}="{_escape_attr(str(value), name)}"')
+            parts.append(f' {name}="{_escape_attr(_format_value(value), name)}"')
             written.add(name)
     prefixes: dict[str, str] = {}
     for name, value in extra:
@@ -632,16 +746,19 @@ def _serialize_prosody(p: Prosody) -> str:
             ("volume", p.volume),
             ("rate", p.rate),
             ("quality", p.quality),
-            ("f0_mean", p.f0_mean),
+            ("f0_mean", _checked_float("Prosody.f0_mean", p.f0_mean, "V27", lo=0.0)),
             ("f0_range", p.f0_range),
             ("f0_contour", p.f0_contour),
-            ("intensity_mean", p.intensity_mean),
-            ("intensity_range", p.intensity_range),
-            ("speech_rate", p.speech_rate),
-            ("duration_ms", p.duration_ms),
-            ("jitter", p.jitter),
-            ("shimmer", p.shimmer),
-            ("hnr", p.hnr),
+            ("intensity_mean", _checked_float("Prosody.intensity_mean", p.intensity_mean, "V27")),
+            (
+                "intensity_range",
+                _checked_float("Prosody.intensity_range", p.intensity_range, "V27", lo=0.0),
+            ),
+            ("speech_rate", _checked_float("Prosody.speech_rate", p.speech_rate, "V27", lo=0.0)),
+            ("duration_ms", _checked_int("Prosody.duration_ms", p.duration_ms, "V27")),
+            ("jitter", _checked_float("Prosody.jitter", p.jitter, "V27", lo=0.0)),
+            ("shimmer", _checked_float("Prosody.shimmer", p.shimmer, "V27", lo=0.0)),
+            ("hnr", _checked_float("Prosody.hnr", p.hnr, "V27")),
         ],
         p.extra_attributes,
     )
@@ -664,7 +781,14 @@ def _serialize_segment(s: Segment) -> str:
 
 def _serialize_utterance(u: Utterance) -> str:
     attrs = _attrs(
-        [("emotion", u.emotion), ("confidence", u.confidence), ("speaker_id", u.speaker_id)],
+        [
+            ("emotion", u.emotion),
+            (
+                "confidence",
+                _checked_float("Utterance.confidence", u.confidence, "V4", lo=0.0, hi=1.0),
+            ),
+            ("speaker_id", u.speaker_id),
+        ],
         u.extra_attributes,
     )
     inner = _serialize_children(u.children)
@@ -733,9 +857,12 @@ class IMLParser:
         bare ``<utterance>``; anything else gets an ``<iml>`` wrapper. The
         output is un-namespaced IML with comments, processing instructions
         and unknown element tags removed, and without an XML declaration (so
-        a non-UTF-8 encoding declaration, V30, is not carried over). All
-        attributes are kept, including ``extra_attributes``, so a document
-        with invalid attribute values stays invalid.
+        a non-UTF-8 encoding declaration, V30, is not carried over). The
+        utterances inside ``<iml>`` are separated by a space, so stripping
+        the tags keeps their sentences apart (spec 6.2). All attributes are
+        kept, including ``extra_attributes``, so a parsed document with
+        invalid attribute values stays invalid; numbers the parser read are
+        written as they were (``f0_mean="220"`` stays ``220``).
 
         The output is always well-formed XML (spec 6.1), which
         :meth:`parse` reads back. A document that cannot be written as
@@ -747,6 +874,17 @@ class IMLParser:
         surrogates; U+FFFE and U+FFFF), or an extra attribute whose name is
         not an XML name without a colon or a Clark name ``{uri}name``
         (``xmlns`` and the ``xmlns`` namespace are not attributes).
+
+        A typed numeric field built in code with a value IML cannot have
+        raises :class:`~prosody_protocol.exceptions.IMLValidationError`
+        (whose ``issues`` name the validator rule) instead of being written
+        as invalid IML: a ``confidence`` that is not a finite number from 0
+        to 1 (V4), a ``Pause.duration`` other than a whole number from 1 to
+        2147483647 or 0 for a missing duration (V6), or an extended
+        attribute (spec Section 4) that is not finite, is negative where
+        Section 4 forbids it, or is a ``duration_ms`` that is not a positive
+        Integer (V27). The parser never puts such values in typed fields: it
+        keeps them, as written, in ``extra_attributes``.
         """
         doc_attrs = _attrs(
             [
@@ -760,5 +898,7 @@ class IMLParser:
         if len(doc.utterances) == 1 and not doc_attrs:
             return _serialize_utterance(doc.utterances[0])
 
-        inner = "".join(_serialize_utterance(u) for u in doc.utterances)
+        # A space between utterances keeps their sentences apart for a consumer
+        # that strips the tags (spec 6.2); the parser ignores it (spec 2.4).
+        inner = " ".join(_serialize_utterance(u) for u in doc.utterances)
         return f"<iml{doc_attrs}>{inner}</iml>"

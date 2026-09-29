@@ -3,7 +3,7 @@
 Supports a rule-based baseline and a pluggable ML model backend.
 Spec reference: Section 3 (output conforms to IML tag set).
 
-Phase 6a implements rule-based prediction using punctuation, capitalisation,
+Phase 6a implements rule-based prediction using punctuation, capitalization,
 and lexical cues.  Zero external dependencies beyond ``lxml``.
 
 The rule-based model:
@@ -63,7 +63,7 @@ from .validator import IMLValidator
 # ---------------------------------------------------------------------------
 
 # Cue word -> emotion from the spec 3.1 core vocabulary. Words are matched in
-# lower case with typographic apostrophes normalised to "'".
+# lower case with typographic apostrophes normalized to "'".
 _EMOTION_WORDS: dict[str, str] = {
     **dict.fromkeys(
         (
@@ -145,13 +145,23 @@ _SARCASM_IDIOM_RE = re.compile(
 # idiom unless the positive word is in capitals, the clause trails off
 # ("Oh great..."), or a follow-up such as "another" comes after it ("Oh
 # great, another meeting.").
+#
+# The words between the opener and the positive word are never openers
+# themselves, and there are at most _MAX_FRAME_FILLERS of them, so each
+# match attempt looks at a bounded number of words and a scan of the whole
+# text takes linear time. (With "just" among them, as it once was, every
+# "just" in a run of them rescanned the rest of the run: 100 KB of "just
+# just ..." took about a minute.) "Oh, that's just great" still matches,
+# from its "just".
 _POSITIVE_FOR_SARCASM = (
     r"(?:great|wonderful|perfect|fantastic|brilliant|lovely|marvell?ous|terrific|"
     r"super|fabulous|splendid|nice|awesome|joy|goody)"
 )
+_MAX_FRAME_FILLERS = 6
 _POSITIVE_FRAME_RE = re.compile(
     r"\b(?:oh|ah|just),?\s+"
-    r"(?:(?:that's|thats|that is|it's|this is|how|so|just|really|yeah),?\s+)*"
+    r"(?:(?:that's|thats|that is|it's|this is|how|so|really|yeah),?\s+)"
+    f"{{0,{_MAX_FRAME_FILLERS}}}"
     r"(?P<word>" + _POSITIVE_FOR_SARCASM + r")"
     r"(?=[\"'\u201d)]*\s*(?:[,;:.!?\u2026\u2014\u2013]|$))",
     re.IGNORECASE,
@@ -193,7 +203,7 @@ _EXCLAMATION_BONUS = 0.1
 # hyphens (DON'T, SUPER-FAST, ÉTÉ), no digits.
 _CAPS_WORD_RE = re.compile(r"[^\W\d_]+(?:['\u2019\-][^\W\d_]+)*")
 
-# Short capitalised words (2-4 letters) are emphasised only if they are
+# Short capitalized words (2-4 letters) are emphasized only if they are
 # ordinary words; any other short all-caps token is taken to be an acronym
 # (NASA, FBI, API, USA, OK).
 _SHOUTED_SHORT_WORDS = frozenset({
@@ -210,7 +220,7 @@ _SHOUTED_SHORT_WORDS = frozenset({
     "died", "die", "kill", "hurt", "pain", "fire", "cool", "nice", "fine", "mad",
     "sad", "yet", "ugh", "omg",
 })
-# Capitalised words of five or more letters that are usually acronyms.
+# Capitalized words of five or more letters that are usually acronyms.
 _LONG_ACRONYMS = frozenset({
     "nasdaq", "unicef", "unesco", "naacp", "asean", "https", "ascii", "scuba",
     "laser", "radar", "sonar",
@@ -321,7 +331,8 @@ def _cue_scores(text: str, lexicon: dict[str, str]) -> dict[str, float]:
     """Score emotions by sarcasm cues, cue phrases and cue words in ``text``.
 
     Negated cue words are ignored, and words that are part of a sarcasm cue
-    or a cue phrase do not count again on their own. Runs in linear time.
+    or a cue phrase do not count again on their own. Runs in time linear in
+    the length of ``text`` (see ``_POSITIVE_FRAME_RE``).
     """
     text = text.replace("\u2019", "'")
     matches = list(_WORD_RE.finditer(text))
@@ -530,8 +541,8 @@ def _split_quotes(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _is_emphasised(core: str, shouting: bool) -> bool:
-    """Whether a token's letters are an ALL-CAPS word to emphasise."""
+def _is_emphasized(core: str, shouting: bool) -> bool:
+    """Whether a token's letters are an ALL-CAPS word to emphasize."""
     if shouting or not _CAPS_WORD_RE.fullmatch(core) or core.upper() != core:
         return False
     letters = [ch for ch in core if ch.isalpha()]
@@ -579,7 +590,7 @@ def _build_children_for_sentence(sentence: str, shouting: bool) -> tuple[ChildNo
             add_pause()  # "well ...and": the pause goes before the ellipsis
         core = _strip_punctuation(token)
         start = token.find(core) if core else -1
-        if start >= 0 and _is_emphasised(core, shouting):
+        if start >= 0 and _is_emphasized(core, shouting):
             add_text(token[:start])
             add_node(Emphasis(level="strong", children=(core,)))
             add_text(token[start + len(core) :])
@@ -649,7 +660,7 @@ class TextToIML:
     ----------
     model:
         Backend to use.  ``"rule-based"`` (default) uses punctuation,
-        capitalisation, and lexical cues.  Other values are reserved for
+        capitalization, and lexical cues.  Other values are reserved for
         future ML backends (Phase 6b).
     default_confidence:
         Optional confidence floor for emitted emotions (0.0-1.0). By default
@@ -718,19 +729,16 @@ class TextToIML:
             return self._parser.to_iml_string(doc)
 
         context_emotion = _context_emotion(context)
-        utterances = [
+        utterances = tuple(
             _build_utterance(
                 sentence, context_emotion, self.min_confidence, self.default_confidence
             )
             for run in _split_quotes(normalized)
             for sentence in _split_sentences(run)
-        ]
-        # Utterances are separated by the single space the text had between
-        # them, so stripping the tags gives the text back (spec 6.2).
-        body = " ".join(
-            self._parser.to_iml_string(IMLDocument(utterances=(u,))) for u in utterances
         )
-        xml = f'<iml version="{_IML_VERSION}">{body}</iml>'
+        # The serializer separates utterances by a space, the one the text
+        # had between them, so stripping the tags gives the text back (spec 6.2).
+        xml = self._parser.to_iml_string(IMLDocument(utterances=utterances, version=_IML_VERSION))
         result = self._validator.validate(xml)
         if not result.valid:  # pragma: no cover - guards against model bugs
             raise ConversionError(

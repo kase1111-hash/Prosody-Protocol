@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import math
+
+import pytest
+
+from prosody_protocol.exceptions import IMLValidationError
 from prosody_protocol.models import (
     Emphasis,
     IMLDocument,
@@ -10,6 +15,7 @@ from prosody_protocol.models import (
     Segment,
     Utterance,
 )
+from prosody_protocol.parser import IMLParser
 
 
 class TestPause:
@@ -78,3 +84,20 @@ class TestIMLDocument:
     def test_empty_document(self) -> None:
         doc = IMLDocument()
         assert doc.utterances == ()
+
+
+class TestBuiltValues:
+    """Models accept any value when built; writing them as IML checks numbers."""
+
+    def test_construction_does_not_validate(self) -> None:
+        # Consumers (to_llm_context, IMLToSSML) cope with such documents.
+        u = Utterance(children=("hi", Pause(duration=-5)), emotion="calm", confidence=math.nan)
+        assert math.isnan(u.confidence or 0.0)
+
+    def test_writing_an_invalid_number_raises(self) -> None:
+        # Used to write '<utterance emotion="calm" confidence="nan">hi</utterance>'.
+        doc = IMLDocument(utterances=(
+            Utterance(children=("hi",), emotion="calm", confidence=math.nan),
+        ))
+        with pytest.raises(IMLValidationError, match="confidence"):
+            IMLParser().to_iml_string(doc)

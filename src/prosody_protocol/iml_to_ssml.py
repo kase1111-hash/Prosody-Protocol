@@ -32,7 +32,7 @@ written on a nested ``<prosody>`` so that its targets are unambiguously
 relative to the shifted pitch.
 
 ``vendor="espeak-ng"`` adapts the output to what espeak-ng 1.51 actually
-renders (measured by analysing its audio): pitch values are rescaled so the
+renders (measured by analyzing its audio): pitch values are rescaled so the
 realized F0 shift matches the IML value (espeak-ng applies relative pitch to
 an internal 0-100 parameter, which roughly halves it, and treats "185Hz" as a
 relative value; absolute values are resolved against the voice's measured
@@ -252,8 +252,11 @@ def _iml_volume_to_ssml(volume: str) -> str:
     """
     m = _DB_RE.match(volume)
     if m is None:
-        return volume  # unrecognised format -- pass through unchanged
-    db = float(m.group(1))
+        return volume  # unrecognized format -- pass through unchanged
+    # Rounding keeps tiny values out of exponent notation ("1e-07"), and
+    # adding 0.0 turns -0.0 ("-0dB", valid IML) into 0.0, so that it is
+    # written "+0dB" rather than "+-0dB".
+    db = round(float(m.group(1)), 4) + 0.0
     # The W3C SSML spec defines these named levels:
     #   silent, x-soft, soft, medium, loud, x-loud
     # Map extreme values so engines without dB support still behave sensibly.
@@ -261,7 +264,7 @@ def _iml_volume_to_ssml(volume: str) -> str:
         return "x-soft"
     if db >= 20:
         return "x-loud"
-    # Standard +/-NdB is valid SSML; normalise the suffix to "dB".
+    # Standard +/-NdB is valid SSML; normalize the suffix to "dB".
     sign = "+" if db >= 0 else ""
     return f"{sign}{db:g}dB"
 

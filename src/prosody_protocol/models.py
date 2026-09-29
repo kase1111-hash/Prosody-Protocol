@@ -10,12 +10,22 @@ no typed field, as ``(name, value)`` pairs in document order. It holds
 namespaced attributes (named in Clark notation, ``{uri}name``), numeric
 attributes whose value is not valid per the spec -- for example
 ``confidence="NaN"`` or ``duration="-5"``, whose typed field is then left at
-its default, so numeric fields only ever hold valid values -- and an empty
-``level=""`` on ``<emphasis>``. (Other string fields such as ``pitch`` hold
-their value as written, valid or not.)
+its default, so the numeric fields of a parsed document only ever hold valid
+values -- and an empty ``level=""`` on ``<emphasis>``. (Other string fields
+such as ``pitch`` hold their value as written, valid or not.)
 :class:`~prosody_protocol.parser.IMLParser` fills it and writes it back
 verbatim, so a parse/serialize round trip keeps extension data and never
 turns an invalid document into a valid one.
+
+The models do not check their values when they are built, so a document
+built in code can hold any value (consumers such as
+:func:`~prosody_protocol.llm.to_llm_context` cope with that).
+:meth:`IMLParser.to_iml_string <prosody_protocol.parser.IMLParser.to_iml_string>`
+refuses to write a numeric field that IML cannot have -- a ``confidence``
+of ``nan`` or ``5.0``, a negative pause ``duration`` -- and raises
+:class:`~prosody_protocol.exceptions.IMLValidationError` instead. Validate
+other values, such as ``pitch`` strings, with
+:class:`~prosody_protocol.validator.IMLValidator`.
 """
 
 from __future__ import annotations
