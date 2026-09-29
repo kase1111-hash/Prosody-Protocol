@@ -46,7 +46,7 @@ Prosody-Protocol/
 - **Abstention:** utterances below `min_emotion_confidence` (0.5) carry no `emotion`/`confidence`. The rule-based classifier never reports `neutral` or `calm` at 0.5 or above.
 - **Prosody profiles:** JSON documents (spec Section 7) that map a speaker's atypical patterns to intended meanings. Profile use is reported downstream (spec 7.2): `x-profile="<matched pattern>"` on the utterance, `ConversionResult.profile_matches`, and "interpreted with the speaker's prosody profile" in `to_llm_context`. The profile's `user_id` is never written into IML.
 - **Word timings:** the SDK measures how words were said; the words come from `words=` (any STT, via `prosody_protocol.alignment`; speaker labels kept), `transcript=` (no timings: whole-utterance delivery only, and only against calibration), or Whisper (`whisper` extra). Utterances split at sentence ends, speaker changes, and in unpunctuated text at pauses of 500 ms.
-- **Language tags:** one rule everywhere (`_types.LANGUAGE_TAG_RE`: 1-8 letters, then `-` subtags of 1-8 alphanumerics; form only): V29, D6, the dataset schema, `IMLToSSML`, `AudioToIML`, `IMLAssembler`, `MavisBridge`, CLI. SDK/CLI arguments read `en_US` as `en-US`; documents and datasets are checked as written; the REST `language` field takes the tag form only.
+- **Language tags:** one rule everywhere (`_types.LANGUAGE_TAG_RE`: 1-8 letters, then `-` subtags of 1-8 alphanumerics; form only): V29, D6, the dataset schema, `IMLToSSML`, `AudioToIML`, `IMLAssembler`, `MavisBridge`, CLI. SDK, CLI and REST arguments read `en_US` as `en-US`; documents and datasets are checked as written.
 
 ## Specification Rules
 
@@ -86,7 +86,7 @@ CLI: `prosody-protocol validate | to-text | to-ssml | to-prompt | from-text | fr
 
 ## REST API
 
-`prosody-protocol serve` or `python -m prosody_protocol.server` (same options; binds 127.0.0.1:8000, also when `PP_HOST` is empty). Settings are `PP_*` env vars (`server/config.py`): `PP_HOST`, `PP_PORT`, `PP_DEBUG`, `PP_CORS_ORIGINS`, `PP_MAX_UPLOAD_MB`, `PP_MAX_JSON_BYTES`, `PP_RATE_LIMIT`, `PP_TRUSTED_PROXIES`, `PP_MAX_TEXT_CHARS`, `PP_MAX_WORDS_CHARS`, `PP_MAX_AUDIO_SECONDS`, `PP_MAX_SYNTH_SECONDS`, `PP_MAX_CONCURRENT_JOBS`, `PP_MAX_QUEUED_JOBS`, `PP_STT_MODEL`.
+`prosody-protocol serve` or `python -m prosody_protocol.server` (same options; binds 127.0.0.1:8000, also when `PP_HOST` is empty). Settings are `PP_*` env vars (`server/config.py`): `PP_HOST`, `PP_PORT`, `PP_DEBUG`, `PP_CORS_ORIGINS`, `PP_MAX_UPLOAD_MB`, `PP_MAX_JSON_BYTES`, `PP_RATE_LIMIT`, `PP_TRUSTED_PROXIES`, `PP_MAX_TEXT_CHARS`, `PP_MAX_WORDS_CHARS`, `PP_MAX_AUDIO_SECONDS`, `PP_MAX_SYNTH_SECONDS`, `PP_MAX_CONCURRENT_JOBS`, `PP_MAX_QUEUED_JOBS`, `PP_JOB_TIMEOUT_S`, `PP_STT_MODEL`.
 
 ```
 GET  /v1/health
@@ -98,7 +98,7 @@ POST /v1/convert/iml-to-prompt
 POST /v1/synthesize               # -> audio/wav
 ```
 
-Every error body is `{"error", "detail"}` (422 `invalid_request` has a list as `detail`). Audio conversion and synthesis run in worker processes (about 450 MB per job for 10 minutes of audio); scripts that embed the app need an `if __name__ == "__main__":` guard.
+Every error body is `{"error", "detail"}` (422 `invalid_request` has a list as `detail`). Audio conversion and synthesis run in worker processes (about 450 MB per job for 10 minutes of audio); a job over `PP_JOB_TIMEOUT_S` is stopped (504), and one whose client disconnects is dropped or its worker stopped; scripts that embed the app need an `if __name__ == "__main__":` guard.
 
 ## Build and Test
 

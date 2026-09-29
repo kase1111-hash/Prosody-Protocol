@@ -73,6 +73,10 @@ class Settings:
         PP_MAX_AUDIO_SECONDS: Maximum duration of an audio upload; longer audio
             is rejected before it is decoded in full, since a small compressed
             file can hold hours of audio (default 600)
+        PP_JOB_TIMEOUT_S: Longest time, in seconds, a worker process may spend
+            on one audio conversion or synthesis; the worker is then stopped
+            and the request gets a 504 job_timeout (default 900, room for
+            Whisper on a CPU with PP_MAX_AUDIO_SECONDS of audio)
         PP_MAX_CONCURRENT_JOBS: Audio conversions and syntheses run at the same
             time, each in its own worker process (default 2)
         PP_MAX_QUEUED_JOBS: Audio conversions and syntheses that may wait for a
@@ -111,6 +115,7 @@ class Settings:
         default_factory=lambda: _env_float("PP_MAX_AUDIO_SECONDS", 600.0)
     )
     max_queued_jobs: int = field(default_factory=lambda: _env_int("PP_MAX_QUEUED_JOBS", 8))
+    job_timeout_s: float = field(default_factory=lambda: _env_float("PP_JOB_TIMEOUT_S", 900.0))
     stt_model: str = field(
         default_factory=lambda: os.getenv("PP_STT_MODEL", "").strip() or DEFAULT_STT_MODEL
     )
@@ -188,6 +193,7 @@ _INT_SETTINGS: dict[str, tuple[str, int]] = {
 _DURATION_SETTINGS: dict[str, str] = {
     "max_synth_seconds": "PP_MAX_SYNTH_SECONDS",
     "max_audio_seconds": "PP_MAX_AUDIO_SECONDS",
+    "job_timeout_s": "PP_JOB_TIMEOUT_S",
 }
 
 

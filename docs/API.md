@@ -1170,7 +1170,11 @@ conversion and synthesis run in worker processes, one job at a time each,
 so a long job does not block other requests. A worker that dies (killed
 for using too much memory, say) fails only the job it was running (500
 `internal_error`); jobs waiting for a worker are not affected, and a job
-sent to a worker that died before taking it runs on another.
+sent to a worker that died before taking it runs on another. A job that
+runs longer than `PP_JOB_TIMEOUT_S` has its worker stopped (504
+`job_timeout`), and when a client disconnects while its audio conversion
+or synthesis is waiting or running, the job is dropped or its worker
+stopped, so abandoned requests do not keep workers busy.
 `prosody_protocol.server.run(host=None, port=None)` serves the app
 configured from the environment (`prosody_protocol.server.app:app`) with
 uvicorn, as `prosody-protocol serve` does.
@@ -1226,6 +1230,7 @@ variable unset) binds 127.0.0.1, never every interface.
 | `PP_MAX_SYNTH_SECONDS` (`max_synth_seconds`) | `120` | longest audio `/v1/synthesize` produces |
 | `PP_MAX_CONCURRENT_JOBS` (`max_concurrent_jobs`) | `2` | worker processes for audio conversion and synthesis. Allow about 450 MB each for 10 minutes of audio (all audio is analyzed at 16 kHz mono, so the input's sample rate does not matter), plus the Whisper model if it is installed. |
 | `PP_MAX_QUEUED_JOBS` (`max_queued_jobs`) | `8` | jobs that may wait for a worker; beyond that, 503 |
+| `PP_JOB_TIMEOUT_S` (`job_timeout_s`) | `900` | longest time a worker may spend on one audio conversion or synthesis; the worker is then stopped and the request gets a 504 `job_timeout`. The default leaves room for Whisper on a CPU with `PP_MAX_AUDIO_SECONDS` of audio; without Whisper, 10 minutes of audio takes well under a minute |
 | `PP_STT_MODEL` (`stt_model`) | `base` | the Whisper model audio-to-iml transcribes with, when the server has the `whisper` extra and a request has neither `words` nor `transcript`: a model name (`tiny`, `small`, `large-v3`, ...) or the path of a checkpoint |
 
 ### Errors
@@ -1257,6 +1262,11 @@ for `validation_error`:
 | 500 | `speech_recognition_failed` | the server's Whisper failed on audio it could read |
 | 503 | `server_busy` | audio-to-iml or synthesize: every worker busy and the queue full; see `Retry-After` |
 | 503 | `speech_recognition_unavailable` | the server's Whisper model (`PP_STT_MODEL`) cannot be loaded; send `words` or `transcript` instead. `Retry-After: 60` |
+| 504 | `job_timeout` | audio-to-iml or synthesize ran longer than `PP_JOB_TIMEOUT_S` and was stopped |
+
+A client that disconnects while its audio conversion or synthesis waits or
+runs never sees a response; the server logs it as 499
+`client_closed_request` and stops the job.
 
 A request that does not match an endpoint's schema (a missing field, an
 unknown `engine`, `min_confidence` above 1, a bad language tag, invalid
@@ -1294,7 +1304,7 @@ curl http://127.0.0.1:8000/v1/health
 ```
 
 ```json
-{"status":"ok","version":"0.1.0a3","capabilities":{"whisper":false,"espeak_ng":true,"ffmpeg":true},"limits":{"max_upload_bytes":52428800,"max_json_bytes":2465536,"max_text_chars":100000,"max_words_chars":1000000,"max_synth_seconds":120.0,"max_audio_seconds":600.0,"rate_limit_per_minute":60}}
+{"status":"ok","version":"0.1.0a3","capabilities":{"whisper":false,"espeak_ng":true,"ffmpeg":true},"limits":{"max_upload_bytes":52428800,"max_json_bytes":2465536,"max_text_chars":100000,"max_words_chars":1000000,"max_synth_seconds":120.0,"max_audio_seconds":600.0,"job_timeout_s":900.0,"rate_limit_per_minute":60}}
 ```
 
 Without `whisper`, audio-to-iml needs `words` or `transcript` for real
@@ -1334,7 +1344,7 @@ text is `[speech]` placeholders. A `transcript` without timings adds little
 without `calibration` (see [AudioToIML](#audiotoiml)). All fields are
 checked before the job waits for a worker. Starlette limits a form field
 sent as text to 1 MiB (413 `text_too_large`), so send long word lists as a
-file. The `language` field takes the tag form only (`en_US` is a 422).
+file. The `language` field reads `en_US` as `en-US`, like the SDK.
 
 Response: `{"iml", "plain_text", "transcript_source": "words" |
 "transcript" | "whisper" | "none", "warnings": [str], "profile_matches":
@@ -1346,7 +1356,7 @@ calibration recording, naming the file; every calibration recording
 silent), 400 `profile_error`, 413, 415 (not multipart), 422 (invalid `words`
 or `transcript`, both given, bad `language`, `calibration` sent as text or
 more than 5 of them), 500 `speech_recognition_failed`, 503 (`server_busy`,
-`speech_recognition_unavailable`).
+`speech_recognition_unavailable`), 504 `job_timeout`.
 
 ```bash
 curl -F audio=@examples/monotone.wav -F words=@examples/monotone.deepgram.json -F profile=@examples/profile.json http://127.0.0.1:8000/v1/convert/audio-to-iml

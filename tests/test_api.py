@@ -185,6 +185,7 @@ class TestHealth:
             "max_words_chars": 5678,
             "max_synth_seconds": 45.0,
             "max_audio_seconds": 600.0,
+            "job_timeout_s": 900.0,
             "rate_limit_per_minute": 0,
         }
 
@@ -1752,24 +1753,89 @@ class TestJobRunner:
         finally:
             runner.shutdown()
 
-    def test_job_of_a_request_that_went_away_keeps_its_place(self) -> None:
+    def test_cancelled_request_stops_its_job(self) -> None:
+        """A cancelled request used to leave its job running to the end."""
         runner = JobRunner(max_workers=1, max_queued=0)
 
         async def scenario() -> None:
             async def request() -> None:
                 with runner.admit():
-                    await runner.run(time.sleep, 1.5)
+                    await runner.run(time.sleep, 30)
 
             task = asyncio.ensure_future(request())
             await self.until(lambda: runner.running == 1)
+            [pid] = runner.worker_pids()
+            started = time.monotonic()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            # The worker is still busy, so no other job may be admitted yet.
-            assert runner.admitted == 1
-            with pytest.raises(APIError), runner.admit():
-                pass
-            await self.until(lambda: runner.admitted == 0)
+            # The worker was killed, so its place frees long before 30 s.
+            await self.until(lambda: runner.admitted == 0 and runner.running == 0, 10.0)
+            assert time.monotonic() - started < 10.0
+            assert pid not in runner.worker_pids()
+            # The next job gets a fresh worker.
+            with runner.admit():
+                assert await runner.run(operator.add, 2, 3) == 5
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            runner.shutdown()
+
+    def test_client_that_goes_away_stops_its_job(self) -> None:
+        runner = JobRunner(max_workers=1, max_queued=0)
+        checks: list[bool] = []
+
+        async def gone() -> bool:
+            checks.append(runner.running == 1)
+            return runner.running == 1  # the client leaves once the job has started
+
+        async def scenario() -> None:
+            started = time.monotonic()
+            with pytest.raises(APIError) as excinfo, runner.admit():
+                await runner.run(time.sleep, 30, is_disconnected=gone)
+            assert excinfo.value.status_code == 499
+            assert excinfo.value.error == "client_closed_request"
+            await self.until(lambda: runner.admitted == 0 and runner.running == 0, 10.0)
+            assert time.monotonic() - started < 10.0
+            assert checks and checks[-1]
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            runner.shutdown()
+
+    def test_client_that_stays_gets_the_result(self) -> None:
+        runner = JobRunner(max_workers=1)
+
+        async def connected() -> bool:
+            return False
+
+        async def scenario() -> None:
+            with runner.admit():
+                assert await runner.run(
+                    operator.mul, 6, 7, is_disconnected=connected
+                ) == 42
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            runner.shutdown()
+
+    def test_job_over_the_time_limit_is_stopped(self) -> None:
+        runner = JobRunner(max_workers=1, job_timeout_s=0.5)
+
+        async def scenario() -> None:
+            started = time.monotonic()
+            with pytest.raises(APIError) as excinfo, runner.admit():
+                await runner.run(time.sleep, 30)
+            assert excinfo.value.status_code == 504
+            assert excinfo.value.error == "job_timeout"
+            assert "PP_JOB_TIMEOUT_S" in excinfo.value.detail
+            assert time.monotonic() - started < 10.0
+            # Its worker was replaced; a quick job still runs.
+            with runner.admit():
+                assert await runner.run(operator.add, 1, 1) == 2
 
         try:
             asyncio.run(scenario())

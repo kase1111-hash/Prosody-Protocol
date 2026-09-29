@@ -73,6 +73,9 @@ class Limits(BaseModel):
     max_words_chars: int
     max_synth_seconds: float
     max_audio_seconds: float
+    job_timeout_s: float = Field(
+        description="Longest time one audio conversion or synthesis may run."
+    )
     rate_limit_per_minute: int = Field(description="0 means unlimited.")
 
 
@@ -113,6 +116,7 @@ async def health(settings: SettingsDep) -> HealthResponse:
             max_words_chars=settings.max_words_chars,
             max_synth_seconds=settings.max_synth_seconds,
             max_audio_seconds=settings.max_audio_seconds,
+            job_timeout_s=settings.job_timeout_s,
             rate_limit_per_minute=settings.rate_limit_per_minute,
         ),
     )
@@ -140,7 +144,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=_lifespan,
     )
     application.state.settings = settings
-    application.state.jobs = JobRunner(settings.max_concurrent_jobs, settings.max_queued_jobs)
+    application.state.jobs = JobRunner(
+        settings.max_concurrent_jobs,
+        settings.max_queued_jobs,
+        job_timeout_s=settings.job_timeout_s,
+    )
 
     # Middleware added last runs first: CORS, then rate limit, then size limit.
     application.add_middleware(

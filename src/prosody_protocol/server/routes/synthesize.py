@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -67,7 +67,7 @@ _WAV_RESPONSE: dict[int | str, dict[str, Any]] = {
     responses={**_WAV_RESPONSE, **ERROR_RESPONSES, **BUSY_RESPONSES},
 )
 async def synthesize(
-    request: SynthesizeRequest, settings: SettingsDep, jobs: JobsDep
+    request: SynthesizeRequest, http: Request, settings: SettingsDep, jobs: JobsDep
 ) -> Response:
     """Synthesize IML markup to a WAV file.
 
@@ -85,6 +85,7 @@ async def synthesize(
             request.engine,
             settings.max_synth_seconds,
             request.strict,
+            is_disconnected=http.is_disconnected,
         )
     return Response(
         content=wav_bytes,

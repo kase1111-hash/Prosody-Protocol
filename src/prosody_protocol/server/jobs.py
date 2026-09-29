@@ -15,6 +15,11 @@ sent to a worker that died before taking it runs on another. Dead workers
 are replaced when the next job needs one, and workers exit when the server
 process does, however it ends.
 
+A job that runs longer than ``job_timeout_s`` has its worker killed and
+fails with a 504. When the caller passes ``is_disconnected`` and the client
+goes away, a waiting job is dropped and the worker running a started one is
+killed, so abandoned requests do not keep a worker busy.
+
 Workers are started with the ``spawn`` method, which re-imports the main
 script in each worker: a script that serves the app itself must guard its
 entry point with ``if __name__ == "__main__":``.
@@ -30,8 +35,8 @@ import multiprocessing.connection
 import multiprocessing.process
 import signal
 import threading
-from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Awaitable, Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, TypeVar, cast
 
 from . import _worker
@@ -53,6 +58,10 @@ _SEND_ATTEMPTS = 3
 # Seconds a worker is given to exit by itself when the runner shuts down.
 _STOP_TIMEOUT_S = 5.0
 
+# How often, in seconds, a request waiting for its job checks whether the
+# client is still connected.
+_DISCONNECT_POLL_S = 0.5
+
 
 class _RemoteTraceback(Exception):
     """The traceback of an exception raised in a worker process (its ``__cause__``)."""
@@ -71,6 +80,37 @@ class _WorkerExited(Exception):
     def __init__(self, exitcode: int | None) -> None:
         super().__init__(exitcode)
         self.exitcode = exitcode
+
+
+class _JobTimedOut(Exception):
+    """The job ran longer than the runner's ``job_timeout_s``; its worker was killed."""
+
+
+class _JobAbandoned(Exception):
+    """The client went away; the job's worker was killed."""
+
+
+class _Job:
+    """One job's link to the worker process running it, so it can be stopped."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._worker: _WorkerProcess | None = None
+        self.abandoned = False
+
+    def attach(self, worker: _WorkerProcess) -> bool:
+        """Record that *worker* runs the job; ``False`` if it was abandoned already."""
+        with self._lock:
+            self._worker = worker
+            return not self.abandoned
+
+    def abandon(self) -> None:
+        """Stop the job: kill its worker if one has started it."""
+        with self._lock:
+            self.abandoned = True
+            worker = self._worker
+        if worker is not None:
+            worker.kill()
 
 
 class _NoWorker(Exception):
@@ -105,6 +145,11 @@ class _WorkerProcess:
         self.process.join(timeout=1.0)
         return self.process.exitcode
 
+    def kill(self) -> None:
+        """Kill the worker at once; its pipe then reports EOF."""
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            self.process.kill()
+
     def stop(self) -> None:
         """Ask the worker to exit; kill it if it does not."""
         with contextlib.suppress(OSError, ValueError):
@@ -126,12 +171,16 @@ class JobRunner:
     Callers hold a place from :meth:`admit` while they prepare and run a
     job; at most ``max_workers + max_queued`` places are handed out, and
     ``admitted`` counts those held. ``running`` counts the jobs a worker
-    process is working on.
+    process is working on. A worker that spends more than *job_timeout_s*
+    seconds on one job (``None``: no limit) is killed.
     """
 
-    def __init__(self, max_workers: int, max_queued: int = 8) -> None:
+    def __init__(
+        self, max_workers: int, max_queued: int = 8, *, job_timeout_s: float | None = None
+    ) -> None:
         self.max_workers = max_workers
         self.max_queued = max_queued
+        self.job_timeout_s = job_timeout_s
         self.admitted = 0
         self.running = 0
         self._lock = threading.Lock()
@@ -165,27 +214,49 @@ class JobRunner:
         finally:
             self._release()
 
-    async def run(self, func: Callable[..., T], *args: object) -> T:
+    async def run(
+        self,
+        func: Callable[..., T],
+        *args: object,
+        is_disconnected: Callable[[], Awaitable[bool]] | None = None,
+    ) -> T:
         """Return ``func(*args)`` computed in a worker process.
 
         *func* and *args* must be picklable (module-level functions). SDK
         exceptions are re-raised here with their attributes intact. Call it
-        inside :meth:`admit`.
+        inside :meth:`admit`. With *is_disconnected* (such as Starlette's
+        ``Request.is_disconnected``), the job is stopped when the client
+        goes away, and a 499 ``client_closed_request`` is raised.
         """
-        future = self._get_threads().submit(self._execute, func, args)
+        job = _Job()
+        future = self._get_threads().submit(self._execute, func, args, job)
+        waiting = asyncio.wrap_future(future)
         try:
-            return await asyncio.wrap_future(future)
+            if is_disconnected is not None:
+                while not future.done():
+                    await asyncio.wait({waiting}, timeout=_DISCONNECT_POLL_S)
+                    if not future.done() and await is_disconnected():
+                        logger.info("Client went away; stopping its job")
+                        waiting.add_done_callback(_retrieve_exception)
+                        self._abandon(future, job)
+                        raise APIError(
+                            499, "client_closed_request", "The client closed the request."
+                        )
+            return await waiting
         except asyncio.CancelledError:
-            # The request went away. A job still waiting is dropped; one a
-            # worker is running holds a place until it ends, so the number
-            # of jobs in the server stays within the limit.
-            if not future.cancel():
-                with self._lock:
-                    self.admitted += 1
-                future.add_done_callback(lambda _: self._release())
+            # The request task was cancelled: stop its job the same way.
+            self._abandon(future, job)
             raise
         except _worker.JobError as exc:
             raise exc.rebuild() from None
+        except _JobTimedOut:
+            raise APIError(
+                504,
+                "job_timeout",
+                f"The request took longer than {self.job_timeout_s:g} seconds "
+                "(PP_JOB_TIMEOUT_S) and was stopped. Send shorter audio, or word timings "
+                "instead of relying on the server's speech recognition.",
+            ) from None
         except _WorkerExited as exc:
             raise APIError(
                 500,
@@ -201,6 +272,21 @@ class JobRunner:
                 "No worker process could be started for this request; the details are in "
                 "the server log.",
             ) from None
+
+    def _abandon(self, future: Future[Any], job: _Job) -> None:
+        """Stop the job of a request that went away.
+
+        A job still waiting is dropped. A running one has its worker killed;
+        it holds a place until its thread notices, so the number of jobs in
+        the server stays within the limit.
+        """
+        if future.cancel():
+            return
+        job.abandon()
+        if not future.done():
+            with self._lock:
+                self.admitted += 1
+            future.add_done_callback(lambda _: self._release())
 
     def worker_pids(self) -> list[int]:
         """The process IDs of the live worker processes."""
@@ -228,7 +314,7 @@ class JobRunner:
 
     # -- In the runner's threads ------------------------------------------------
 
-    def _execute(self, func: Callable[..., T], args: tuple[object, ...]) -> T:
+    def _execute(self, func: Callable[..., T], args: tuple[object, ...], job: _Job) -> T:
         """Run one job in a worker process; runs in one of the runner's threads."""
         for _ in range(_SEND_ATTEMPTS):
             worker = self._checkout()
@@ -251,19 +337,29 @@ class JobRunner:
             with self._lock:
                 self.running += 1
             try:
-                return cast(T, self._answer(worker))
+                if not job.attach(worker):
+                    worker.kill()  # Abandoned while it was being sent.
+                return cast(T, self._answer(worker, job))
             finally:
                 with self._lock:
                     self.running -= 1
         logger.error("Worker processes exited before taking a job %d times", _SEND_ATTEMPTS)
         raise _NoWorker
 
-    def _answer(self, worker: _WorkerProcess) -> Any:
+    def _answer(self, worker: _WorkerProcess, job: _Job) -> Any:
         """The result of the job *worker* has started, or its exception raised."""
         try:
+            if self.job_timeout_s is not None and not worker.conn.poll(self.job_timeout_s):
+                worker.kill()
+                self._discard(worker)
+                logger.warning("Worker process %s ran one job for over %g s; killed it",
+                               worker.pid, self.job_timeout_s)
+                raise _JobTimedOut
             status, payload = worker.conn.recv()
         except (OSError, EOFError):
             exitcode = self._discard(worker)
+            if job.abandoned:
+                raise _JobAbandoned from None
             logger.error("Worker process %s exited while running a job (%s)",
                          worker.pid, _describe_exit(exitcode))
             raise _WorkerExited(exitcode) from None
@@ -320,6 +416,12 @@ class JobRunner:
                     max_workers=self.max_workers, thread_name_prefix="prosody-protocol-job"
                 )
             return self._threads
+
+
+def _retrieve_exception(future: asyncio.Future[Any]) -> None:
+    """Mark the outcome of a future nobody awaits any more as seen."""
+    if not future.cancelled():
+        future.exception()
 
 
 def _describe_exit(exitcode: int | None) -> str:

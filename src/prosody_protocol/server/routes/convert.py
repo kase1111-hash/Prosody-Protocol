@@ -371,6 +371,7 @@ _AUDIO_RESPONSES: dict[int | str, dict[str, Any]] = {
     dependencies=[Depends(_require_multipart)],
 )
 async def audio_to_iml(
+    http: Request,
     audio: Annotated[
         UploadFile,
         File(
@@ -483,7 +484,12 @@ async def audio_to_iml(
             )
             saved.append((str(copy), name))
         result = await jobs.run(
-            _worker.convert_audio, str(path), display_name, options, tuple(saved)
+            _worker.convert_audio,
+            str(path),
+            display_name,
+            options,
+            tuple(saved),
+            is_disconnected=http.is_disconnected,
         )
     return AudioToIMLResponse(
         iml=result.iml,

@@ -566,6 +566,17 @@ class TestPauseInsertion:
         doc = _assemble(words, pauses=[PauseInterval(320, 880)])
         assert doc.utterances[0].children == ("one", Pause(duration=560), " two.")
 
+    def test_silences_at_one_boundary_add_up(self) -> None:
+        """Untranscribed speech (an 'um') between two silences is not pause."""
+        words: list[Word] = [("one", 0, 300, 120, 65), ("two.", 1500, 1800, 120, 65)]
+        doc = _assemble(words, pauses=[PauseInterval(300, 700), PauseInterval(1000, 1500)])
+        assert doc.utterances[0].children == ("one", Pause(duration=900), " two.")
+
+    def test_overlapping_silences_count_once(self) -> None:
+        words: list[Word] = [("one", 0, 300, 120, 65), ("two.", 1100, 1400, 120, 65)]
+        doc = _assemble(words, pauses=[PauseInterval(300, 800), PauseInterval(600, 1100)])
+        assert doc.utterances[0].children == ("one", Pause(duration=800), " two.")
+
     def test_silence_before_and_after_speech_is_not_a_pause(self) -> None:
         words = _sentence("one two three.", start_ms=1000)
         doc = _assemble(words, pauses=[PauseInterval(0, 1000), PauseInterval(1850, 3000)])

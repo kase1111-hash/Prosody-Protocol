@@ -298,6 +298,7 @@ Many outputs change; read **Breaking changes** first.
 - `tests/test_docs_examples.py` runs the Python, IML and CLI examples of
   README.md, examples/README.md and docs/. CI gained a core-only job and a
   wheel smoke test.
+- `PP_JOB_TIMEOUT_S` (default 900): a worker that spends longer on one audio conversion or synthesis is stopped and the request gets a 504 `job_timeout`; `/v1/health` reports the limit.
 
 ### Changed
 
@@ -417,6 +418,8 @@ Many outputs change; read **Breaking changes** first.
 - Earlier fixes after 0.1.0a2 (February 2026): `ProsodyProfile.mappings` is
   a tuple, matching the frozen dataclass; `MavisBridge` converts volume to
   dB with 20·log10; `BenchmarkReport` gained `num_failures`.
+- A client that disconnects no longer leaves its audio conversion or synthesis running: a waiting job is dropped and the worker running a started one is stopped.
+- Several silences at one word boundary now add up; the speech between them (an untranscribed "um") is no longer counted as pause.
 
 ### Security
 

@@ -335,8 +335,9 @@ def _resolve_pauses(words: list[_Word], pauses: Sequence[PauseInterval]) -> list
 
     A detected silence belongs to the boundary its midpoint falls in (between
     the centres of the two words), clipped to the outer edges of those words;
-    silence before the first or after the last word is not a pause. Where no
-    silence was detected, the gap between the word timings is used.
+    silence before the first or after the last word is not a pause. Several
+    silences at one boundary add up (speech between them is not pause).
+    Where no silence was detected, the gap between the word timings is used.
     Durations are rounded to whole milliseconds, pauses shorter than
     :data:`MIN_PAUSE_MS` are dropped, and a pause before punctuation moves
     after it -- unless the punctuation ends the transcript, in which case
@@ -347,7 +348,7 @@ def _resolve_pauses(words: list[_Word], pauses: Sequence[PauseInterval]) -> list
     centres = list(
         accumulate(((w.alignment.start_ms + w.alignment.end_ms) / 2 for w in words), max)
     )
-    detected: dict[int, tuple[int, int]] = {}
+    detected: dict[int, list[tuple[int, int]]] = {}
     for pause in pauses:
         boundary = bisect_right(centres, (pause.start_ms + pause.end_ms) / 2) - 1
         if not 0 <= boundary < len(words) - 1:
@@ -355,19 +356,15 @@ def _resolve_pauses(words: list[_Word], pauses: Sequence[PauseInterval]) -> list
         start = max(pause.start_ms, words[boundary].alignment.start_ms)
         end = min(pause.end_ms, words[boundary + 1].alignment.end_ms)
         if end > start:
-            known = detected.get(boundary)
-            detected[boundary] = (start, end) if known is None else (
-                min(known[0], start), max(known[1], end)
-            )
+            detected.setdefault(boundary, []).append((start, end))
 
     result: list[int] = []
     for boundary in range(len(words) - 1):
         if boundary in detected:
-            start, end = detected[boundary]
+            duration = round(_covered_ms(detected[boundary]))
         else:
-            start = words[boundary].alignment.end_ms
-            end = words[boundary + 1].alignment.start_ms
-        duration = round(end - start)
+            gap = words[boundary + 1].alignment.start_ms - words[boundary].alignment.end_ms
+            duration = round(gap)
         result.append(duration if duration >= MIN_PAUSE_MS else 0)
 
     for boundary, duration in enumerate(result):
@@ -376,6 +373,19 @@ def _resolve_pauses(words: list[_Word], pauses: Sequence[PauseInterval]) -> list
             if boundary + 1 < len(result):
                 result[boundary + 1] += duration
     return result
+
+
+def _covered_ms(intervals: list[tuple[int, int]]) -> int:
+    """Total length of the union of *intervals* (start, end), in ms."""
+    total = 0
+    reach: int | None = None
+    for start, end in sorted(intervals):
+        if reach is not None and start < reach:
+            start = reach
+        if end > start:
+            total += end - start
+        reach = end if reach is None else max(reach, end)
+    return total
 
 
 def _is_punctuated(words: list[_Word]) -> bool:
