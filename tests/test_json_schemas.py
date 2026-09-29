@@ -269,6 +269,11 @@ _ENTRY_CASES: list[tuple[str, dict[str, Any], bool]] = [
     ("null speaker", _entry(speaker_id=None), True),
     ("no speaker", _entry(speaker_id=_DELETE), True),
     ("metadata object", _entry(metadata={"session": 1}), True),
+    # Benchmark gives these to the converter as words= (prosody_protocol.benchmarks).
+    ("metadata word timings", _entry(metadata={"word_timings": [
+        {"word": "Hello", "start_ms": 0, "end_ms": 420},
+        {"word": "world.", "start_ms": 480, "end_ms": 900},
+    ]}), True),
     ("non-ISO timestamp (advisory)", _entry(timestamp="yesterday"), True),
     ("consent false", _entry(consent=False), False),
     ("consent missing", _entry(consent=_DELETE), False),
@@ -341,5 +346,22 @@ class TestDatasetEntrySchemaAgreement:
             consent=True,
         )
         stored = json.loads((tmp_path / "ds" / "entries" / "mavis_s1.json").read_text())
+        assert _schema_accepts(ENTRY_SCHEMA, stored), list(ENTRY_SCHEMA.iter_errors(stored))
+        assert _loader_accepts_entry(stored)
+
+    def test_mavis_export_with_a_guessed_label_conforms(self, tmp_path: Path) -> None:
+        """A guessed label is the entry's emotion_label but not in its IML."""
+        pytest.importorskip("numpy")
+        from prosody_protocol.mavis_bridge import MavisBridge, PhonemeEvent
+
+        events = [PhonemeEvent("a", start_ms=i * 120, volume=0.2) for i in range(3)]
+        MavisBridge().export_dataset(
+            [{"events": events, "transcript": "so quiet", "session_id": "s1"}],
+            tmp_path / "ds",
+            consent=True,
+        )
+        stored = json.loads((tmp_path / "ds" / "entries" / "mavis_s1.json").read_text())
+        assert (stored["emotion_label"], stored["annotator"]) == ("calm", "model")
+        assert "emotion=" not in stored["iml"]
         assert _schema_accepts(ENTRY_SCHEMA, stored), list(ENTRY_SCHEMA.iter_errors(stored))
         assert _loader_accepts_entry(stored)

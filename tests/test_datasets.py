@@ -5,14 +5,19 @@ Covers:
 - DatasetLoader.load: directory loading, metadata, entry parsing, validation
 - DatasetLoader.validate_entry: required fields, enums, IML, audio location
 - DatasetLoader.iter_entries: lazy iteration
-- DatasetLoader.split: deterministic, speaker-disjoint train/val/test split
+- DatasetLoader.split: deterministic, speaker-disjoint train/val/test split,
+  optionally stratified by a field, warning about labels left out of val/test
 - Data models: DatasetEntry, Dataset
-- Error handling: missing dirs, bad JSON, missing fields
+- Error handling: missing dirs, bad JSON (also hostile: nested too deeply,
+  integers too long), missing fields
 """
 
 from __future__ import annotations
 
 import json
+import random
+import warnings
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -166,6 +171,39 @@ class TestLoaderLoad:
         entries_dir.mkdir()
         (entries_dir / "bad.json").write_text("{invalid json}", encoding="utf-8")
         with pytest.raises(DatasetError, match="Cannot read entry"):
+            loader.load(tmp_path)
+
+
+_HOSTILE_JSON = {
+    "nested": "[" * 100_000,
+    "long-integer": '{"id": ' + "7" * 5000 + "}",
+    "not-utf8": b'{"id": "\xff"}'.decode("latin-1"),
+}
+
+
+class TestHostileJSON:
+    """Deep nesting raised RecursionError and 5000-digit integers ValueError
+    out of load(), instead of DatasetError (ProfileLoader already did this)."""
+
+    @pytest.mark.parametrize("text", _HOSTILE_JSON.values(), ids=_HOSTILE_JSON.keys())
+    def test_entry(self, loader: DatasetLoader, tmp_path: Path, text: str) -> None:
+        (tmp_path / "entries").mkdir()
+        (tmp_path / "entries" / "e.json").write_text(text, encoding="latin-1")
+        with pytest.raises(DatasetError, match="Cannot read entry e.json"):
+            loader.load(tmp_path)
+        with pytest.raises(DatasetError, match="Cannot read entry e.json"):
+            list(loader.iter_entries(tmp_path))
+
+    @pytest.mark.parametrize("text", _HOSTILE_JSON.values(), ids=_HOSTILE_JSON.keys())
+    def test_metadata(self, loader: DatasetLoader, tmp_path: Path, text: str) -> None:
+        (tmp_path / "entries").mkdir()
+        (tmp_path / "metadata.json").write_text(text, encoding="latin-1")
+        with pytest.raises(DatasetError, match="Cannot read metadata.json"):
+            loader.load(tmp_path)
+
+    def test_unreadable_entry(self, loader: DatasetLoader, tmp_path: Path) -> None:
+        (tmp_path / "entries" / "e.json").mkdir(parents=True)  # a directory, not a file
+        with pytest.raises(DatasetError, match="Cannot read entry e.json"):
             loader.load(tmp_path)
 
 
@@ -766,3 +804,119 @@ class TestSplitBehaviour:
     def test_unknown_group_by_rejected(self, loader: DatasetLoader) -> None:
         with pytest.raises(DatasetError, match="Cannot group by 'metadata'"):
             loader.split(Dataset(name="t", entries=_entries(3)), group_by="metadata")
+
+
+# ---------------------------------------------------------------------------
+# Stratified splits
+# ---------------------------------------------------------------------------
+
+
+def _labelled(labels: list[str], speakers: list[str | None] | None = None) -> Dataset:
+    entries = [
+        replace(entry, emotion_label=label,
+                speaker_id=None if speakers is None else speakers[i])
+        for i, (entry, label) in enumerate(zip(_entries(len(labels)), labels, strict=True))
+    ]
+    return Dataset(name="t", entries=entries)
+
+
+def _label_counts(parts: tuple[list[DatasetEntry], ...], label: str) -> list[int]:
+    return [sum(e.emotion_label == label for e in part) for part in parts]
+
+
+class TestStratifiedSplit:
+    RARE = ["rare"] * 3 + ["common"] * 27
+
+    def test_unstratified_split_can_leave_a_rare_label_out(
+        self, loader: DatasetLoader
+    ) -> None:
+        """Seed 3 put all three 'rare' entries in train, with no warning."""
+        with pytest.warns(UserWarning, match=r"val lacks 'rare'; test lacks 'rare'; pass "
+                                             r"stratify_by='emotion_label'"):
+            parts = loader.split(_labelled(self.RARE), seed=3)
+        assert _label_counts(parts, "rare") == [3, 0, 0]
+
+    def test_rare_label_in_every_split(self, loader: DatasetLoader) -> None:
+        dataset = _labelled(self.RARE)
+        for seed in range(20):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                parts = loader.split(dataset, seed=seed, stratify_by="emotion_label")
+            assert _label_counts(parts, "rare") == [1, 1, 1], seed
+            assert [len(p) for p in parts] == [22, 4, 4]
+            assert sorted(e.id for p in parts for e in p) == sorted(e.id for e in dataset.entries)
+
+    def test_each_label_follows_the_ratios(self, loader: DatasetLoader) -> None:
+        labels = ["a"] * 50 + ["b"] * 30 + ["c"] * 20
+        parts = loader.split(_labelled(labels), stratify_by="emotion_label")
+        assert [_label_counts(parts, label) for label in "abc"] == [
+            [40, 5, 5], [24, 3, 3], [16, 2, 2]
+        ]
+
+    def test_stratified_split_is_deterministic(self, loader: DatasetLoader) -> None:
+        dataset = _labelled(self.RARE)
+
+        def ids(seed: int) -> list[list[str]]:
+            parts = loader.split(dataset, seed=seed, stratify_by="emotion_label")
+            return [[e.id for e in p] for p in parts]
+
+        assert ids(5) == ids(5) != ids(6)
+
+    def test_speakers_stay_apart_and_rare_labels_spread(self, loader: DatasetLoader) -> None:
+        """120 entries of 12 speakers; 'rare' is spoken by three of them."""
+        rng = random.Random(0)
+        speakers = [f"spk{i % 12}" for i in range(120)]
+        labels = ["rare" if i in (0, 40, 80) else rng.choice("abc") for i in range(120)]
+        dataset = _labelled(labels, speakers)
+        for seed in range(10):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                parts = loader.split(dataset, seed=seed, stratify_by="emotion_label")
+            groups = [{e.speaker_id for e in part} for part in parts]
+            assert not (groups[0] & groups[1] or groups[0] & groups[2] or groups[1] & groups[2])
+            assert _label_counts(parts, "rare") == [1, 1, 1], seed
+            assert [len(p) for p in parts] == [100, 10, 10]
+
+    def test_rare_speaker_groups_go_to_every_split(self, loader: DatasetLoader) -> None:
+        """Three speakers hold 'rare', one of them most of the data."""
+        speakers = ["big"] * 20 + ["s1", "s2"] + [f"x{i}" for i in range(8)]
+        labels = ["rare"] + ["a"] * 19 + ["rare", "rare"] + ["a"] * 8
+        for seed in range(5):
+            parts = loader.split(_labelled(labels, speakers), seed=seed,
+                                 stratify_by="emotion_label")
+            assert _label_counts(parts, "rare") == [1, 1, 1]
+            assert "big" in {e.speaker_id for e in parts[0]}
+
+    def test_warning_names_the_missing_values(self) -> None:
+        from prosody_protocol.datasets import _warn_missing_values
+
+        entries = _labelled(["rare"] * 3 + ["a"] * 3).entries
+        # 'rare' is in three groups, two of them in train and none in val.
+        parts = [[entries[0:1], entries[1:2]], [entries[3:4]], [entries[2:3], entries[4:]]]
+        with pytest.warns(UserWarning, match=r"val lacks 'rare'; their entries' groups could "
+                                             r"not be spread further"):
+            _warn_missing_values(parts, "emotion_label", suggest=False)
+
+    def test_labels_too_rare_to_spread_do_not_warn(self, loader: DatasetLoader) -> None:
+        labels = ["once"] + ["twice"] * 2 + ["common"] * 27
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            loader.split(_labelled(labels), seed=3)
+
+    def test_stratify_by_another_field(self, loader: DatasetLoader) -> None:
+        entries = [
+            replace(e, source="mavis" if i < 3 else "recorded")
+            for i, e in enumerate(_entries(30))
+        ]
+        parts = loader.split(Dataset(name="t", entries=entries), seed=3, stratify_by="source")
+        assert [sum(e.source == "mavis" for e in p) for p in parts] == [1, 1, 1]
+
+    def test_unknown_stratify_by_rejected(self, loader: DatasetLoader) -> None:
+        with pytest.raises(DatasetError, match="Cannot stratify by 'metadata'"):
+            loader.split(Dataset(name="t", entries=_entries(3)), stratify_by="metadata")
+
+    def test_counts_per_label_are_kept(self, loader: DatasetLoader) -> None:
+        labels = [random.Random(1).choice("abcdefg") for _ in range(57)]
+        parts = loader.split(_labelled(labels), stratify_by="emotion_label")
+        merged = Counter(e.emotion_label for p in parts for e in p)
+        assert merged == Counter(labels)

@@ -3,18 +3,23 @@
 Covers acceptance criteria:
 - Benchmark runs against the emotional-speech dataset
 - Report is saved as JSON for tracking over time
-- CI can run benchmarks on a subset and fail if metrics regress
+- CI can run benchmarks on a subset and fail if metrics regress, and a
+  committed baseline for the synthetic fixture dataset is checked
 
 and that every entry counts: failed conversions lower every rate, pauses
-and contours are matched per entry by position, unmeasured metrics are
-None, and metric values agree with scikit-learn.
+and contours are matched per entry by position (also with thousands of
+pauses), placeholder output is not aligned, abstentions are reported as
+coverage, converters get each entry's word timings or transcript,
+unmeasured metrics are None, and metric values agree with scikit-learn.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
-import shutil
-import subprocess
+import logging
+import random
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -23,10 +28,12 @@ import pytest
 pytest.importorskip("numpy")
 
 from prosody_protocol import Benchmark, BenchmarkReport
+from prosody_protocol._types import WordAlignment
 from prosody_protocol.benchmarks import (
     _compute_pause_f1,
     _extract_pauses,
     _extract_pitch_contours,
+    _max_matching,
     _per_class_f1,
     compute_ece,
     compute_f1_from_counts,
@@ -36,6 +43,7 @@ from prosody_protocol.parser import IMLParser
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SYNTHETIC_DATASET = FIXTURES / "datasets" / "training_synthetic"
+BASELINES = FIXTURES / "benchmarks"
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +134,24 @@ class ScriptedConverter:
         if name not in self.outputs:
             raise RuntimeError(f"cannot convert {name}")
         return self.outputs[name]  # type: ignore[return-value]
+
+
+class KeywordConverter(ScriptedConverter):
+    """A ScriptedConverter that also takes words= and transcript=, and records them."""
+
+    def __init__(self, outputs: dict[str, object]) -> None:
+        super().__init__(outputs)
+        self.inputs: dict[str, dict[str, object]] = {}
+
+    def convert(  # type: ignore[override]
+        self,
+        audio_path: str | Path,
+        *,
+        words: list[WordAlignment] | None = None,
+        transcript: str | None = None,
+    ) -> str:
+        self.inputs[Path(audio_path).name] = {"words": words, "transcript": transcript}
+        return super().convert(audio_path)
 
 
 def _entry(entry_id: str, emotion: str, iml: str | None = None) -> DatasetEntry:
@@ -614,7 +640,8 @@ class TestBenchmarkExecution:
         assert report.num_samples == 0
         assert report.num_failures == 10
         assert report.failure_rate == 1.0
-        assert report.emotion_accuracy == 0.0
+        assert report.emotion_accuracy is None  # no output carried an emotion
+        assert report.emotion_coverage == 0.0
         assert report.validity_rate == 0.0
         assert report.confidence_ece is None
         assert report.pause_f1 is None
@@ -664,7 +691,9 @@ class TestEdgeCases:
         report = benchmark.run()
 
         assert report.num_samples == 0
-        assert report.emotion_accuracy == 0.0
+        assert report.emotion_accuracy is None
+        assert report.emotion_coverage is None
+        assert report.emotion_f1_macro is None
         assert report.validity_rate == 0.0
         assert report.check_regression() == ["no dataset entries were evaluated"]
 
@@ -719,9 +748,18 @@ class TestFailuresCount:
         assert report.num_samples == 1
         assert report.num_failures == 9
         assert report.failure_rate == pytest.approx(0.9)
-        assert report.emotion_accuracy == pytest.approx(0.1)
+        # Accuracy is over the one output with an emotion; coverage shows the rest.
+        assert report.emotion_accuracy == 1.0
+        assert report.emotion_coverage == pytest.approx(0.1)
         assert report.validity_rate == pytest.approx(0.1)
         assert report.emotion_f1 == {"joyful": 1.0, "sad": 0.0}
+        assert report.check_regression(
+            thresholds={"emotion_accuracy": 0.5, "failure_rate": 1.0}
+        ) == [
+            "emotion_accuracy = 0.1000 < threshold 0.5000 (over all entries: those without an "
+            "emotion count as wrong; add an emotion_coverage threshold to score only the "
+            "entries with one)"
+        ]
 
     def test_default_regression_check_fails_on_failures(self):
         entries = [_entry("ok", "joyful")] + [_entry(f"f{i}", "sad") for i in range(9)]
@@ -737,7 +775,7 @@ class TestFailuresCount:
         report = _run(entries, {"ok.wav": _JOYFUL, "bad.wav": "<utterance emotion='angry'"})
         assert report.num_samples == 1
         assert report.num_failures == 1
-        assert report.emotion_accuracy == 0.5
+        assert (report.emotion_accuracy, report.emotion_coverage) == (1.0, 0.5)
         assert report.validity_rate == 0.5
         assert report.emotion_f1 == {"joyful": 1.0, "sad": 0.0}
 
@@ -813,9 +851,11 @@ class TestEmotionMetrics:
                 labels, y_pred, labels=classes, average="macro", zero_division=0
             )
         )
+        answered = [(t, p) for t, p in zip(labels, predicted, strict=True) if p is not None]
         assert report.emotion_accuracy == pytest.approx(
-            sklearn_metrics.accuracy_score(labels, y_pred)
+            sklearn_metrics.accuracy_score(*zip(*answered, strict=True))
         )
+        assert report.emotion_coverage == pytest.approx(len(answered) / len(labels))
 
     def test_one_prediction_per_entry(self):
         """A multi-utterance output is one prediction: its most confident emotion."""
@@ -828,10 +868,45 @@ class TestEmotionMetrics:
         assert report.emotion_accuracy == 1.0
         assert report.confidence_ece == pytest.approx(0.2)
 
-    def test_no_emotion_means_neutral_without_confidence(self):
-        report = _run([_entry("e1", "neutral")], {"e1.wav": "<utterance>x</utterance>"})
-        assert report.emotion_accuracy == 1.0
-        assert report.confidence_ece is None
+    def test_no_emotion_is_an_abstention(self):
+        """An output without an emotion used to count as "neutral", so a
+        converter that never labels anything scored the share of neutral
+        labels as its accuracy."""
+        entries = [_entry("e1", "neutral"), _entry("e2", "angry"), _entry("e3", "sad")]
+        outputs = {
+            "e1.wav": "<utterance>x</utterance>",
+            "e2.wav": "<utterance>x</utterance>",
+            "e3.wav": '<utterance emotion="sad" confidence="0.8">x</utterance>',
+        }
+        report = _run(entries, outputs)
+        assert report.emotion_accuracy == 1.0  # the one emotion given is right
+        assert report.emotion_coverage == pytest.approx(1 / 3)
+        # Abstentions are misses for their label, not predictions of a class.
+        assert report.emotion_f1 == {"angry": 0.0, "neutral": 0.0, "sad": 1.0}
+        assert report.confidence_ece == pytest.approx(0.2)
+        assert report.abstention_label is None
+
+        nothing = _run(entries[:2], outputs)
+        assert (nothing.emotion_accuracy, nothing.emotion_coverage) == (None, 0.0)
+        assert nothing.confidence_ece is None
+
+    def test_abstention_label_scores_no_emotion_as_that_label(self):
+        entries = [_entry("e1", "neutral"), _entry("e2", "angry")]
+        outputs = {"e1.wav": "<utterance>x</utterance>", "e2.wav": "<utterance>x</utterance>"}
+        dataset = Dataset(name="scripted", entries=entries)
+        report = Benchmark(
+            dataset, ScriptedConverter(outputs), dataset_dir="/data", abstention_label="neutral"
+        ).run()
+        assert (report.emotion_accuracy, report.emotion_coverage) == (0.5, 1.0)
+        assert report.emotion_f1 == pytest.approx({"angry": 0.0, "neutral": 2 / 3})
+        assert report.abstention_label == "neutral"
+        assert report.to_dict()["abstention_label"] == "neutral"
+
+    @pytest.mark.parametrize("label", ["", "  ", 3])
+    def test_abstention_label_must_be_a_label(self, label):
+        dataset = Dataset(name="t", entries=[])
+        with pytest.raises(ValueError, match="abstention_label"):
+            Benchmark(dataset, MockConverter(), dataset_dir="/data", abstention_label=label)
 
     def test_invalid_confidence_does_not_score_as_calibrated(self):
         """confidence="1.5" is invalid IML: it lowers validity and is left out
@@ -1016,9 +1091,24 @@ class TestRegressionChecks:
         )
         assert failures == ["failure_rate regressed: 0.0909 > baseline 0.0000"]
 
-    def test_unmeasured_metrics_are_not_compared_with_baseline(self):
-        current = _report(pitch_accuracy=None, pitch_coverage=None, pause_f1=None)
-        assert current.check_regression(baseline=_report()) == []
+    def test_metrics_the_baseline_did_not_measure_are_not_compared(self):
+        baseline = _report(pitch_accuracy=None, pitch_coverage=None, pause_f1=None,
+                           confidence_ece=None)
+        assert _report(pitch_accuracy=0.1, pause_f1=0.0).check_regression(baseline=baseline) == []
+
+    def test_metric_no_longer_measured_is_a_regression(self):
+        """Placeholder output (say, Whisper broke) makes pause_f1 and the pitch
+        metrics None; that used to pass against a baseline that measured them."""
+        current = _report(pitch_accuracy=None, pitch_coverage=None, pause_f1=None,
+                          confidence_ece=None)
+        assert current.check_regression(baseline=_report()) == [
+            "pitch_accuracy was not measured (baseline 0.8000)",
+            "pitch_coverage was not measured (baseline 0.9000)",
+            "pause_f1 was not measured (baseline 0.9000)",
+        ]
+        # Nothing to lose: a baseline value within the tolerance of zero.
+        assert current.check_regression(baseline=_report(pause_f1=0.0, pitch_accuracy=0.0,
+                                                         pitch_coverage=0.005)) == []
 
     def test_tolerance(self):
         current = _report(emotion_accuracy=0.87)
@@ -1026,6 +1116,26 @@ class TestRegressionChecks:
             "emotion_accuracy regressed: 0.8700 < baseline 0.9000"
         ]
         assert current.check_regression(baseline=_report(), tolerance=0.05) == []
+
+    def test_class_tolerance(self):
+        current = _report(emotion_f1={"angry": 0.5, "neutral": 0.95})
+        assert current.check_regression(baseline=_report(), tolerance=0.3) == [
+            "emotion_f1[angry] regressed: 0.5000 < baseline 0.9000"
+        ]
+        assert current.check_regression(
+            baseline=_report(), tolerance=0.3, class_tolerance=0.5
+        ) == []
+        # It defaults to the tolerance and applies to the classes only.
+        assert current.check_regression(baseline=_report(), class_tolerance=0.5) == [
+            "emotion_f1_macro regressed: 0.7250 < baseline 0.9250"
+        ]
+
+    @pytest.mark.parametrize("slack", [-0.1, float("nan"), "0.1", True])
+    def test_tolerances_must_be_non_negative_numbers(self, slack):
+        with pytest.raises(ValueError, match="tolerance must be a non-negative number"):
+            _report().check_regression(baseline=_report(), tolerance=slack)
+        with pytest.raises(ValueError, match="class_tolerance must be a non-negative number"):
+            _report().check_regression(baseline=_report(), class_tolerance=slack)
 
 
 class TestReportSerialization:
@@ -1054,11 +1164,338 @@ class TestReportSerialization:
 
 
 # ---------------------------------------------------------------------------
+# Many pauses in one entry: the matching is iterative
+# ---------------------------------------------------------------------------
+
+
+def _reference_matching(candidates: list[list[int]], n_right: int) -> int:
+    """Maximum matching by brute force over the right items' owners."""
+    best = 0
+
+    def search(left: int, used: frozenset[int], size: int) -> None:
+        nonlocal best
+        if left == len(candidates):
+            best = max(best, size)
+            return
+        search(left + 1, used, size)
+        for right in candidates[left]:
+            if right not in used:
+                search(left + 1, used | {right}, size + 1)
+
+    search(0, frozenset(), 0)
+    return best
+
+
+class TestManyPauses:
+    N = 5000
+
+    def test_thousands_of_pauses_match(self):
+        """About 1000 pauses in one entry used to raise RecursionError out of run()."""
+        iml = "<utterance>" + " ".join(
+            f'w{i} <pause duration="500"/>' for i in range(self.N)
+        ) + "</utterance>"
+        started = time.perf_counter()
+        report = _run([_entry("e", "neutral", iml)], {"e.wav": iml})
+        assert report.pause_f1 == 1.0
+        assert time.perf_counter() - started < 30
+
+    def test_every_pause_one_word_late(self):
+        """Each truth pause's nearest candidate belongs to the previous one:
+        the layout that made the recursive search go N levels deep."""
+        truth = "<utterance>" + " ".join(
+            f'word{i}<pause duration="450"/> next{i}' for i in range(self.N)
+        ) + "</utterance>"
+        late = "<utterance>" + " ".join(
+            f'word{i} next{i}<pause duration="500"/>' for i in range(self.N)
+        ) + "</utterance>"
+        started = time.perf_counter()
+        assert _run([_entry("e", "neutral", truth)], {"e.wav": late}).pause_f1 == 1.0
+        assert time.perf_counter() - started < 30
+
+    def test_duration_only_matching_of_equal_pauses(self):
+        assert _compute_pause_f1([500] * self.N, [500] * self.N) == 1.0
+        assert _compute_pause_f1([500] * self.N, [500] * (self.N // 2)) == pytest.approx(2 / 3)
+
+    def test_matching_is_maximum(self):
+        rng = random.Random(7)
+        for _ in range(300):
+            n_left, n_right = rng.randint(0, 7), rng.randint(0, 7)
+            candidates = [
+                rng.sample(range(n_right), rng.randint(0, n_right)) for _ in range(n_left)
+            ]
+            assert _max_matching(candidates, n_right) == _reference_matching(
+                candidates, n_right
+            ), candidates
+
+
+# ---------------------------------------------------------------------------
+# The converter gets each entry's words
+# ---------------------------------------------------------------------------
+
+_TIMINGS = [
+    {"word": "hello", "start_ms": 0, "end_ms": 400},
+    {"word": "world", "start_ms": 900, "end_ms": 1300},
+]
+_TWO_WORDS = '<utterance>hello <pause duration="500"/> world</utterance>'
+
+
+def _timed_entry(entry_id: str, timings: object = _TIMINGS) -> DatasetEntry:
+    return replace(
+        _entry(entry_id, "neutral", _TWO_WORDS),
+        transcript="hello world",
+        metadata={"word_timings": timings},
+    )
+
+
+class TestWordsGivenToTheConverter:
+    def _run(self, entries, converter, **kwargs) -> BenchmarkReport:
+        return Benchmark(Dataset("t", entries), converter, dataset_dir="/data", **kwargs).run()
+
+    def test_word_timings_else_transcript(self):
+        converter = KeywordConverter({"a.wav": _TWO_WORDS, "b.wav": _TWO_WORDS})
+        report = self._run([_timed_entry("a"), replace(_entry("b", "neutral"),
+                           transcript="good morning")], converter)
+        assert converter.inputs["a.wav"] == {
+            "words": [WordAlignment("hello", 0, 400), WordAlignment("world", 900, 1300)],
+            "transcript": None,
+        }
+        assert converter.inputs["b.wav"] == {"words": None, "transcript": "good morning"}
+        assert report.word_sources == {"timings": 1, "transcript": 1, "stt": 0}
+        assert report.to_dict()["word_sources"] == {"timings": 1, "transcript": 1, "stt": 0}
+
+    def test_timings_in_any_supported_format(self):
+        whisper = {"segments": [{"words": [
+            {"word": " hello", "start": 0.0, "end": 0.4},
+            {"word": " world", "start": 0.9, "end": 1.3},
+        ]}]}
+        converter = KeywordConverter({"a.wav": _TWO_WORDS})
+        self._run([_timed_entry("a", whisper)], converter)
+        words = converter.inputs["a.wav"]["words"]
+        assert [(w.word, w.start_ms, w.end_ms) for w in words] == [  # type: ignore[union-attr]
+            ("hello", 0, 400), ("world", 900, 1300)
+        ]
+
+    @pytest.mark.parametrize(
+        ("words_from", "expected"),
+        [
+            ("auto", ("words", "transcript")),
+            ("timings", ("words", None)),
+            ("transcript", ("transcript", "transcript")),
+            ("stt", (None, None)),
+        ],
+    )
+    def test_words_from(self, words_from, expected):
+        converter = KeywordConverter({"a.wav": _TWO_WORDS, "b.wav": _TWO_WORDS})
+        self._run([_timed_entry("a"), _entry("b", "neutral")], converter, words_from=words_from)
+        given = [
+            next((k for k, v in converter.inputs[name].items() if v is not None), None)
+            for name in ("a.wav", "b.wav")
+        ]
+        assert tuple(given) == expected
+
+    def test_plain_converters_get_only_the_path(self):
+        converter = ScriptedConverter({"a.wav": _TWO_WORDS})
+        report = self._run([_timed_entry("a")], converter)
+        assert converter.calls == ["a.wav"]
+        assert report.word_sources == {"timings": 0, "transcript": 0, "stt": 1}
+
+    def test_converters_with_keyword_catch_all_get_words(self):
+        seen: dict[str, object] = {}
+
+        class Catchall:
+            def convert(self, audio_path, **options):
+                seen.update(options)
+                return _TWO_WORDS
+
+        self._run([_entry("b", "neutral")], Catchall())
+        assert seen == {"transcript": "x"}
+
+    @pytest.mark.parametrize("words_from", ["timings", "transcript"])
+    def test_words_from_needs_a_converter_that_takes_them(self, words_from):
+        with pytest.raises(ValueError, match=f"words_from='{words_from}' needs a converter"):
+            Benchmark(Dataset("t", []), MockConverter(), dataset_dir="/d", words_from=words_from)
+
+    def test_unknown_words_from(self):
+        with pytest.raises(ValueError, match="words_from must be one of"):
+            Benchmark(Dataset("t", []), MockConverter(), dataset_dir="/d",
+                      words_from="whisper")  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "timings",
+        [[{"word": "hello", "start_ms": 500, "end_ms": 100}], "not json", 42, [[[]]]],
+        ids=["reversed", "text", "number", "nested"],
+    )
+    def test_invalid_word_timings_fail_the_entry(self, timings, caplog):
+        converter = KeywordConverter({"a.wav": _TWO_WORDS, "b.wav": _TWO_WORDS})
+        with caplog.at_level(logging.WARNING, logger="prosody_protocol.benchmarks"):
+            report = self._run([_timed_entry("a", timings), _timed_entry("b")], converter)
+        assert (report.num_samples, report.num_failures) == (1, 1)
+        assert list(converter.inputs) == ["b.wav"]
+        assert "Entry a not converted: invalid word timings" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Placeholder output has no words to align
+# ---------------------------------------------------------------------------
+
+_PAUSES_AND_CONTOURS = (
+    '<utterance>I <prosody pitch_contour="fall">told</prosody> you <pause duration="600"/> '
+    'to call me <pause duration="300"/> <prosody pitch_contour="fall">yesterday.</prosody>'
+    "</utterance>"
+)
+_PLACEHOLDERS = (
+    '<utterance><prosody pitch_contour="rise-fall">[speech]</prosody><pause duration="610"/> '
+    '[speech]<pause duration="300"/> <prosody pitch_contour="fall">[speech]</prosody>'
+    "</utterance>"
+)
+
+
+class TestPlaceholderOutput:
+    def test_placeholders_are_not_scored_for_pauses_or_contours(self, caplog):
+        """Word-level contours used to be interpolated onto phrase-level
+        placeholder spans (pitch_accuracy 0.0, coverage 0.5)."""
+        entries = [_entry("e", "neutral", _PAUSES_AND_CONTOURS)]
+        with caplog.at_level(logging.WARNING, logger="prosody_protocol.benchmarks"):
+            report = _run(entries, {"e.wav": _PLACEHOLDERS})
+        assert report.num_unaligned == 1
+        assert report.pause_f1 is None
+        assert report.pitch_accuracy is None
+        assert report.pitch_coverage is None
+        assert report.validity_rate == 1.0
+        assert "1 of 1 outputs have only '[speech]' placeholders" in caplog.text
+        assert report.check_regression(thresholds={"pause_f1": 0.5}) == [
+            "pause_f1 was not measured (threshold 0.5000)"
+        ]
+
+    def test_only_aligned_entries_are_scored(self):
+        entries = [
+            _entry("a", "neutral", _PAUSES_AND_CONTOURS),
+            _entry("b", "neutral", _PAUSES_AND_CONTOURS),
+        ]
+        report = _run(entries, {"a.wav": _PLACEHOLDERS, "b.wav": _PAUSES_AND_CONTOURS})
+        assert report.num_unaligned == 1
+        assert (report.pause_f1, report.pitch_accuracy, report.pitch_coverage) == (1.0, 1.0, 1.0)
+
+    def test_placeholders_among_words_are_ignored(self):
+        mixed = _PAUSES_AND_CONTOURS.replace("to call me", "to [speech] call me")
+        report = _run([_entry("e", "neutral", _PAUSES_AND_CONTOURS)], {"e.wav": mixed})
+        assert report.num_unaligned == 0
+        assert report.pause_f1 == 1.0
+
+    def test_failed_conversions_still_miss_their_pauses(self):
+        report = _run([_entry("e", "neutral", _PAUSES_AND_CONTOURS)], {})
+        assert report.num_unaligned == 0
+        assert report.pause_f1 == 0.0
+        assert report.pitch_coverage == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Accuracy thresholds cannot be passed by abstaining
+# ---------------------------------------------------------------------------
+
+
+class TestCoverageAwareThresholds:
+    def test_pitch_accuracy_threshold_counts_missing_contours(self):
+        """One right contour out of three used to pass pitch_accuracy=0.9."""
+        prediction = '<utterance><prosody pitch_contour="rise">a</prosody> b c</utterance>'
+        report = _run([_entry("e", "neutral", _CONTOUR_TRUTH)], {"e.wav": prediction})
+        assert (report.pitch_accuracy, report.pitch_coverage) == (1.0, pytest.approx(1 / 3))
+        assert report.check_regression(thresholds={"pitch_accuracy": 0.9}) == [
+            "pitch_accuracy = 0.3333 < threshold 0.9000 (over all ground-truth contours: "
+            "those without a predicted contour count as wrong; add a pitch_coverage "
+            "threshold to score only the compared ones)"
+        ]
+        # With a coverage threshold, accuracy is over the compared contours.
+        assert report.check_regression(
+            thresholds={"pitch_accuracy": 0.9, "pitch_coverage": 0.0}
+        ) == []
+        assert report.check_regression(
+            thresholds={"pitch_accuracy": 0.9, "pitch_coverage": 0.5}
+        ) == ["pitch_coverage = 0.3333 < threshold 0.5000"]
+
+    def test_emotion_accuracy_threshold_counts_abstentions(self):
+        entries = [_entry("e1", "sad"), _entry("e2", "angry")]
+        outputs = {
+            "e1.wav": '<utterance emotion="sad" confidence="0.8">x</utterance>',
+            "e2.wav": "<utterance>x</utterance>",
+        }
+        report = _run(entries, outputs)
+        failures = report.check_regression(thresholds={"emotion_accuracy": 0.9})
+        assert failures == [
+            "emotion_accuracy = 0.5000 < threshold 0.9000 (over all entries: those without an "
+            "emotion count as wrong; add an emotion_coverage threshold to score only the "
+            "entries with one)"
+        ]
+        assert report.check_regression(
+            thresholds={"emotion_accuracy": 0.9, "emotion_coverage": 0.5}
+        ) == []
+
+    def test_no_emotion_at_all_fails_an_accuracy_threshold(self):
+        report = _run([_entry("e", "sad")], {"e.wav": "<utterance>x</utterance>"})
+        assert report.check_regression(thresholds={"emotion_accuracy": 0.1})[0].startswith(
+            "emotion_accuracy = 0.0000 < threshold 0.1000 (over all entries"
+        )
+        assert report.check_regression(
+            thresholds={"emotion_accuracy": 0.1, "emotion_coverage": 0.0}
+        ) == ["emotion_accuracy was not measured (threshold 0.1000)"]
+
+    def test_reports_without_coverage_check_accuracy_as_is(self):
+        """Reports made before coverage existed have no coverage to weigh by."""
+        report = _report(emotion_accuracy=0.8, pitch_accuracy=0.8, pitch_coverage=None)
+        assert report.check_regression(
+            thresholds={"emotion_accuracy": 0.75, "pitch_accuracy": 0.75}
+        ) == []
+
+    def test_emotion_coverage_drop_is_a_regression(self):
+        current = _report(emotion_coverage=0.2)
+        assert current.check_regression(baseline=_report(emotion_coverage=0.6)) == [
+            "emotion_coverage regressed: 0.2000 < baseline 0.6000"
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Reports saved before abstentions were separated
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyBaselines:
+    def _legacy(self, tmp_path: Path) -> BenchmarkReport:
+        path = tmp_path / "old.json"
+        path.write_text(json.dumps({
+            "emotion_accuracy": 0.9, "emotion_f1": {"neutral": 0.9, "sad": 0.9},
+            "emotion_f1_macro": 0.9, "confidence_ece": 0.1, "pitch_accuracy": None,
+            "pitch_coverage": None, "pause_f1": None, "validity_rate": 1.0,
+            "failure_rate": 0.0, "num_samples": 10, "num_failures": 0,
+            "duration_seconds": 1.0,
+        }))
+        return BenchmarkReport.load(path)
+
+    def test_old_reports_counted_no_emotion_as_neutral(self, tmp_path):
+        old = self._legacy(tmp_path)
+        assert old.abstention_label == "neutral"
+        assert old.emotion_coverage is None
+
+    def test_emotion_metrics_are_not_compared_across_scorings(self, tmp_path):
+        current = _report(emotion_accuracy=0.1, emotion_f1={"neutral": 0.0, "sad": 0.0},
+                          emotion_coverage=0.1, confidence_ece=0.5)
+        assert current.check_regression(baseline=self._legacy(tmp_path)) == [
+            "the baseline scored outputs without an emotion as 'neutral' and this run as "
+            "abstentions, so their emotion accuracy, coverage and F1 are not compared; save "
+            "a new baseline made the same way",
+            "confidence_ece regressed: 0.5000 > baseline 0.1000",
+        ]
+        same = replace(current, abstention_label="neutral")
+        assert "emotion_accuracy regressed: 0.1000 < baseline 0.9000" in same.check_regression(
+            baseline=self._legacy(tmp_path)
+        )
+
+
+# ---------------------------------------------------------------------------
 # End to end with the real converter
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.filterwarnings("ignore::UserWarning")  # no transcript: placeholder words
+@pytest.mark.filterwarnings("ignore::UserWarning")
 def test_audio_to_iml_benchmark_runs_on_fixture_dataset():
     pytest.importorskip("parselmouth")
     from prosody_protocol import AudioToIML
@@ -1068,54 +1505,140 @@ def test_audio_to_iml_benchmark_runs_on_fixture_dataset():
     assert report.num_failures == 0
     assert report.num_samples == 10
     assert report.validity_rate == 1.0
-    # The fixture ground truth has no contours or pauses to compare against.
+    # The entries' transcripts were used: no placeholders, no pauses.
+    assert report.word_sources == {"timings": 0, "transcript": 10, "stt": 0}
+    assert report.num_unaligned == 0
+    assert report.pause_f1 is None
+    # The fixture ground truth has no contours to compare against.
     assert report.pitch_accuracy is None
     assert report.pitch_coverage is None
+    # Each clip alone has no speaker baseline, so AudioToIML abstains: the
+    # emotion metrics say so instead of scoring the share of "neutral" labels.
+    assert report.emotion_coverage == 0.0
+    assert report.emotion_accuracy is None
 
 
-@pytest.mark.skipif(shutil.which("espeak-ng") is None, reason="espeak-ng is not installed")
-@pytest.mark.filterwarnings("ignore::UserWarning")  # no transcript: placeholder words
-def test_pause_detection_benchmark_on_real_speech(tmp_path):
-    """Speech with known breaks, converted by AudioToIML, scored against IML
-    that marks those breaks, marks none, or gives them the wrong length.
+def test_placeholder_token_matches_audio_to_iml():
+    pytest.importorskip("parselmouth")
+    from prosody_protocol import benchmarks
+    from prosody_protocol.audio_to_iml import PLACEHOLDER_TOKEN
 
-    Without speech recognition the converter writes one placeholder per
-    stretch of speech, so pauses are matched to within a stretch of speech.
+    assert benchmarks._PLACEHOLDER == PLACEHOLDER_TOKEN
+
+
+def _speech_pauses_dataset(root: Path, truth_iml: str) -> Dataset:
+    """A one-entry dataset of tests/fixtures/audio/speech_pauses.wav, whose
+    word timings and pauses are exact (tests/generate_audio_fixtures.py)."""
+    (root / "audio").mkdir(parents=True)
+    (root / "entries").mkdir()
+    audio = FIXTURES / "audio"
+    (root / "audio" / "e1.wav").write_bytes((audio / "speech_pauses.wav").read_bytes())
+    words = json.loads((audio / "speech_pauses.json").read_text())["words"]
+    entry = {
+        "id": "e1", "timestamp": "2025-01-01T00:00:00Z", "source": "synthetic",
+        "language": "en-US", "audio_file": "audio/e1.wav",
+        "transcript": "I told you to call me yesterday.", "iml": truth_iml,
+        "emotion_label": "neutral", "annotator": "human", "consent": True,
+        "metadata": {"word_timings": words},
+    }
+    (root / "entries" / "e1.json").write_text(json.dumps(entry))
+    return DatasetLoader().load(root, check_audio=True)
+
+
+@pytest.mark.parametrize(
+    ("pause_ms", "expected"),
+    [(600, 1.0), (None, 0.0), (1500, 0.0)],
+    ids=["right", "no-pauses-in-truth", "wrong-length"],
+)
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_pause_detection_benchmark_on_real_speech(tmp_path, pause_ms, expected):
+    """Speech with known breaks, converted by AudioToIML with the entry's
+    word timings, scored against IML that marks those breaks, marks none
+    (every detected pause is a false positive), or gives them the wrong length.
     """
     pytest.importorskip("parselmouth")
     from prosody_protocol import AudioToIML
 
-    words = ["the", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog", "while",
-             "the", "children", "watch"]
-    breaks = {1, 3, 5, 8}  # a 600 ms break after these word indices
-    ssml = " ".join(
-        w + (' <break time="600ms"/>' if i in breaks else "") for i, w in enumerate(words)
+    def pause(ms: int) -> str:
+        return f' <pause duration="{ms}"/>' if pause_ms else ""
+
+    truth = (
+        f"<utterance>I told you{pause(pause_ms or 0)} to call me"
+        f"{pause(pause_ms // 2 if pause_ms else 0)} yesterday.</utterance>"
     )
-    root = tmp_path / "ds"
-    (root / "audio").mkdir(parents=True)
-    (root / "entries").mkdir()
-    subprocess.run(
-        ["espeak-ng", "-m", "-w", str(root / "audio" / "e1.wav"), f"<speak>{ssml}</speak>"],
-        check=True, capture_output=True,
+    report = Benchmark(_speech_pauses_dataset(tmp_path / "ds", truth), AudioToIML(stt="none")).run()
+    assert report.num_failures == 0
+    assert report.word_sources == {"timings": 1, "transcript": 0, "stt": 0}
+    assert report.pause_f1 == expected
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_pitch_contours_scored_end_to_end(tmp_path):
+    """Word-level contour ground truth against AudioToIML given word timings;
+    without words the same recording is placeholders and is not scored."""
+    pytest.importorskip("parselmouth")
+    from prosody_protocol import AudioToIML
+
+    dataset = _speech_pauses_dataset(tmp_path / "ds", _PAUSES_AND_CONTOURS)
+    report = Benchmark(dataset, AudioToIML(stt="none")).run()
+    assert (report.pitch_accuracy, report.pitch_coverage, report.pause_f1) == (1.0, 1.0, 1.0)
+
+    placeholders = Benchmark(dataset, AudioToIML(stt="none"), words_from="stt").run()
+    assert placeholders.num_unaligned == 1
+    assert placeholders.pitch_accuracy is None
+    assert placeholders.pitch_coverage is None
+    assert placeholders.pause_f1 is None
+    assert placeholders.check_regression(baseline=report) == [
+        "pitch_accuracy was not measured (baseline 1.0000)",
+        "pitch_coverage was not measured (baseline 1.0000)",
+        "pause_f1 was not measured (baseline 1.0000)",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The committed baseline (CI)
+# ---------------------------------------------------------------------------
+
+
+def _baseline_module():
+    path = BASELINES / "make_baselines.py"
+    spec = importlib.util.spec_from_file_location("make_baselines", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_training_synthetic_does_not_regress_from_the_committed_baseline():
+    """AudioToIML on tests/fixtures/datasets/training_synthetic, against the
+    report committed in tests/fixtures/benchmarks/. After an intended change
+    in the converter's output, regenerate it with
+    ``python tests/fixtures/benchmarks/make_baselines.py`` and commit it.
+    """
+    pytest.importorskip("parselmouth")
+    make = _baseline_module()
+    baseline = BenchmarkReport.load(make.TRAINING_SYNTHETIC_BASELINE)
+    report = make.benchmark_training_synthetic()
+    assert report.word_sources == baseline.word_sources
+    failures = report.check_regression(
+        baseline,
+        thresholds=make.TRAINING_SYNTHETIC_THRESHOLDS,
+        tolerance=make.TOLERANCE,
+        class_tolerance=make.CLASS_TOLERANCE,
+    )
+    assert failures == [], (
+        f"{failures}; if the change is intended, run "
+        "python tests/fixtures/benchmarks/make_baselines.py"
     )
 
-    def score(pause_ms: int | None) -> float | None:
-        text = " ".join(
-            w + (f' <pause duration="{pause_ms}"/>' if pause_ms and i in breaks else "")
-            for i, w in enumerate(words)
-        )
-        entry = {
-            "id": "e1", "timestamp": "2025-01-01T00:00:00Z", "source": "synthetic",
-            "language": "en-US", "audio_file": "audio/e1.wav", "transcript": " ".join(words),
-            "iml": f"<utterance>{text}</utterance>", "emotion_label": "neutral",
-            "annotator": "human", "consent": True,
-        }
-        (root / "entries" / "e1.json").write_text(json.dumps(entry))
-        dataset = DatasetLoader().load(root, check_audio=True)
-        report = Benchmark(dataset, AudioToIML(stt="none")).run()
-        assert report.num_failures == 0
-        return report.pause_f1
 
-    assert score(600) == 1.0
-    assert score(None) == 0.0  # every detected pause is a false positive
-    assert score(1500) == 0.0  # right places, wrong length
+def test_committed_baseline_is_a_current_report():
+    make = _baseline_module()
+    baseline = BenchmarkReport.load(make.TRAINING_SYNTHETIC_BASELINE)
+    data = json.loads(Path(make.TRAINING_SYNTHETIC_BASELINE).read_text())
+    assert set(data) == set(baseline.to_dict())
+    assert baseline.abstention_label is None
+    assert baseline.num_entries == 10 and baseline.num_failures == 0
+    # It measures emotion: the regression check has something to guard.
+    assert baseline.emotion_coverage and baseline.emotion_accuracy is not None
