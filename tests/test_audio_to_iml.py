@@ -11,6 +11,11 @@ Integration tests that:
 - Extended attributes appear only when include_extended=True
 - Every failure to read audio raises AudioProcessingError
 - A prosody profile sets matching utterances' emotion and is reported
+- Speaker baselines: calibration from one or several recordings (cached per
+  file), per-speaker baselines from speaker labels, no baseline for two
+  voices without labels, and a warning whenever there is no baseline
+- Warnings on what could not be measured: transcripts without timings,
+  unpunctuated words, word timings that do not match the audio
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import types
 import wave
 from pathlib import Path
@@ -32,9 +38,15 @@ np = pytest.importorskip("numpy")
 parselmouth = pytest.importorskip("parselmouth")
 
 from prosody_protocol import audio_to_iml
-from prosody_protocol.assembler import DEFAULT_MIN_EMOTION_CONFIDENCE
+from prosody_protocol.alignment import load_word_timings
+from prosody_protocol.assembler import DEFAULT_MIN_EMOTION_CONFIDENCE, _Assembly
 from prosody_protocol.audio_to_iml import PLACEHOLDER_TOKEN, AudioToIML, ConversionResult
-from prosody_protocol.exceptions import AudioProcessingError, ProfileError
+from prosody_protocol.exceptions import (
+    AudioProcessingError,
+    ConversionError,
+    ProfileError,
+    SpeechRecognitionError,
+)
 from prosody_protocol.models import Emphasis, IMLDocument, Pause, Prosody, Segment, Utterance
 from prosody_protocol.parser import IMLParser
 from prosody_protocol.profiles import ProfileLoader, ProsodyMapping, ProsodyProfile
@@ -42,6 +54,8 @@ from prosody_protocol.prosody_analyzer import WordAlignment
 from prosody_protocol.validator import IMLValidator
 
 AUDIO_DIR = Path(__file__).parent / "fixtures" / "audio"
+EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
+CALIBRATION = AUDIO_DIR / "speech_calibration.wav"
 SPEECH = AUDIO_DIR / "speech_pauses.wav"
 SR = 16_000
 
@@ -113,6 +127,81 @@ def _text_of(node: Any) -> str:
         c if isinstance(c, str) else _text_of(c)
         for c in getattr(node, "children", ())
     )
+
+
+needs_espeak = pytest.mark.skipif(
+    shutil.which("espeak-ng") is None, reason="espeak-ng not installed"
+)
+
+
+def _espeak(word: str, pitch: int) -> Any:
+    """*word* spoken by espeak-ng at 16 kHz, without leading or trailing silence."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "word.wav"
+        subprocess.run(
+            ["espeak-ng", "-v", "en-us", "-s", "160", "-p", str(pitch), "-z", "-w", str(path),
+             word],
+            check=True,
+        )
+        samples = parselmouth.Sound(str(path)).resample(SR).values[0]
+    audible = np.flatnonzero(np.abs(samples) > 1e-3)
+    return samples[audible[0]: audible[-1] + 1]
+
+
+def _speak(
+    path: Path, turns: list[tuple[str, str | None, int]], gap_ms: int = 900
+) -> list[WordAlignment]:
+    """Record *turns* of (sentence, speaker, espeak pitch) word by word, with
+    50 ms between words and *gap_ms* between turns; returns the exact words."""
+    parts: list[Any] = [np.zeros(SR // 5)]
+    words: list[WordAlignment] = []
+    position = len(parts[0])
+    for turn, (sentence, speaker, pitch) in enumerate(turns):
+        if turn:
+            parts.append(np.zeros(SR * gap_ms // 1000))
+            position += len(parts[-1])
+        for index, token in enumerate(sentence.split()):
+            if index:
+                parts.append(np.zeros(SR // 20))
+                position += len(parts[-1])
+            clip = _espeak(token.strip(".,?!"), pitch)
+            words.append(WordAlignment(
+                token, round(position * 1000 / SR), round((position + len(clip)) * 1000 / SR),
+                speaker,
+            ))
+            parts.append(clip)
+            position += len(clip)
+    parts.append(np.zeros(SR // 5))
+    signal = np.concatenate(parts)
+    signal = 0.5 * signal / np.abs(signal).max()
+    signal += 1e-3 * np.random.default_rng(0).standard_normal(len(signal))
+    _write(path, signal)
+    return words
+
+
+# A support call: a low voice (4 turns) and a high voice (2 calm turns).
+LOW, HIGH = 20, 85
+CALL = [
+    ("I called about my order last week.", "A", LOW),
+    ("Can you tell me when it ships?", "B", HIGH),
+    ("It should arrive on Monday morning.", "A", LOW),
+    ("Okay that sounds good to me.", "B", HIGH),
+    ("Let me check the tracking number.", "A", LOW),
+    ("Yes it left the warehouse today.", "A", LOW),
+]
+
+
+@pytest.fixture(scope="module")
+def call(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, list[WordAlignment]]:
+    if shutil.which("espeak-ng") is None:
+        pytest.skip("espeak-ng not installed")
+    path = tmp_path_factory.mktemp("call") / "call.wav"
+    return path, _speak(path, CALL)
+
+
+def _other_warnings(result: ConversionResult) -> list[str]:
+    """The warnings besides the note that there is no speaker baseline."""
+    return [w for w in result.warnings if not w.startswith("No speaker baseline")]
 
 
 def _write(path: Path, signal: Any) -> Path:
@@ -203,7 +292,8 @@ class TestWords:
     ) -> None:
         result = converter.convert_detailed(SPEECH, words=_words("speech_pauses"))
         assert result.transcript_source == "words"
-        assert result.warnings == ()
+        # One utterance without calibration: only the missing baseline is noted.
+        assert _other_warnings(result) == []
         assert parser.to_plain_text(result.document) == "I told you to call me yesterday."
         assert result.document.language == "en-US"
         assert validator.validate(result.iml).valid
@@ -265,12 +355,87 @@ class TestWords:
         result = converter.convert_detailed(SPEECH, words=words)
         assert any("after the end of the audio" in w for w in result.warnings)
 
+    def test_words_ending_after_the_audio_are_flagged_and_clamped(
+        self, validator: IMLValidator
+    ) -> None:
+        """A word ending far past the audio used to pass silently, and with
+        include_extended its whole span became duration_ms="2999999386",
+        invalid IML (V27)."""
+        converter = AudioToIML(stt="none", include_extended=True)
+        words = [WordAlignment("I", 250, 564), WordAlignment("never", 614, 3_000_000_000)]
+        result = converter.convert_detailed(SPEECH, words=words)
+        assert any("end after the end of the audio" in w for w in result.warnings)
+        assert validator.validate(result.iml).valid
+        durations = [n.duration_ms for n in _nodes(result.document)
+                     if isinstance(n, Prosody) and n.duration_ms is not None]
+        assert durations and max(durations) <= 4435
+
+    def test_words_of_another_recording_are_flagged(self, converter: AudioToIML) -> None:
+        """Timings of another recording used to give confident markup with a
+        note only about the words past the end."""
+        words = load_word_timings(EXAMPLES_DIR / "monotone.deepgram.json")
+        result = converter.convert_detailed(EXAMPLES_DIR / "speech.wav", words=words)
+        assert any("may belong to another recording" in w for w in result.warnings)
+
+    def test_part_of_the_speech_outside_the_words_is_flagged(
+        self, converter: AudioToIML
+    ) -> None:
+        words = _words("speech_calibration")[:2]  # "this is" of "this is how I normally sound."
+        result = converter.convert_detailed(CALIBRATION, words=words)
+        assert any("lie outside the words" in w for w in result.warnings)
+
+    @pytest.mark.parametrize("name", ["speech_pauses", "speech_calibration", "speech_raised"])
+    def test_matching_timings_are_not_flagged(self, converter: AudioToIML, name: str) -> None:
+        result = converter.convert_detailed(AUDIO_DIR / f"{name}.wav", words=_words(name))
+        assert _other_warnings(result) == []
+
+    def test_unpunctuated_words_are_split_at_long_pauses(self, converter: AudioToIML) -> None:
+        """Without sentence punctuation, only pauses of 1 s or more used to end
+        an utterance, so sentences with ordinary gaps ran together, silently."""
+        words = [dataclasses.replace(w, word=w.word.rstrip(".").lower())
+                 for w in _words("speech_pauses")]
+        result = converter.convert_detailed(SPEECH, words=words)
+        assert [IMLParser().to_plain_text(dataclasses.replace(result.document, utterances=(u,)))
+                for u in result.document.utterances] == ["i told you", "to call me yesterday"]
+        assert any("no sentence punctuation" in w for w in result.warnings)
+
+    def test_speakers_may_talk_over_each_other(self, converter: AudioToIML) -> None:
+        """Words of different speakers may overlap by more than 500 ms."""
+        words = [
+            WordAlignment("I", 250, 564, "A"), WordAlignment("told", 614, 1086, "A"),
+            WordAlignment("you", 1136, 1486, "A"), WordAlignment("to", 700, 2387, "B"),
+        ]
+        result = converter.convert_detailed(SPEECH, words=words)
+        assert [u.speaker_id for u in result.document.utterances] == ["A", "B", "A"]
+        crowd = [WordAlignment("hi", 0, 3000, speaker) for speaker in "ABCD"]
+        with pytest.raises(ValueError, match="other speakers"):
+            converter.convert(SPEECH, words=crowd)
+
+    @pytest.mark.parametrize(
+        ("speaker", "error"), [(3, TypeError), ("A\x1b", ValueError)]
+    )
+    def test_speaker_labels_are_checked(
+        self, converter: AudioToIML, speaker: Any, error: type[Exception]
+    ) -> None:
+        with pytest.raises(error, match="speaker"):
+            converter.convert(SPEECH, words=[WordAlignment("I", 250, 564, speaker)])
+
+    def test_invalid_output_is_never_returned(
+        self, converter: AudioToIML, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        broken = IMLDocument(utterances=(Utterance(children=("hi",), emotion="angry"),))
+        monkeypatch.setattr(
+            converter._assembler, "_assemble", lambda *a, **k: _Assembly(broken, [], [], [])
+        )
+        with pytest.raises(ConversionError, match="V3"):
+            converter.convert(SPEECH, words=_words("speech_pauses"))
+
     def test_words_may_be_a_generator(self, converter: AudioToIML, parser: IMLParser) -> None:
         """A generator used to be exhausted by validation, leaving no words."""
         words = _words("speech_pauses")
         result = converter.convert_detailed(SPEECH, words=(w for w in words))
         assert parser.to_plain_text(result.document) == "I told you to call me yesterday."
-        assert result.warnings == ()
+        assert _other_warnings(result) == []
 
     @pytest.mark.parametrize("bad", [
         WordAlignment("back", 500, 400), WordAlignment("neg", -10, 100),
@@ -398,6 +563,28 @@ class TestTranscript:
         result = converter.convert_detailed(SPEECH, transcript="   ")
         assert parser.to_plain_text(result.document) == ""
         assert any("empty" in w for w in result.warnings)
+
+    def test_transcript_conversion_says_what_was_measured(self) -> None:
+        """A transcript without timings used to come back as the plain text with
+        no warning, though nothing but the utterance as a whole was measured."""
+        converter = AudioToIML(stt="none")
+        result = converter.convert_detailed(SPEECH, transcript="I told you to call me yesterday.")
+        assert any("The transcript has no word timings" in w for w in result.warnings)
+        # A single utterance without calibration has no baseline either.
+        assert any(w.startswith("No speaker baseline") for w in result.warnings)
+
+    def test_transcript_gets_utterance_level_delivery_against_calibration(self) -> None:
+        """With a baseline, the utterance's overall delivery is measured: every
+        word of speech_raised.wav is ~45% above the speaker's usual pitch."""
+        converter = AudioToIML(stt="none", calibration_audio=CALIBRATION)
+        result = converter.convert_detailed(
+            AUDIO_DIR / "speech_raised.wav", transcript="please call me back."
+        )
+        [wrapper] = result.document.utterances[0].children
+        assert isinstance(wrapper, Prosody) and wrapper.pitch is not None
+        assert _pitch_percent(wrapper.pitch) > 25
+        assert not any(w.startswith("No speaker baseline") for w in result.warnings)
+        assert any("The transcript has no word timings" in w for w in result.warnings)
 
     def test_transcript_over_silence_has_no_emotion(self) -> None:
         converter = AudioToIML(stt="none", min_emotion_confidence=0.0)
@@ -527,7 +714,7 @@ class TestWhisper:
     def test_whisper_words(self, fake_whisper: types.ModuleType, parser: IMLParser) -> None:
         result = AudioToIML().convert_detailed(SPEECH)
         assert result.transcript_source == "whisper"
-        assert result.warnings == ()
+        assert _other_warnings(result) == []
         assert parser.to_plain_text(result.document) == "I told you to call me yesterday."
 
     def test_model_is_loaded_once(self, fake_whisper: types.ModuleType) -> None:
@@ -592,6 +779,29 @@ class TestWhisper:
         with pytest.raises(AudioProcessingError, match="out of memory"):
             AudioToIML().convert(SPEECH)
 
+    @pytest.mark.parametrize(
+        ("failure", "prefix"),
+        [("load_error", "Cannot load Whisper model"),
+         ("transcribe_error", "Whisper transcription failed")],
+    )
+    def test_recognizer_failures_have_their_own_error(
+        self, fake_whisper: types.ModuleType, failure: str, prefix: str
+    ) -> None:
+        """Callers (the REST API) used to tell a recognizer failure from bad
+        audio by the message alone."""
+        setattr(fake_whisper, failure, RuntimeError("out of memory"))
+        with pytest.raises(SpeechRecognitionError, match=f"^{prefix}") as caught:
+            AudioToIML().convert(SPEECH)
+        assert isinstance(caught.value, AudioProcessingError)
+
+    def test_missing_whisper_is_not_a_recognizer_failure(self, no_whisper: None) -> None:
+        with pytest.raises(AudioProcessingError) as caught:
+            AudioToIML(stt="whisper").convert(SPEECH)
+        assert not isinstance(caught.value, SpeechRecognitionError)
+        with pytest.raises(AudioProcessingError) as caught:
+            AudioToIML(stt="none").convert(AUDIO_DIR / "missing.wav")
+        assert not isinstance(caught.value, SpeechRecognitionError)
+
     def test_no_words_recognised(self, fake_whisper: types.ModuleType, parser: IMLParser) -> None:
         fake_whisper.words = [{"word": " ", "start": 0.1, "end": 0.2}]
         result = AudioToIML().convert_detailed(SPEECH)
@@ -644,6 +854,110 @@ class TestCalibration:
             converter.convert(AUDIO_DIR / "speech_raised.wav", words=_words("speech_raised"))
         assert analysed.count(calibration) == 1
 
+    def test_transcript_and_words_agree_against_calibration(self) -> None:
+        """The pitch movement of a whole utterance (transcript=) used to be
+        compared with that of 300 ms calibration chunks: longer spans move
+        more, so neutral speech came out 'joyful' 0.59 (and with words=, no
+        emotion)."""
+        converter = AudioToIML(stt="none", calibration_audio=CALIBRATION)
+        by_words = converter.convert_to_doc(SPEECH, words=_words("speech_pauses"))
+        by_text = converter.convert_to_doc(SPEECH, transcript="I told you to call me yesterday.")
+        assert [u.emotion for u in by_words.utterances] == [None]
+        assert [u.emotion for u in by_text.utterances] == [None]
+
+    @pytest.mark.parametrize("name", ["speech_calibration", "speech_pauses", "speech_raised"])
+    def test_recording_against_itself_has_no_emotion(self, name: str) -> None:
+        """A recording measured against itself deviates from nothing, however
+        its words are grouped (speech_pauses used to be 'joyful' 0.71)."""
+        path = AUDIO_DIR / f"{name}.wav"
+        converter = AudioToIML(stt="none", calibration_audio=path)
+        for kwargs in ({"transcript": "some words"}, {}):
+            doc = converter.convert_to_doc(path, **kwargs)  # type: ignore[arg-type]
+            assert all(u.emotion is None for u in doc.utterances), IMLParser().to_iml_string(doc)
+
+    def test_single_utterance_without_calibration_is_reported(self) -> None:
+        """A one-turn recording gets no utterance-level delivery or emotion,
+        which used to go unmentioned."""
+        words = _words("speech_raised")
+        plain = AudioToIML(stt="none").convert_detailed(
+            AUDIO_DIR / "speech_raised.wav", words=words
+        )
+        [note] = [w for w in plain.warnings if w.startswith("No speaker baseline")]
+        assert "calibration_audio" in note
+        calibrated = AudioToIML(stt="none", calibration_audio=CALIBRATION).convert_detailed(
+            AUDIO_DIR / "speech_raised.wav", words=words
+        )
+        assert not [w for w in calibrated.warnings if w.startswith("No speaker baseline")]
+
+    def test_baseline_note_is_true_for_a_classifier_without_baseline(self) -> None:
+        """A plain classifier (classify(features) only, such as a trained model)
+        still labels a single utterance, so the note must not say that no
+        emotion was estimated."""
+
+        class Plain:
+            def classify(self, features: list[Any]) -> tuple[str, float]:
+                return ("calm", 0.8)
+
+        result = AudioToIML(stt="none", emotion_classifier=Plain()).convert_detailed(
+            SPEECH, words=_words("speech_pauses")
+        )
+        assert [u.emotion for u in result.document.utterances] == ["calm"]
+        [note] = [w for w in result.warnings if w.startswith("No speaker baseline")]
+        assert "not marked" in note and "emotion" not in note
+
+    def test_several_calibration_files(self) -> None:
+        """Earlier turns of the speaker can serve as calibration together."""
+        converter = AudioToIML(stt="none", calibration_audio=[CALIBRATION, str(SPEECH)])
+        assert converter.calibration_audio == (CALIBRATION, SPEECH)
+        doc = converter.convert_to_doc(
+            AUDIO_DIR / "speech_raised.wav", words=_words("speech_raised")
+        )
+        assert [p for p in self._pitches(doc) if p > 25]
+
+    def test_growing_calibration_list_analyses_each_file_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A converter reused across turns only analyses the new turn."""
+        analysed: list[Path] = []
+        original = audio_to_iml._AudioAnalysis.from_path
+
+        def counting(cls: Any, path: Any, *args: Any) -> Any:
+            analysed.append(Path(path))
+            return original(path, *args)
+
+        monkeypatch.setattr(audio_to_iml._AudioAnalysis, "from_path", classmethod(counting))
+        converter = AudioToIML(stt="none", calibration_audio=[])
+        raised = AUDIO_DIR / "speech_raised.wav"
+        turns: list[Path] = []
+        for turn in (CALIBRATION, SPEECH, CALIBRATION):
+            converter.calibration_audio = turns
+            converter.convert(raised, words=_words("speech_raised"))
+            turns.append(turn)
+        assert analysed.count(CALIBRATION) == 1
+        assert analysed.count(SPEECH) == 1
+        assert analysed.count(raised) == 3
+
+    def test_empty_calibration_list_is_no_calibration(self) -> None:
+        converter = AudioToIML(stt="none", calibration_audio=())
+        result = converter.convert_detailed(SPEECH, words=_words("speech_pauses"))
+        assert any(w.startswith("No speaker baseline") for w in result.warnings)
+
+    def test_silent_calibration_file_among_others_is_skipped(self) -> None:
+        silent = AUDIO_DIR / "silence_1s.wav"
+        converter = AudioToIML(stt="none", calibration_audio=[silent, CALIBRATION])
+        result = converter.convert_detailed(
+            AUDIO_DIR / "speech_raised.wav", words=_words("speech_raised")
+        )
+        assert any("contain no voiced speech and were not used" in w for w in result.warnings)
+        converter.calibration_audio = [silent, silent]
+        with pytest.raises(AudioProcessingError, match="Calibration audio"):
+            converter.convert(SPEECH, words=_words("speech_pauses"))
+
+    @pytest.mark.parametrize("bad", [42, b"me.wav", [CALIBRATION, 3]])
+    def test_calibration_audio_must_be_paths(self, bad: Any) -> None:
+        with pytest.raises(TypeError, match="calibration_audio"):
+            AudioToIML(calibration_audio=bad)
+
     def test_silent_calibration_audio_rejected(self) -> None:
         converter = AudioToIML(stt="none", calibration_audio=AUDIO_DIR / "silence_1s.wav")
         with pytest.raises(AudioProcessingError, match="Calibration audio"):
@@ -653,6 +967,65 @@ class TestCalibration:
         converter = AudioToIML(stt="none", calibration_audio="/nonexistent/me.wav")
         with pytest.raises(AudioProcessingError, match="not found"):
             converter.convert(SPEECH, words=_words("speech_pauses"))
+
+
+# ---------------------------------------------------------------------------
+# Several speakers
+# ---------------------------------------------------------------------------
+
+
+@needs_espeak
+class TestSpeakers:
+    def test_two_voices_without_labels_get_no_emotion(
+        self, call: tuple[Path, list[WordAlignment]]
+    ) -> None:
+        """A low voice and a high voice without speaker labels share one
+        baseline, so the high voice's calm questions came out 'fearful' 0.71
+        with pitch="+93%"."""
+        path, words = call
+        unlabelled = [dataclasses.replace(w, speaker=None) for w in words]
+        result = AudioToIML(stt="none").convert_detailed(path, words=unlabelled)
+        assert [u.emotion for u in result.document.utterances] == [None] * len(CALL)
+        pitches = [_pitch_percent(n.pitch) for n in _nodes(result.document)
+                   if isinstance(n, Prosody) and n.pitch]
+        assert all(abs(p) < 50 for p in pitches), result.iml
+        assert any("as from two voices" in w for w in result.warnings)
+
+    def test_speaker_labels_give_each_speaker_a_baseline(
+        self, call: tuple[Path, list[WordAlignment]]
+    ) -> None:
+        path, words = call
+        result = AudioToIML(stt="none", min_emotion_confidence=0.0).convert_detailed(
+            path, words=words
+        )
+        assert [u.speaker_id for u in result.document.utterances] == [s for _, s, _ in CALL]
+        for utterance in result.document.utterances:
+            pitches = [_pitch_percent(n.pitch) for n in _nodes(IMLDocument((utterance,)))
+                       if isinstance(n, Prosody) and n.pitch]
+            assert all(abs(p) < 50 for p in pitches), result.iml
+            assert utterance.emotion != "fearful"
+        # Speaker B said only two utterances: too few for a baseline.
+        assert any(w.startswith("Speaker 'B': No speaker baseline") for w in result.warnings)
+        assert not any("two voices" in w for w in result.warnings)
+
+    def test_calibration_is_not_used_for_several_speakers(
+        self, call: tuple[Path, list[WordAlignment]]
+    ) -> None:
+        path, words = call
+        result = AudioToIML(stt="none", calibration_audio=CALIBRATION).convert_detailed(
+            path, words=words
+        )
+        assert any("calibration_audio describes one speaker" in w for w in result.warnings)
+
+    def test_one_speakers_words_of_a_call(self, call: tuple[Path, list[WordAlignment]]) -> None:
+        """Converting one speaker's words is the other way to use a baseline;
+        the other speaker's speech is noted as lying outside the words."""
+        path, words = call
+        result = AudioToIML(stt="none").convert_detailed(
+            path, words=[w for w in words if w.speaker == "B"]
+        )
+        assert [u.speaker_id for u in result.document.utterances] == ["B", "B"]
+        assert any("one speaker's of several" in w for w in result.warnings)
 
 
 # ---------------------------------------------------------------------------

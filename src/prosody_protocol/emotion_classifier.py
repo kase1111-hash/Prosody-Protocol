@@ -19,6 +19,7 @@ import math
 import statistics
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, fields, replace
+from itertools import pairwise
 from typing import Protocol, runtime_checkable
 
 from ._types import SpanFeatures
@@ -74,6 +75,13 @@ class BaselineAwareEmotionClassifier(Protocol):
 # A span needs this many voiced F0 samples for its pitch spread to be measured
 # from the contour (otherwise ``f0_range`` is used).
 _MIN_SPREAD_SAMPLES = 5
+# Pitch spread is measured in windows of about this many voiced F0 samples
+# (300 ms of voicing at the analyzer's 10 ms step): about a word, and the
+# size of the chunks calibration speech is measured in. Over a longer span
+# the spread would grow with its length (a sentence moves through more of
+# the speaker's range than a word does), so a sentence measured as one span
+# would seem livelier than the same speech measured word by word.
+_SPREAD_WINDOW_SAMPLES = 30
 
 
 def _semitones(f0_hz: float, reference_hz: float) -> float:
@@ -114,17 +122,30 @@ def _span_rate(features: SpanFeatures) -> float | None:
     return _positive(features.speech_rate)
 
 
+def _decile_spread(contour: Sequence[float]) -> float:
+    """The distance (semitones) between the 10th and 90th percentiles of *contour*."""
+    deciles = statistics.quantiles(contour, n=10)
+    return _semitones(deciles[-1], deciles[0])
+
+
 def _span_f0_spread(features: SpanFeatures) -> float | None:
     """How far pitch moves within a span, in semitones.
 
     The distance between the 10th and 90th percentiles of the F0 contour,
-    which ignores a stray sample at either end; spans with a short contour
+    which ignores a stray sample at either end. A contour longer than about
+    :data:`_SPREAD_WINDOW_SAMPLES` is cut into equal consecutive windows of
+    about that length and the median of their spreads is taken, so the
+    value does not grow with the length of the span: a sentence measured as
+    one span has about the spread of its words. Spans with a short contour
     fall back to the full ``f0_range``.
     """
     contour = [v for v in features.f0_contour or () if math.isfinite(v) and v > 0.0]
     if len(contour) >= _MIN_SPREAD_SAMPLES:
-        deciles = statistics.quantiles(contour, n=10)
-        return _semitones(deciles[-1], deciles[0])
+        windows = max(1, round(len(contour) / _SPREAD_WINDOW_SAMPLES))
+        edges = [round(i * len(contour) / windows) for i in range(windows + 1)]
+        return statistics.median(
+            _decile_spread(contour[a:b]) for a, b in pairwise(edges)
+        )
     if features.f0_range is not None:
         low, high = (_positive(v) for v in features.f0_range)
         if low is not None and high is not None and high >= low:
@@ -190,7 +211,10 @@ class SpeakerBaseline:
         Spans without a measurement are skipped for that field, as are
         intensities at or below 0 dB (digital-silence artefacts). A span's
         pitch movement is the 10th-90th percentile distance of its F0
-        contour in semitones (``f0_range`` when the contour is short).
+        contour in semitones (``f0_range`` when the contour is short),
+        measured in windows of about 300 ms of voicing and averaged (as the
+        median) over a longer span, so that it does not depend on how long
+        the spans are.
         """
         spans = list(features)
         return cls(

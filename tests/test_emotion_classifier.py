@@ -369,6 +369,30 @@ class TestSpeakerBaseline:
         spread = SpeakerBaseline.from_features([span]).f0_spread
         assert spread is not None and 8.0 < spread < 12.0
 
+    def test_pitch_spread_does_not_grow_with_span_length(self) -> None:
+        """A sentence measured as one span (a transcript without timings) used
+        to seem livelier than the same speech measured in word-sized spans,
+        as calibration speech is: its pitch drifts from word to word. Neutral
+        speech then came out 'joyful' against its own calibration."""
+        contours = [_glide(150.0 * 2 ** (-i / 24), 1.5, samples=30) for i in range(8)]
+        words = [
+            SpanFeatures(start_ms=i * 300, end_ms=i * 300 + 300, text="w",
+                         f0_mean=sum(c) / len(c), f0_contour=c)
+            for i, c in enumerate(contours)
+        ]
+        sentence = SpanFeatures(
+            start_ms=0, end_ms=2400, text="s", f0_mean=words[4].f0_mean,
+            f0_contour=[v for c in contours for v in c],
+        )
+        by_word = SpeakerBaseline.from_features(words).f0_spread
+        whole = SpeakerBaseline.from_features([sentence]).f0_spread
+        assert by_word == pytest.approx(1.5, abs=0.2)
+        assert whole == pytest.approx(by_word, abs=0.5)
+        label, _ = RuleBasedEmotionClassifier().classify_relative(
+            [sentence], SpeakerBaseline.from_features(words)
+        )
+        assert label == "neutral"
+
     def test_from_utterances_counts_each_utterance_once(self) -> None:
         """Two short calm sentences outvote one long shouted one; word by word they
         would not."""

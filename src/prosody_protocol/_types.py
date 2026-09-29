@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class WordAlignment:
     """A word with its time boundaries in the audio.
 
@@ -20,11 +20,26 @@ class WordAlignment:
     :func:`~prosody_protocol.alignment.load_word_timings` and
     :func:`~prosody_protocol.alignment.parse_word_timings` make them from
     the output of common speech-to-text services.
+
+    ``speaker`` is the label a recognizer with speaker diarization gave the
+    word (Deepgram ``0``, AssemblyAI ``"A"``, WhisperX ``"SPEAKER_00"``), or
+    ``None``. :class:`~prosody_protocol.assembler.IMLAssembler` starts a new
+    utterance where the speaker changes, writes the label as the utterance's
+    ``speaker_id`` and measures each speaker against their own baseline
+    (spec 6.2).
     """
 
     word: str
     start_ms: int
     end_ms: int
+    speaker: str | None = None
+
+    def __repr__(self) -> str:
+        speaker = "" if self.speaker is None else f", speaker={self.speaker!r}"
+        return (
+            f"WordAlignment(word={self.word!r}, start_ms={self.start_ms!r}, "
+            f"end_ms={self.end_ms!r}{speaker})"
+        )
 
 
 @dataclass(frozen=True)
